@@ -1,19 +1,16 @@
 import type OpenAI from "openai"
 import type { ModeConfig, ToolName, ToolGroup, ModelInfo } from "@roo-code/types"
-import { getModeBySlug, getToolsForMode } from "../../../shared/modes"
-import { TOOL_GROUPS, ALWAYS_AVAILABLE_TOOLS, TOOL_ALIASES } from "../../../shared/tools"
 import { defaultModeSlug } from "../../../shared/modes"
+import { TOOL_GROUPS, ALWAYS_AVAILABLE_TOOLS, TOOL_ALIASES } from "../../../shared/tools"
 import type { CodeIndexManager } from "../../../services/code-index/manager"
 import type { McpHub } from "../../../services/mcp/McpHub"
+import { resolveEffectiveToolPolicy, resolveToolAlias } from "./effective-tool-policy"
 import { isToolAllowedForMode } from "../../../core/tools/validateToolUse"
 
-/**
- * Reverse lookup map - maps alias name to canonical tool name.
- * Built once at module load from the central TOOL_ALIASES constant.
- */
-const ALIAS_TO_CANONICAL: Map<string, string> = new Map(
-	Object.entries(TOOL_ALIASES).map(([alias, canonical]) => [alias, canonical]),
-)
+// Re-export the resolver's alias helper so existing importers of this module
+// (NativeToolCallParser, presentAssistantMessage, build-tools) keep binding to the
+// single canonical implementation in effective-tool-policy.ts.
+export { resolveToolAlias }
 
 /**
  * Canonical to aliases map - maps canonical tool name to array of alias names.
@@ -86,19 +83,6 @@ function getOrCreateRenamedTool(
 }
 
 /**
- * Resolves a tool name to its canonical name.
- * If the tool name is an alias, returns the canonical tool name.
- * If it's already a canonical name or unknown, returns as-is.
- *
- * @param toolName - The tool name to resolve (may be an alias)
- * @returns The canonical tool name
- */
-export function resolveToolAlias(toolName: string): string {
-	const canonical = ALIAS_TO_CANONICAL.get(toolName)
-	return canonical ?? toolName
-}
-
-/**
  * Applies tool alias resolution to a set of allowed tools.
  * Resolves any aliases to their canonical tool names.
  *
@@ -128,88 +112,6 @@ export function getToolAliasGroup(toolName: string): readonly string[] {
 }
 
 /**
- * Apply model-specific tool customization to a set of allowed tools.
- *
- * This function filters tools based on model configuration:
- * 1. Removes tools specified in modelInfo.excludedTools
- * 2. Adds tools from modelInfo.includedTools (only if they belong to allowed groups)
- *
- * @param allowedTools - Set of tools already allowed by mode configuration
- * @param modeConfig - Current mode configuration to check tool groups
- * @param modelInfo - Model configuration with tool customization
- * @returns Modified set of tools after applying model customization
- */
-/**
- * Result of applying model tool customization.
- * Contains the set of allowed tools and any alias renames to apply.
- */
-interface ModelToolCustomizationResult {
-	allowedTools: Set<string>
-	/** Maps canonical tool name to alias name for tools that should be renamed */
-	aliasRenames: Map<string, string>
-}
-
-export function applyModelToolCustomization(
-	allowedTools: Set<string>,
-	modeConfig: ModeConfig,
-	modelInfo?: ModelInfo,
-): ModelToolCustomizationResult {
-	if (!modelInfo) {
-		return { allowedTools, aliasRenames: new Map() }
-	}
-
-	const result = new Set(allowedTools)
-	const aliasRenames = new Map<string, string>()
-
-	// Apply excluded tools (remove from allowed set)
-	if (modelInfo.excludedTools && modelInfo.excludedTools.length > 0) {
-		modelInfo.excludedTools.forEach((tool) => {
-			const resolvedTool = resolveToolAlias(tool)
-			result.delete(resolvedTool)
-		})
-	}
-
-	// Apply included tools (add to allowed set, but only if they belong to an allowed group)
-	if (modelInfo.includedTools && modelInfo.includedTools.length > 0) {
-		// Build a map of tool -> group for all tools in TOOL_GROUPS (including customTools)
-		const toolToGroup = new Map<string, ToolGroup>()
-		for (const [groupName, groupConfig] of Object.entries(TOOL_GROUPS)) {
-			// Add regular tools
-			groupConfig.tools.forEach((tool) => {
-				toolToGroup.set(tool, groupName as ToolGroup)
-			})
-			// Add customTools (opt-in only tools)
-			if (groupConfig.customTools) {
-				groupConfig.customTools.forEach((tool) => {
-					toolToGroup.set(tool, groupName as ToolGroup)
-				})
-			}
-		}
-
-		// Get the list of allowed groups for this mode
-		const allowedGroups = new Set(
-			modeConfig.groups.map((groupEntry) => (Array.isArray(groupEntry) ? groupEntry[0] : groupEntry)),
-		)
-
-		// Add included tools only if they belong to an allowed group
-		// If the tool was specified as an alias, track the rename
-		modelInfo.includedTools.forEach((tool) => {
-			const resolvedTool = resolveToolAlias(tool)
-			const toolGroup = toolToGroup.get(resolvedTool)
-			if (toolGroup && allowedGroups.has(toolGroup)) {
-				result.add(resolvedTool)
-				// If the tool was specified as an alias, rename it in the API
-				if (tool !== resolvedTool) {
-					aliasRenames.set(resolvedTool, tool)
-				}
-			}
-		})
-	}
-
-	return { allowedTools: result, aliasRenames }
-}
-
-/**
  * Filters native tools based on mode restrictions and model customization.
  * This ensures native tools are filtered consistently with mode/tool permissions.
  *
@@ -235,94 +137,39 @@ export function filterNativeToolsForMode(
 	mcpHub?: McpHub,
 	allowedMcpServers?: string[],
 ): OpenAI.Chat.ChatCompletionTool[] {
-	// Get mode configuration and all tools for this mode
-	const modeSlug = mode ?? defaultModeSlug
-	let modeConfig = getModeBySlug(modeSlug, customModes)
-
-	// Fallback to default mode if current mode config is not found
-	// This ensures the agent always has functional tools even if a custom mode is deleted
-	// or configuration becomes corrupted
-	if (!modeConfig) {
-		modeConfig = getModeBySlug(defaultModeSlug, customModes)!
-	}
-
-	// Get all tools for this mode (including always-available tools)
-	const allToolsForMode = getToolsForMode(modeConfig.groups)
-
-	// Filter to only tools that pass permission checks
-	let allowedToolNames = new Set(
-		allToolsForMode.filter((tool) =>
-			isToolAllowedForMode(
-				tool as ToolName,
-				modeSlug,
-				customModes ?? [],
-				undefined,
-				undefined,
-				experiments ?? {},
-			),
-		),
-	)
-
-	// Apply model-specific tool customization
+	// Resolve the single, request-scoped effective tool policy. The filter below
+	// consumes only its `tools` set (plus alias renames from model customization),
+	// so prompt generation and API tool construction agree on the logical allowed
+	// set. Behavior for all non-protocol tools is byte-identical to the previous
+	// inline computation; attempt_completion is always advertised (the protocol
+	// guarantee), even if it appears in disabledTools.
 	const modelInfo = settings?.modelInfo as ModelInfo | undefined
-	const { allowedTools: customizedTools, aliasRenames } = applyModelToolCustomization(
-		allowedToolNames,
-		modeConfig,
+
+	const policy = resolveEffectiveToolPolicy({
+		mode: mode ?? defaultModeSlug,
+		customModes,
+		mcpHub,
+		disabledTools: settings?.disabledTools,
 		modelInfo,
-	)
-	allowedToolNames = customizedTools
+		experiments,
+		todoListEnabled: settings?.todoListEnabled,
+		codeIndexManager,
+		allowedMcpServers,
+	})
 
-	// Conditionally exclude codebase_search if feature is disabled or not configured
-	if (
-		!codeIndexManager ||
-		!(codeIndexManager.isFeatureEnabled && codeIndexManager.isFeatureConfigured && codeIndexManager.isInitialized)
-	) {
-		allowedToolNames.delete("codebase_search")
-	}
+	// Apply model-specific alias renames (canonical -> alias) to the allowed set.
+	// Included-tools customization may rename a tool to the alias the caller asked
+	// for; excluded/always-available semantics are already resolved by the resolver.
+	const aliasRenames = resolveModelAliasRenames(modelInfo, policy.tools)
 
-	// Conditionally exclude update_todo_list if disabled in settings
-	if (settings?.todoListEnabled === false) {
-		allowedToolNames.delete("update_todo_list")
-	}
-
-	// Conditionally exclude generate_image if experiment is not enabled
-	if (!experiments?.imageGeneration) {
-		allowedToolNames.delete("generate_image")
-	}
-
-	// Conditionally exclude run_slash_command if experiment is not enabled
-	if (!experiments?.runSlashCommand) {
-		allowedToolNames.delete("run_slash_command")
-	}
-
-	// Remove tools that are explicitly disabled via the disabledTools setting
-	if (settings?.disabledTools?.length) {
-		for (const toolName of settings.disabledTools) {
-			// Normalize aliases so disabling a legacy alias (e.g. "search_and_replace")
-			// also disables the canonical tool (e.g. "edit").
-			const resolvedToolName = resolveToolAlias(toolName)
-			allowedToolNames.delete(resolvedToolName)
-		}
-	}
-
-	// Conditionally exclude access_mcp_resource if MCP is not enabled or there are no resources.
-	// When the mode restricts MCP servers via allowedMcpServers, only resources from allowed
-	// servers count — otherwise a restricted mode could still read resources from disallowed servers.
-	// Fall back to the mode config's own allowlist when the caller omits the parameter, so the
-	// restriction is enforced regardless of call site (defense in depth).
-	const effectiveAllowedMcpServers = allowedMcpServers ?? modeConfig.allowedMcpServers
-	if (!mcpHub || !hasAnyMcpResources(mcpHub, effectiveAllowedMcpServers)) {
-		allowedToolNames.delete("access_mcp_resource")
-	}
-
-	// Filter native tools based on allowed tool names and apply alias renames
+	// Filter native tools based on the allowed tool names and apply alias renames
 	const filteredTools: OpenAI.Chat.ChatCompletionTool[] = []
 
 	for (const tool of nativeTools) {
 		// Handle both ChatCompletionTool and ChatCompletionCustomTool
 		if ("function" in tool && tool.function) {
 			const toolName = tool.function.name
-			if (allowedToolNames.has(toolName)) {
+			if (policy.tools.has(resolveToolAlias(toolName))) {
 				// Check if this tool should be renamed to an alias
 				const aliasName = aliasRenames.get(toolName)
 				if (aliasName) {
@@ -339,19 +186,26 @@ export function filterNativeToolsForMode(
 }
 
 /**
- * Helper function to check if any MCP server has resources available.
- *
- * When `allowedServers` is provided, only servers whose name is in the allowlist are considered.
- * This keeps the `access_mcp_resource` availability check consistent with the mode's MCP server
- * allowlist so a restricted mode cannot retain the tool based on resources from disallowed servers.
+ * Computes canonical -> alias renames from model-specific included-tools
+ * customization, but only for tools that remain in the effective policy's allowed
+ * set (exclusions are already applied by the resolver). Preserves the previous
+ * behavior where an alias listed in includedTools renames the canonical tool.
  */
-function hasAnyMcpResources(mcpHub: McpHub, allowedServers?: string[]): boolean {
-	let servers = mcpHub.getServers()
-	if (allowedServers) {
-		const allowSet = new Set(allowedServers)
-		servers = servers.filter((server) => allowSet.has(server.name))
+function resolveModelAliasRenames(
+	modelInfo: ModelInfo | undefined,
+	allowedTools: ReadonlySet<string>,
+): Map<string, string> {
+	const aliasRenames = new Map<string, string>()
+	if (!modelInfo?.includedTools?.length) {
+		return aliasRenames
 	}
-	return servers.some((server) => server.resources && server.resources.length > 0)
+	for (const included of modelInfo.includedTools) {
+		const canonical = resolveToolAlias(included)
+		if (canonical !== included && allowedTools.has(canonical)) {
+			aliasRenames.set(canonical, included)
+		}
+	}
+	return aliasRenames
 }
 
 /**

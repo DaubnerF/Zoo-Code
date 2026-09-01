@@ -4082,6 +4082,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				undefined, // todoList
 				this.api.getModel().id,
 				provider.getSkillsManager(),
+				state?.disabledTools,
+				modelInfo,
 			)
 		})()
 	}
