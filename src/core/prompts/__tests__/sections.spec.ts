@@ -91,7 +91,7 @@ describe("getCapabilitiesSection", () => {
 		expect(result).toContain("list files")
 		expect(result).toContain("read files")
 		expect(result).toContain("write and edit files")
-		// the task tail is a plain sentence — no over-claiming enumeration (plan §5)
+		// the task tail is a plain sentence — assert no over-claiming enumeration
 		expect(result).not.toContain("such as writing code")
 	})
 
@@ -285,10 +285,8 @@ describe("getRulesSection", () => {
 	})
 
 	it("uses the replacement bullet when ask_followup_question is absent", () => {
-		// Both sub-cases — list_files present (previously the
-		// filesystem-enumeration branch) and list_files absent — now take the
-		// single best-effort replacement bullet (plan §5: emitted exactly when
-		// ask_followup_question is absent).
+		// Both sub-cases — list_files present and list_files absent — take the single
+		// best-effort replacement bullet, emitted exactly when ask_followup_question is absent.
 		const withListFiles = getRulesSection(
 			cwd,
 			settings,
@@ -313,8 +311,7 @@ describe("getRulesSection", () => {
 	})
 
 	it("uses the fallback phrasing in the terminal-output rule when ask_followup_question is absent", () => {
-		// The execute_command bullet stays, but its tail must not reference a
-		// disabled tool (the disabled-tool-reference bug class this fix removes).
+		// The execute_command bullet is always present, but its tail must not reference a disabled tool.
 		const withoutAsk = getRulesSection(
 			cwd,
 			settings,
@@ -346,7 +343,7 @@ describe("getRulesSection", () => {
 	})
 
 	it("states the attempt_completion protocol rule unconditionally", () => {
-		// F6: the completion sentence is protocol wording — emitted even when the policy
+		// The completion sentence is protocol wording — emitted even when the policy
 		// does not advertise attempt_completion. A raw literal is required: the
 		// resolver-backed policyFor cannot express this (protocol guarantee re-adds the
 		// tool in resolveEffectiveToolPolicy step 11).

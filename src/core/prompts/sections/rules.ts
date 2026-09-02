@@ -68,10 +68,7 @@ When asked about your creator, vendor, or company, respond with:
  * Builds the RULES section of the system prompt.
  *
  * Fragments that describe tool-specific behavior are emitted only when that tool
- * is in the request's effective tool policy. The hardcoded `architect` edit
- * example (which was misplaced, mode-wrong for most built-ins, and redundant with
- * the CAPABILITIES restriction clause and the FileRestrictionError message) is
- * removed without replacement.
+ * is in the request's effective tool policy.
  *
  * @param cwd Current working directory used in the prompt text.
  * @param settings System prompt settings (used for the stealth-model confidentiality section).
@@ -137,7 +134,7 @@ export function getRulesSection(
 			}`,
 		)
 	} else {
-		// ask_followup_question unavailable: best-effort guidance (plan §5 replacement bullet).
+		// ask_followup_question unavailable: fall back to best-effort guidance.
 		rules.push(
 			"Provide your best-effort result and state your assumptions; the user may respond with feedback after completion.",
 		)

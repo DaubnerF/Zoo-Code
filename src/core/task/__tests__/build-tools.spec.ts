@@ -3,7 +3,7 @@
 // Gemini `includeAllToolsWithRestrictions` path: with the flag on, `tools`
 // contains ALL declarations while `allowedFunctionNames` is derived from the
 // resolver-filtered set — so a disabled `attempt_completion` is still allowed
-// (protocol guarantee) and `disabledTools`-removed tools are excluded (plan §8 / D5).
+// (protocol guarantee) and `disabledTools`-removed tools are excluded.
 
 import type OpenAI from "openai"
 
@@ -113,7 +113,7 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 			disabledTools: ["execute_command"],
 		})
 
-		// Non-Gemini path unchanged: disabled tools are not sent at all.
+		// Non-Gemini path: disabled tools are not sent at all.
 		expect(toolNames(result.tools)).not.toContain("execute_command")
 		expect(result.allowedFunctionNames).toBeUndefined()
 	})

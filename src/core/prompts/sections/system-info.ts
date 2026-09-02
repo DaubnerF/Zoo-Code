@@ -8,11 +8,9 @@ import type { EffectiveToolPolicy } from "../tools/effective-tool-policy"
 /**
  * Builds the SYSTEM INFORMATION section of the system prompt.
  *
- * The workspace-directory / file-tree facts are stated once here (deduplicated
- * from CAPABILITIES). The `/test/path` literal that was previously baked into
- * every prompt is removed; the file-tree fact is now cwd-independent. The
- * terminal-cd sentence is gated on `execute_command`, since those semantics do
- * not exist without it.
+ * The workspace-directory / file-tree facts are stated once here; the
+ * file-tree fact is cwd-independent. The terminal-cd sentence is gated on
+ * `execute_command`, since those semantics do not exist without it.
  *
  * @param cwd Current working directory used in the prompt text.
  * @param policy The request's effective tool policy.

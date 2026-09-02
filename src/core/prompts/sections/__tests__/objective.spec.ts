@@ -57,7 +57,7 @@ describe("getObjectiveSection", () => {
 	})
 
 	it("still names attempt_completion unconditionally when the tool is not advertised", () => {
-		// F6: step 4 names attempt_completion, a protocol tool, so the wording is emitted
+		// Step 4 names attempt_completion, a protocol tool, so the wording is emitted
 		// even when the policy's tools set does not include it. The local policyFor builds
 		// the policy object directly (no resolver), so policyFor([]) provably excludes
 		// attempt_completion.

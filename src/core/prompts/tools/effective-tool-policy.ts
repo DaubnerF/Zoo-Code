@@ -13,9 +13,8 @@ import { isToolAllowedForMode } from "../../../core/tools/validateToolUse"
  * model-specific exclusions have been applied, so the system prompt and the API's
  * logical allowed set always agree that these tools can be called.
  *
- * See decision D2 in the bugfix plan: `attempt_completion` is the only tool with
- * no coherent prompt state when absent (the task loop can only exit through it), so
- * it is the sole protocol guarantee today.
+ * `attempt_completion` is the only tool with no coherent prompt state when absent
+ * (the task loop can only exit through it), so it is the sole protocol guarantee.
  */
 export const PROTOCOL_TOOLS: readonly string[] = ["attempt_completion"]
 
@@ -181,9 +180,9 @@ export function hasAnyMcpResources(mcpHub: McpHub, allowedServers?: string[]): b
  * metadata the system prompt needs.
  *
  * This is the single source of truth shared by prompt generation, API tool
- * construction, runtime validation, and preview. It performs, in order, the same
- * steps `filterNativeToolsForMode` used to compute inline (steps 1-10 of that
- * function), plus a protocol guarantee that re-adds `PROTOCOL_TOOLS`.
+ * construction, runtime validation, and preview. The numbered steps below (1-10)
+ * compute the allowed tool set; step 11 adds the protocol guarantee that re-adds
+ * `PROTOCOL_TOOLS`.
  *
  * The returned policy is deterministic for a given input. The only side effect
  * is an intentional, process-deduplicated `console.warn` when a protocol tool is

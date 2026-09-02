@@ -80,9 +80,8 @@ export function filterNativeToolsForMode(
 	// Resolve the single, request-scoped effective tool policy. The filter below
 	// consumes only its `tools` set (plus alias renames from model customization),
 	// so prompt generation and API tool construction agree on the logical allowed
-	// set. Behavior for all non-protocol tools is byte-identical to the previous
-	// inline computation; attempt_completion is always advertised (the protocol
-	// guarantee), even if it appears in disabledTools.
+	// set. attempt_completion is always advertised (the protocol guarantee), even
+	// if it appears in disabledTools.
 	const modelInfo = settings?.modelInfo as ModelInfo | undefined
 
 	const policy = resolveEffectiveToolPolicy({
@@ -128,8 +127,8 @@ export function filterNativeToolsForMode(
 /**
  * Computes canonical -> alias renames from model-specific included-tools
  * customization, but only for tools that remain in the effective policy's allowed
- * set (exclusions are already applied by the resolver). Preserves the previous
- * behavior where an alias listed in includedTools renames the canonical tool.
+ * set (exclusions are already applied by the resolver). An alias listed in
+ * includedTools renames the canonical tool to that alias.
  */
 function resolveModelAliasRenames(
 	modelInfo: ModelInfo | undefined,

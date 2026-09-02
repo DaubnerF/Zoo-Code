@@ -81,7 +81,7 @@ describe("resolveEffectiveToolPolicy - groups", () => {
 		expect(policy.tools.has("ask_followup_question")).toBe(true)
 		expect(policy.tools.has("update_todo_list")).toBe(true)
 		expect(policy.tools.has("skill")).toBe(true)
-		// run_slash_command is always-available but gated by the runSlashCommand experiment (plan step 8)
+		// run_slash_command is always-available but gated by the runSlashCommand experiment
 		expect(policy.tools.has("run_slash_command")).toBe(false)
 	})
 

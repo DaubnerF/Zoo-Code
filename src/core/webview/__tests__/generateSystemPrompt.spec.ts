@@ -4,8 +4,8 @@
 // the same CAPABILITIES / RULES / SYSTEM INFORMATION sections as a direct
 // SYSTEM_PROMPT call built from the *same* inputs — including a full ModelInfo,
 // so model-level excludedTools/includedTools are honored in the preview exactly
-// like the runtime path (plan §6.3 / §8, and fix-plan issue 8: the old
-// `{ isStealthModel }`-only typing silently allowed the preview to ignore them).
+// like the runtime path. The old `{ isStealthModel }`-only typing silently
+// allowed the preview to ignore them.
 
 vi.mock("os", () => ({
 	default: {
@@ -95,7 +95,7 @@ vi.mock("../../prompts/sections/custom-instructions", () => ({
 }))
 
 // The preview must consume a *complete* ModelInfo from the API handler. This
-// locks in the issue-8 contract: if generateSystemPrompt ever narrows the local
+// locks in that contract: if generateSystemPrompt ever narrows the local
 // modelInfo back down, the excludedTools sub-assertion below fails.
 const fullModelInfo: ModelInfo = {
 	contextWindow: 100_000,

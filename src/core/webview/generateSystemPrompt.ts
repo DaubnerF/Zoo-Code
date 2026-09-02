@@ -34,7 +34,7 @@ export const generateSystemPrompt = async (provider: ClineProvider, message: Web
 	// Create a temporary API handler to fetch the full model info for the preview.
 	// This avoids relying on an active Cline instance which might not exist during preview.
 	// The full ModelInfo flows into SYSTEM_PROMPT so the preview honors
-	// excludedTools/includedTools exactly like the runtime path (plan §6.3 parity).
+	// excludedTools/includedTools exactly like the runtime path.
 	let modelInfo: ModelInfo | undefined
 	try {
 		const tempApiHandler = buildApiHandler(apiConfiguration)

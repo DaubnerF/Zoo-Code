@@ -1,7 +1,7 @@
 import { resolveEffectiveToolPolicy } from "../effective-tool-policy"
 
 /**
- * F1: `resolveEffectiveToolPolicy` must warn (once per process, per protocol
+ * `resolveEffectiveToolPolicy` must warn (once per process, per protocol
  * tool) when `disabledTools` tries to disable a protocol tool, since the
  * protocol guarantee makes such a disable a no-op.
  *
