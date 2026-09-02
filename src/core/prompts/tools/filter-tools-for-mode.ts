@@ -1,7 +1,6 @@
 import type OpenAI from "openai"
-import type { ModeConfig, ToolName, ToolGroup, ModelInfo } from "@roo-code/types"
+import type { ModeConfig, ModelInfo } from "@roo-code/types"
 import { defaultModeSlug } from "../../../shared/modes"
-import { TOOL_GROUPS, ALWAYS_AVAILABLE_TOOLS, TOOL_ALIASES } from "../../../shared/tools"
 import type { CodeIndexManager } from "../../../services/code-index/manager"
 import type { McpHub } from "../../../services/mcp/McpHub"
 import { resolveEffectiveToolPolicy, resolveToolAlias } from "./effective-tool-policy"
@@ -11,36 +10,6 @@ import { isToolAllowedForMode } from "../../../core/tools/validateToolUse"
 // (NativeToolCallParser, presentAssistantMessage, build-tools) keep binding to the
 // single canonical implementation in effective-tool-policy.ts.
 export { resolveToolAlias }
-
-/**
- * Canonical to aliases map - maps canonical tool name to array of alias names.
- * Built once at module load from the central TOOL_ALIASES constant.
- */
-const CANONICAL_TO_ALIASES: Map<string, string[]> = new Map()
-
-// Build the reverse mapping (canonical -> aliases)
-for (const [alias, canonical] of Object.entries(TOOL_ALIASES)) {
-	const existing = CANONICAL_TO_ALIASES.get(canonical) ?? []
-	existing.push(alias)
-	CANONICAL_TO_ALIASES.set(canonical, existing)
-}
-
-/**
- * Pre-computed alias groups map - maps any tool name (canonical or alias) to its full group.
- * Built once at module load for O(1) lookup.
- */
-const ALIAS_GROUPS: Map<string, readonly string[]> = new Map()
-
-// Build alias groups for all tools
-for (const [canonical, aliases] of CANONICAL_TO_ALIASES.entries()) {
-	const group = Object.freeze([canonical, ...aliases])
-	// Map canonical to group
-	ALIAS_GROUPS.set(canonical, group)
-	// Map each alias to the same group
-	for (const alias of aliases) {
-		ALIAS_GROUPS.set(alias, group)
-	}
-}
 
 /**
  * Cache for renamed tool definitions.
@@ -80,35 +49,6 @@ function getOrCreateRenamedTool(
 	}
 
 	return renamedTool
-}
-
-/**
- * Applies tool alias resolution to a set of allowed tools.
- * Resolves any aliases to their canonical tool names.
- *
- * @param allowedTools - Set of tools that may contain aliases
- * @returns Set with aliases resolved to canonical names
- */
-export function applyToolAliases(allowedTools: Set<string>): Set<string> {
-	const result = new Set<string>()
-
-	for (const tool of allowedTools) {
-		// Resolve alias to canonical name
-		result.add(resolveToolAlias(tool))
-	}
-
-	return result
-}
-
-/**
- * Gets all tools in an alias group (including the canonical tool).
- * Uses pre-computed ALIAS_GROUPS map for O(1) lookup.
- *
- * @param toolName - Any tool name in the alias group
- * @returns Array of all tool names in the alias group, or just the tool if not aliased
- */
-export function getToolAliasGroup(toolName: string): readonly string[] {
-	return ALIAS_GROUPS.get(toolName) ?? [toolName]
 }
 
 /**
@@ -206,94 +146,6 @@ function resolveModelAliasRenames(
 		}
 	}
 	return aliasRenames
-}
-
-/**
- * Checks if a specific tool is allowed in the current mode.
- * This is useful for dynamically filtering system prompt content.
- *
- * @param toolName - Name of the tool to check
- * @param mode - Current mode slug
- * @param customModes - Custom mode configurations
- * @param experiments - Experiment flags
- * @param codeIndexManager - Code index manager for codebase_search feature check
- * @param settings - Additional settings for tool filtering
- * @returns true if the tool is allowed in the mode, false otherwise
- */
-export function isToolAllowedInMode(
-	toolName: ToolName,
-	mode: string | undefined,
-	customModes: ModeConfig[] | undefined,
-	experiments: Record<string, boolean> | undefined,
-	codeIndexManager?: CodeIndexManager,
-	settings?: Record<string, any>,
-): boolean {
-	const modeSlug = mode ?? defaultModeSlug
-
-	// Check if it's an always-available tool
-	if (ALWAYS_AVAILABLE_TOOLS.includes(toolName)) {
-		// But still check for conditional exclusions
-		if (toolName === "codebase_search") {
-			return !!(
-				codeIndexManager &&
-				codeIndexManager.isFeatureEnabled &&
-				codeIndexManager.isFeatureConfigured &&
-				codeIndexManager.isInitialized
-			)
-		}
-		if (toolName === "update_todo_list") {
-			return settings?.todoListEnabled !== false
-		}
-		if (toolName === "generate_image") {
-			return experiments?.imageGeneration === true
-		}
-		if (toolName === "run_slash_command") {
-			return experiments?.runSlashCommand === true
-		}
-		return true
-	}
-
-	// Check if the tool is allowed by the mode's groups
-	// Resolve to canonical name and check that single value
-	const canonicalTool = resolveToolAlias(toolName)
-	return isToolAllowedForMode(
-		canonicalTool as ToolName,
-		modeSlug,
-		customModes ?? [],
-		undefined,
-		undefined,
-		experiments ?? {},
-	)
-}
-
-/**
- * Gets the list of available tools from a specific tool group for the current mode.
- * This is useful for dynamically building system prompt content based on available tools.
- *
- * @param groupName - Name of the tool group to check
- * @param mode - Current mode slug
- * @param customModes - Custom mode configurations
- * @param experiments - Experiment flags
- * @param codeIndexManager - Code index manager for codebase_search feature check
- * @param settings - Additional settings for tool filtering
- * @returns Array of tool names that are available from the group
- */
-export function getAvailableToolsInGroup(
-	groupName: ToolGroup,
-	mode: string | undefined,
-	customModes: ModeConfig[] | undefined,
-	experiments: Record<string, boolean> | undefined,
-	codeIndexManager?: CodeIndexManager,
-	settings?: Record<string, any>,
-): ToolName[] {
-	const toolGroup = TOOL_GROUPS[groupName]
-	if (!toolGroup) {
-		return []
-	}
-
-	return toolGroup.tools.filter((tool) =>
-		isToolAllowedInMode(tool as ToolName, mode, customModes, experiments, codeIndexManager, settings),
-	) as ToolName[]
 }
 
 /**

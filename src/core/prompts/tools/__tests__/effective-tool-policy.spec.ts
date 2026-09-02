@@ -248,6 +248,28 @@ describe("resolveEffectiveToolPolicy - MCP resource gate", () => {
 		expect(hasNeither.hasMcpTools).toBe(false)
 		expect(hasNeither.hasMcpResources).toBe(false)
 	})
+
+	it("returns hasMcpTools false when the only tool has enabledForPrompt: false", () => {
+		const policy = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([{ name: "s", tools: [{ name: "t", enabledForPrompt: false }] }]),
+		})
+		expect(policy.hasMcpTools).toBe(false)
+	})
+
+	it("returns hasMcpTools true when a tool has enabledForPrompt: true", () => {
+		const policy = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([{ name: "s", tools: [{ name: "t", enabledForPrompt: true }] }]),
+		})
+		expect(policy.hasMcpTools).toBe(true)
+	})
+
+	it("returns hasMcpTools false for a server excluded by the allowlist", () => {
+		const policy = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([{ name: "excluded", tools: [{ name: "t", enabledForPrompt: true }] }]),
+			allowedMcpServers: ["other"],
+		})
+		expect(policy.hasMcpTools).toBe(false)
+	})
 })
 
 describe("resolveEffectiveToolPolicy - worst case (control-tools-only mode)", () => {

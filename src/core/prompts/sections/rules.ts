@@ -88,7 +88,6 @@ export function getRulesSection(
 	const hasExecuteCommand = policy.tools.has("execute_command")
 	const hasAskFollowupQuestion = policy.tools.has("ask_followup_question")
 	const hasListFiles = policy.tools.has("list_files")
-	const hasAttemptCompletion = policy.tools.has("attempt_completion")
 	const hasReadFile = policy.tools.has("read_file")
 
 	const rules: string[] = []
@@ -125,17 +124,9 @@ export function getRulesSection(
 		"When making changes to code, always consider the context in which the code is being used. Ensure that your changes are compatible with the existing codebase and that they follow the project's coding standards and best practices.",
 	)
 
-	if (hasAttemptCompletion) {
-		rules.push(
-			"Do not ask for more information than necessary. Use the tools provided to accomplish the user's request efficiently and effectively. When you've completed your task, you must use the attempt_completion tool to present the result to the user. The user may provide feedback, which you can use to make improvements and try again.",
-		)
-	} else {
-		// attempt_completion is a protocol guarantee and is essentially always present;
-		// the fallback keeps the guidance coherent if it were ever excluded.
-		rules.push(
-			"Do not ask for more information than necessary. Use the tools provided to accomplish the user's request efficiently and effectively. When you've completed your task, provide your best-effort result and state your assumptions; the user may respond with feedback after completion.",
-		)
-	}
+	rules.push(
+		"Do not ask for more information than necessary. Use the tools provided to accomplish the user's request efficiently and effectively. When you've completed your task, you must use the attempt_completion tool to present the result to the user. The user may provide feedback, which you can use to make improvements and try again.",
+	)
 
 	if (hasAskFollowupQuestion) {
 		rules.push(

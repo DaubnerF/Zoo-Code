@@ -4,7 +4,6 @@ import { TOOL_ALIASES, TOOL_GROUPS } from "../../../shared/tools"
 import type { CodeIndexManager } from "../../../services/code-index/manager"
 import type { McpHub } from "../../../services/mcp/McpHub"
 import { isToolAllowedForMode } from "../../../core/tools/validateToolUse"
-import { getMcpServerTools } from "./native-tools"
 
 /**
  * Canonical tool names that participate in the task-completion protocol and must
@@ -26,6 +25,12 @@ export const PROTOCOL_TOOLS: readonly string[] = ["attempt_completion"]
  * A group entry may be either a bare group name (string) or a tuple of
  * `[groupName, options]`. Only a tuple entry with a `fileRegex` establishes a
  * prompt-visible edit restriction.
+ *
+ * Returning only the first restriction is intentional: the mode schema rejects
+ * duplicate groups (the `rawGroupEntryArraySchema` refine in
+ * `packages/types/src/mode.ts`), so a mode can declare at most one `edit` group
+ * with a `fileRegex`; and the runtime validator (`validateToolUse.ts`) likewise
+ * returns at the first matching group, so the prompt and the validator agree.
  *
  * @param groups The mode's group entries.
  * @returns The first `{ fileRegex, description }` found, or undefined when the
@@ -70,6 +75,36 @@ export function resolveToolAlias(toolName: string): string {
 	return canonical ?? toolName
 }
 
+/**
+ * Canonical protocol-tool names already warned about. Module-level so the
+ * protocol-override warning fires at most once per tool per process.
+ */
+const warnedProtocolOverrides = new Set<string>()
+
+/**
+ * Warns once per process, per protocol tool, when `disabledTools` tries to
+ * disable a protocol tool — which the protocol guarantee step makes a no-op.
+ *
+ * Uses `console.warn` (not the shared `logger`, which is a no-op in production)
+ * so the no-op disable is visible to extension developers.
+ *
+ * @param disabledTools The raw disabled-tools list (may contain aliases).
+ */
+function warnProtocolToolOverrides(disabledTools?: string[]): void {
+	if (!disabledTools?.length) {
+		return
+	}
+	for (const toolName of disabledTools) {
+		const canonical = resolveToolAlias(toolName)
+		if (PROTOCOL_TOOLS.includes(canonical) && !warnedProtocolOverrides.has(canonical)) {
+			warnedProtocolOverrides.add(canonical)
+			console.warn(
+				`[effective-tool-policy] '${canonical}' is a protocol tool: disabling it via disabledTools is a no-op; it remains available.`,
+			)
+		}
+	}
+}
+
 export interface EffectiveToolPolicyInput {
 	mode: string
 	customModes?: ModeConfig[]
@@ -94,6 +129,12 @@ export interface EffectiveToolPolicy {
 	hasMcpGroup: boolean // mode's groups include "mcp"
 	hasMcpTools: boolean // ≥1 dynamic MCP tool enabled for allowed servers
 	hasMcpResources: boolean // ≥1 accessible resource on allowed servers
+	/**
+	 * The mode's first edit-group file restriction. First-only is intentional:
+	 * the mode schema rejects duplicate groups, so at most one `edit` group can
+	 * carry a `fileRegex`, and the runtime validator likewise stops at the first
+	 * matching group — prompt and validator agree.
+	 */
 	editRestriction?: { fileRegex: string; description?: string }
 }
 
@@ -101,12 +142,21 @@ export interface EffectiveToolPolicy {
  * True when at least one dynamic MCP tool (e.g. `mcp_serverName_toolName`) is
  * enabled for the allowed servers. Used to gate the MCP capability bullet in the
  * prompt so servers whose every tool is `enabledForPrompt: false` do not count.
+ *
+ * Cheap existence check: it inspects the MCP server snapshot directly (allowlist
+ * + `enabledForPrompt !== false`, mirroring the `getMcpServerTools` filter) and
+ * never materializes or normalizes tool schemas.
  */
 function resolveHasMcpTools(mcpHub?: McpHub, allowedServers?: string[]): boolean {
 	if (!mcpHub) {
 		return false
 	}
-	return getMcpServerTools(mcpHub, allowedServers).length > 0
+	let servers = mcpHub.getServers()
+	if (allowedServers) {
+		const allowSet = new Set(allowedServers)
+		servers = servers.filter((server) => allowSet.has(server.name))
+	}
+	return servers.some((server) => server.tools?.some((tool) => tool.enabledForPrompt !== false))
 }
 
 /**
@@ -134,6 +184,11 @@ export function hasAnyMcpResources(mcpHub: McpHub, allowedServers?: string[]): b
  * construction, runtime validation, and preview. It performs, in order, the same
  * steps `filterNativeToolsForMode` used to compute inline (steps 1-10 of that
  * function), plus a protocol guarantee that re-adds `PROTOCOL_TOOLS`.
+ *
+ * The returned policy is deterministic for a given input. The only side effect
+ * is an intentional, process-deduplicated `console.warn` when a protocol tool is
+ * disabled via `disabledTools` (such a disable is a no-op); it fires at most once
+ * per tool per process, so repeated calls never re-warn and do not affect output.
  *
  * @param input Mode, custom modes, MCP hub, disabled tools, model customization,
  *   experiment flags, todo-list enablement, and the code index manager.
@@ -239,6 +294,7 @@ export function resolveEffectiveToolPolicy(input: EffectiveToolPolicyInput): Eff
 
 	// 11. Protocol guarantee: re-add every protocol tool so the logical set and
 	//     the runtime validator both agree it is callable even when disabled.
+	warnProtocolToolOverrides(disabledTools)
 	for (const tool of PROTOCOL_TOOLS) {
 		allowedToolNames.add(resolveToolAlias(tool))
 	}

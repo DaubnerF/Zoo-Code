@@ -344,6 +344,24 @@ describe("getRulesSection", () => {
 		const result = getRulesSection(cwd, settings, policyFor(["read", "edit", "command"]))
 		expect(result).toContain("RULES")
 	})
+
+	it("states the attempt_completion protocol rule unconditionally", () => {
+		// F6: the completion sentence is protocol wording — emitted even when the policy
+		// does not advertise attempt_completion. A raw literal is required: the
+		// resolver-backed policyFor cannot express this (protocol guarantee re-adds the
+		// tool in resolveEffectiveToolPolicy step 11).
+		const rawPolicy: EffectiveToolPolicy = {
+			tools: new Set<string>(["read_file"]),
+			hasMcpGroup: false,
+			hasMcpTools: false,
+			hasMcpResources: false,
+		}
+
+		expect(rawPolicy.tools.has("attempt_completion")).toBe(false)
+		expect(getRulesSection(cwd, settings, rawPolicy)).toContain(
+			"you must use the attempt_completion tool to present the result to the user",
+		)
+	})
 })
 
 describe("getSystemInfoSection", () => {
