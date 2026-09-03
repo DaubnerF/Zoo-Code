@@ -1,7 +1,13 @@
+import { customToolRegistry } from "@roo-code/core"
 import type { ModeConfig, ModelInfo } from "@roo-code/types"
 
 import type { EffectiveToolPolicy } from "../effective-tool-policy"
-import { PROTOCOL_TOOLS, resolveEffectiveToolPolicy, buildToolRequirements } from "../effective-tool-policy"
+import {
+	PROTOCOL_TOOLS,
+	resolveEffectiveToolPolicy,
+	resolveToolAlias,
+	buildToolRequirements,
+} from "../effective-tool-policy"
 import { getModeBySlug, defaultModeSlug } from "../../../../shared/modes"
 import type { McpHub } from "../../../../services/mcp/McpHub"
 import type { CodeIndexManager } from "../../../../services/code-index/manager"
@@ -303,5 +309,354 @@ describe("buildToolRequirements", () => {
 	it("adds alias + canonical for real aliases", () => {
 		const reqs = buildToolRequirements(["write_file"])
 		expect(Object.keys(reqs).sort()).toEqual(["write_file", "write_to_file"].sort())
+	})
+
+	it("skips protocol tools but keeps regular tools in a mixed list", () => {
+		// A protocol tool must be skipped while the regular tool in the same list
+		// still produces its alias + canonical entries.
+		expect(buildToolRequirements(["attempt_completion", "write_file"])).toEqual({
+			write_file: false,
+			write_to_file: false,
+		})
+	})
+})
+
+describe("resolveToolAlias", () => {
+	it("resolves every registered alias to its canonical tool", () => {
+		// Exercises the module-load ALIAS_TO_CANONICAL map for both registered aliases.
+		expect(resolveToolAlias("write_file")).toBe("write_to_file")
+		expect(resolveToolAlias("search_and_replace")).toBe("edit")
+	})
+
+	it("returns canonical and unknown names unchanged", () => {
+		expect(resolveToolAlias("read_file")).toBe("read_file")
+		expect(resolveToolAlias("not_a_tool")).toBe("not_a_tool")
+	})
+})
+
+describe("PROTOCOL_TOOLS", () => {
+	it("lists the single protocol tool by canonical name", () => {
+		expect([...PROTOCOL_TOOLS]).toEqual(["attempt_completion"])
+	})
+})
+
+describe("resolveEffectiveToolPolicy - edit restriction edge cases", () => {
+	it("skips non-edit group tuples even when they declare a fileRegex", () => {
+		// Only an actual `edit` tuple can establish the restriction: a `read` tuple
+		// carrying a fileRegex must be skipped, and an edit tuple without a fileRegex
+		// must not produce one either.
+		const policy = policyFor([["read", { fileRegex: "\\.ts$" }], ["edit", {}], "command"])
+		expect(policy.editRestriction).toBeUndefined()
+	})
+
+	it("does not crash on a malformed edit tuple without options", () => {
+		// Runtime guard: the extraction uses `group[1]?.fileRegex`, so an options-less
+		// tuple must be skipped rather than throwing.
+		const groups = JSON.parse('[["edit"]]') as ModeConfig["groups"]
+		expect(policyFor(groups).editRestriction).toBeUndefined()
+	})
+})
+
+describe("resolveEffectiveToolPolicy - step 3 validator removal", () => {
+	it("drops granted tools when the validator does not recognize the mode", () => {
+		const customMode: ModeConfig = {
+			slug: "policy-test",
+			name: "Policy Under Test",
+			roleDefinition: "",
+			groups: ["read", "edit", "command"],
+		}
+		// The requested slug matches no mode, so the fallback (architect) grants its
+		// read/edit/mcp tools but the per-tool validator rejects every non-always-available
+		// tool, and the step-3 removal loop drops them.
+		const policy = resolveEffectiveToolPolicy({ mode: "ghost-mode", customModes: [customMode] })
+		expect(policy.tools.has("read_file")).toBe(false)
+		expect(policy.tools.has("write_to_file")).toBe(false)
+		expect(policy.tools.has("use_mcp_tool")).toBe(false)
+		expect(policy.tools.has("switch_mode")).toBe(true)
+		expect(policy.tools.has("attempt_completion")).toBe(true)
+	})
+
+	it("re-adds validator-removed group tools via includedTools (regular-tool mapping)", () => {
+		// The includedTools branch maps every regular group tool through
+		// TOOL_GROUPS; when a granted tool was dropped by the step-3 validator
+		// (unknown mode slug), including it re-adds it because its group is allowed
+		// by the fallback mode config.
+		const customMode: ModeConfig = {
+			slug: "policy-test",
+			name: "Policy Under Test",
+			roleDefinition: "",
+			groups: ["read", "edit", "command"],
+		}
+		const policy = resolveEffectiveToolPolicy({
+			mode: "ghost-mode",
+			customModes: [customMode],
+			modelInfo: modelInfo({ includedTools: ["read_file"] }),
+		})
+		expect(policy.tools.has("read_file")).toBe(true)
+	})
+
+	it("threads the experiments flags into the per-mode validator", () => {
+		// The resolver forwards `experiments ?? {}` to the validator; the customTools
+		// escape hatch in isToolAllowedForMode only fires when that flag actually
+		// arrives. A registered custom tool is therefore retained for an otherwise
+		// unknown mode when (and only when) the flag is passed through.
+		const customMode: ModeConfig = {
+			slug: "policy-test",
+			name: "Policy Under Test",
+			roleDefinition: "",
+			groups: ["read"],
+		}
+		customToolRegistry.register({ name: "shadow_read_tool", description: "test double", execute: async () => "ok" })
+		try {
+			const withFlag = resolveEffectiveToolPolicy({
+				mode: "ghost-mode",
+				customModes: [customMode],
+				experiments: { customTools: true },
+			})
+			// shadow_read_tool is not granted by any group, so the flag alone cannot
+			// re-add it; instead the flag must keep granted tools that the validator
+			// would otherwise reject for the unknown mode.
+			expect(withFlag.tools.has("read_file")).toBe(false)
+
+			// Direct proof of flag threading: register under a granted tool's name.
+			customToolRegistry.register({ name: "read_file", description: "shadow", execute: async () => "ok" })
+			const shadowed = resolveEffectiveToolPolicy({
+				mode: "ghost-mode",
+				customModes: [customMode],
+				experiments: { customTools: true },
+			})
+			expect(shadowed.tools.has("read_file")).toBe(true)
+
+			// Without the flag the same shadowed tool is still rejected.
+			const withoutFlag = resolveEffectiveToolPolicy({ mode: "ghost-mode", customModes: [customMode] })
+			expect(withoutFlag.tools.has("read_file")).toBe(false)
+		} finally {
+			customToolRegistry.clear()
+		}
+	})
+
+	it("forwards an empty customModes default to the per-mode validator", async () => {
+		// The step-3 permission filter forwards `customModes ?? []` (and
+		// `experiments ?? {}`) to isToolAllowedForMode. A phantom default entry would
+		// behave identically downstream (a non-object never matches a mode slug), so
+		// the forwarded argument itself is the only observable. Wrap the real
+		// validator for one fresh module instance and assert what it receives.
+		const seen: unknown[][] = []
+		vi.doMock("../../../../core/tools/validateToolUse", async (importOriginal) => {
+			const original = await importOriginal<typeof import("../../../../core/tools/validateToolUse")>()
+			return {
+				...original,
+				isToolAllowedForMode: (...args: Parameters<typeof original.isToolAllowedForMode>) => {
+					seen.push(args)
+					return original.isToolAllowedForMode(...args)
+				},
+			}
+		})
+		vi.resetModules()
+		const mod = await import("../effective-tool-policy")
+		try {
+			mod.resolveEffectiveToolPolicy({ mode: "code" })
+			expect(seen.length).toBeGreaterThan(0)
+			for (const args of seen) {
+				expect(args[2]).toEqual([])
+			}
+
+			// Provided custom modes are forwarded by reference, unchanged.
+			const customModes: ModeConfig[] = [
+				{ slug: "passthrough-test", name: "PT", roleDefinition: "", groups: ["read"] },
+			]
+			seen.length = 0
+			mod.resolveEffectiveToolPolicy({ mode: "code", customModes })
+			expect(seen.some((args) => args[2] === customModes)).toBe(true)
+		} finally {
+			vi.doUnmock("../../../../core/tools/validateToolUse")
+			vi.resetModules()
+		}
+	})
+})
+
+describe("resolveEffectiveToolPolicy - opt-in custom tools via includedTools", () => {
+	it("adds opt-in custom tools only when their group is allowed", () => {
+		// "edit" is an opt-in custom tool of the edit group: absent from the group grant,
+		// it is re-added only when model customization includes it AND the mode allows
+		// the owning group (the toolToGroup map includes customTools entries).
+		const withEditGroup = policyFor(["edit"], { modelInfo: modelInfo({ includedTools: ["edit"] }) })
+		expect(withEditGroup.tools.has("edit")).toBe(true)
+
+		const withoutEditGroup = policyFor(["read"], { modelInfo: modelInfo({ includedTools: ["edit"] }) })
+		expect(withoutEditGroup.tools.has("edit")).toBe(false)
+	})
+
+	it("resolves aliased opt-in custom tools through the group's customTools", () => {
+		// "search_and_replace" is an alias of the opt-in custom tool "edit".
+		const policy = policyFor(["edit"], { modelInfo: modelInfo({ includedTools: ["search_and_replace"] }) })
+		expect(policy.tools.has("edit")).toBe(true)
+	})
+})
+
+describe("resolveEffectiveToolPolicy - code index readiness flags", () => {
+	it("drops codebase_search when the feature is disabled", () => {
+		const manager = {
+			isFeatureEnabled: false,
+			isFeatureConfigured: true,
+			isInitialized: true,
+		} as CodeIndexManager
+		expect(policyFor(["read"], { codeIndexManager: manager }).tools.has("codebase_search")).toBe(false)
+	})
+
+	it("drops codebase_search when the feature is not configured", () => {
+		const manager = {
+			isFeatureEnabled: true,
+			isFeatureConfigured: false,
+			isInitialized: true,
+		} as CodeIndexManager
+		expect(policyFor(["read"], { codeIndexManager: manager }).tools.has("codebase_search")).toBe(false)
+	})
+
+	it("drops codebase_search when the index is not initialized", () => {
+		const manager = {
+			isFeatureEnabled: true,
+			isFeatureConfigured: true,
+			isInitialized: false,
+		} as CodeIndexManager
+		expect(policyFor(["read"], { codeIndexManager: manager }).tools.has("codebase_search")).toBe(false)
+	})
+})
+
+describe("resolveEffectiveToolPolicy - MCP capability flags", () => {
+	it("reports no MCP capabilities without an mcpHub", () => {
+		const policy = policyFor(["mcp"])
+		expect(policy.hasMcpTools).toBe(false)
+		expect(policy.hasMcpResources).toBe(false)
+	})
+
+	it("keeps hasMcpGroup true when mcp is mixed with other groups", () => {
+		expect(policyFor(["read", "mcp", "command"]).hasMcpGroup).toBe(true)
+	})
+
+	it("returns hasMcpTools true for an allowlisted server even when other servers are dropped", () => {
+		const policy = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([
+				{ name: "other", tools: [{ name: "t", enabledForPrompt: true }] },
+				{ name: "listed", tools: [{ name: "t", enabledForPrompt: true }] },
+			]),
+			allowedMcpServers: ["listed"],
+		})
+		expect(policy.hasMcpTools).toBe(true)
+	})
+
+	it("returns hasMcpTools true when at least one of several tools is prompt-enabled", () => {
+		const policy = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([
+				{
+					name: "s",
+					tools: [
+						{ name: "off-a", enabledForPrompt: false },
+						{ name: "off-b", enabledForPrompt: false },
+						{ name: "live", enabledForPrompt: true },
+					],
+				},
+			]),
+		})
+		expect(policy.hasMcpTools).toBe(true)
+	})
+
+	it("returns hasMcpTools false when every tool of the server is prompt-disabled", () => {
+		const policy = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([
+				{
+					name: "s",
+					tools: [
+						{ name: "off-a", enabledForPrompt: false },
+						{ name: "off-b", enabledForPrompt: false },
+					],
+				},
+			]),
+		})
+		expect(policy.hasMcpTools).toBe(false)
+	})
+})
+
+describe("resolveEffectiveToolPolicy - protocol override warning (fresh module)", () => {
+	// The warn-dedupe set is module state and other tests in this file already resolve
+	// policies that disable protocol tools (priming the set), so each test reloads a
+	// fresh module instance whose dedupe set starts empty.
+	async function freshResolve() {
+		vi.resetModules()
+		const mod = await import("../effective-tool-policy")
+		return mod.resolveEffectiveToolPolicy
+	}
+
+	it("skips an alias of a protocol tool when building tool requirements", async () => {
+		// buildToolRequirements skips a tool when its canonical name OR its raw name
+		// is a protocol tool. Register a temporary alias of attempt_completion so the
+		// two operands of that `||` differ: the alias must still be skipped.
+		vi.resetModules()
+		const toolsMod = await import("../../../../shared/tools")
+		toolsMod.TOOL_ALIASES.wp4_attempt_alias = "attempt_completion"
+		const mod = await import("../effective-tool-policy")
+		try {
+			expect(mod.buildToolRequirements(["wp4_attempt_alias"])).toEqual({})
+			// Sanity: the injected alias actually resolves through the fresh module.
+			expect(mod.resolveToolAlias("wp4_attempt_alias")).toBe("attempt_completion")
+		} finally {
+			delete toolsMod.TOOL_ALIASES.wp4_attempt_alias
+		}
+	})
+
+	it("warns once per protocol tool, names the tool, and keeps it available", async () => {
+		vi.resetModules()
+		// Import shared/tools first and assert the alias map right after the fresh
+		// import, so a broken module-load alias map (ALIAS_TO_CANONICAL) fails here.
+		const mod = await import("../effective-tool-policy")
+		expect(mod.resolveToolAlias("write_file")).toBe("write_to_file")
+		expect(mod.resolveToolAlias("search_and_replace")).toBe("edit")
+		expect([...mod.PROTOCOL_TOOLS]).toEqual(["attempt_completion"])
+		const resolve = mod.resolveEffectiveToolPolicy
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+		try {
+			const policy = resolve({ mode: "code", disabledTools: ["attempt_completion"] })
+			expect(warnSpy).toHaveBeenCalledTimes(1)
+			const message = String(warnSpy.mock.calls[0]?.[0])
+			expect(message).toContain("[effective-tool-policy]")
+			expect(message).toContain("'attempt_completion'")
+			expect(message).toContain("no-op")
+			expect(policy.tools.has("attempt_completion")).toBe(true)
+
+			// Second resolve on the same module instance: deduped, no additional warn.
+			const policy2 = resolve({ mode: "code", disabledTools: ["attempt_completion", "execute_command"] })
+			expect(warnSpy).toHaveBeenCalledTimes(1)
+			expect(policy2.tools.has("execute_command")).toBe(false)
+		} finally {
+			warnSpy.mockRestore()
+		}
+	})
+
+	it("does not warn or throw for empty or missing disabledTools", async () => {
+		const resolve = await freshResolve()
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+		try {
+			expect(() => resolve({ mode: "code", disabledTools: [] })).not.toThrow()
+			expect(() => resolve({ mode: "code" })).not.toThrow()
+			expect(warnSpy).not.toHaveBeenCalled()
+		} finally {
+			warnSpy.mockRestore()
+		}
+	})
+
+	it("warns again on a fresh module instance (per-process dedupe)", async () => {
+		const first = await freshResolve()
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+		try {
+			first({ mode: "code", disabledTools: ["attempt_completion"] })
+			expect(warnSpy).toHaveBeenCalledTimes(1)
+
+			// A different module instance has its own dedupe set and warns again.
+			const second = await freshResolve()
+			second({ mode: "code", disabledTools: ["attempt_completion"] })
+			expect(warnSpy).toHaveBeenCalledTimes(2)
+		} finally {
+			warnSpy.mockRestore()
+		}
 	})
 })

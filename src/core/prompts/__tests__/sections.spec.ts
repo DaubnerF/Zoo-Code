@@ -14,6 +14,14 @@ import type { CodeIndexManager } from "../../../services/code-index/manager"
 import type { SkillsManager } from "../../../services/skills/SkillsManager"
 import * as shellUtils from "../../../utils/shell"
 
+// Mock os-name so getSystemInfoSection never spawns PowerShell on Windows (cold
+// launches can exceed the CI test timeout). Matches the form used in
+// sections/__tests__/system-info.spec.ts, but returns a constant since no test
+// here asserts on the OS string itself.
+vi.mock("os-name", () => ({
+	default: vi.fn(() => "MockOS"),
+}))
+
 /**
  * Build an {@link EffectiveToolPolicy} for arbitrary mode groups. `mode` is the
  * custom-mode slug so the resolver derives everything from `groups` (never from

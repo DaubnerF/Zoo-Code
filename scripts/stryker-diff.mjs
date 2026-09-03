@@ -313,23 +313,54 @@ export function resolveVitestBinary(repoRoot, packageEntry) {
 	return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates.at(-1)
 }
 
+// On Windows, pnpm creates .CMD shims (e.g. vitest.CMD) that spawnSync refuses to
+// execute without the extension and shell:true; on Linux the extensionless shim works as-is.
+function resolveWin32Cmd(bin) {
+	return process.platform === "win32" && fs.existsSync(`${bin}.CMD`) ? `${bin}.CMD` : bin
+}
+
+// With shell:true Node concatenates command and args into a single cmd.exe line
+// without escaping (DEP0190), so operands containing spaces must be quoted.
+function win32ShellQuote(s) {
+	return `"${String(s).replaceAll('"', '\\"')}"`
+}
+
 export function discoverRelatedTestFiles(repoRoot, packageEntry, reportDirectory) {
 	const packageRoot = path.join(repoRoot, packageEntry.root)
 	const runRoot = path.join(repoRoot, packageEntry.runRoot ?? packageEntry.root)
 	const outputFile = path.join(reportDirectory, "vitest-related.json")
 	const configFile = path.relative(runRoot, path.join(packageRoot, packageEntry.vitestConfig)).replaceAll("\\", "/")
 	const sourceFiles = [...new Set(packageEntry.selectors.map(selectorFile))]
-	const result = spawnSync(
-		resolveVitestBinary(repoRoot, packageEntry),
-		["related", ...sourceFiles, "--run", "--config", configFile, "--reporter=json", `--outputFile=${outputFile}`],
-		{
-			cwd: runRoot,
-			encoding: "utf8",
-			timeout: 5 * 60 * 1_000,
-			maxBuffer: 50 * 1024 * 1024,
-			env: process.env,
-		},
-	)
+	const command = resolveWin32Cmd(resolveVitestBinary(repoRoot, packageEntry))
+	// With shell:true a missing binary surfaces as a cmd.exe exit code instead of a
+	// spawn error, so mirror the ENOENT that spawnSync reports without a shell.
+	if (process.platform === "win32" && !fs.existsSync(command)) {
+		throw new Error(`${packageEntry.id} related-test discovery could not start: spawnSync ${command} ENOENT`)
+	}
+	const win32 = process.platform === "win32"
+	const spawnArgs = [
+		"related",
+		...sourceFiles,
+		"--run",
+		"--config",
+		configFile,
+		"--reporter=json",
+		`--outputFile=${outputFile}`,
+	]
+	// Node warns (DEP0190) whenever spawnSync receives a non-empty args array with
+	// shell:true, even when every operand is already quoted, so on win32 join the
+	// quoted operands into one command line and pass an empty args array.
+	const [spawnCommand, spawnOperands] = win32
+		? [[command, ...spawnArgs].map((operand) => win32ShellQuote(operand)).join(" "), []]
+		: [command, spawnArgs]
+	const result = spawnSync(spawnCommand, spawnOperands, {
+		cwd: runRoot,
+		encoding: "utf8",
+		timeout: 5 * 60 * 1_000,
+		maxBuffer: 50 * 1024 * 1024,
+		env: process.env,
+		shell: win32,
+	})
 
 	if (result.error?.code === "ETIMEDOUT") {
 		throw new Error(`${packageEntry.id} related-test discovery exceeded 5 minutes`)
@@ -367,11 +398,28 @@ function runStryker(repoRoot, packageEntry, reportRoot, dryRunOnly) {
 	]
 	if (dryRunOnly) args.push("--dryRunOnly", "--reporters", "clear-text", "--logLevel", "info")
 
-	const result = spawnSync(path.join(repoRoot, "node_modules/.bin/stryker"), args, {
+	const command = resolveWin32Cmd(path.join(repoRoot, "node_modules/.bin/stryker"))
+	// With shell:true a missing binary surfaces as a cmd.exe exit code instead of a
+	// spawn error, so mirror the ENOENT that spawnSync reports without a shell.
+	if (process.platform === "win32" && !fs.existsSync(command)) {
+		throw new Error(
+			`${packageEntry.id} Stryker ${dryRunOnly ? "preflight" : "run"} could not start: spawnSync ${command} ENOENT`,
+		)
+	}
+	const win32 = process.platform === "win32"
+	// Node warns (DEP0190) whenever spawnSync receives a non-empty args array with
+	// shell:true, even when every operand is already quoted, so on win32 join the
+	// quoted operands into one command line and pass an empty args array.
+	const [spawnCommand, spawnOperands] = win32
+		? [[command, ...args].map((operand) => win32ShellQuote(operand)).join(" "), []]
+		: [command, args]
+
+	const result = spawnSync(spawnCommand, spawnOperands, {
 		cwd: runRoot,
 		encoding: "utf8",
 		timeout: 12 * 60 * 1_000,
 		maxBuffer: 50 * 1024 * 1024,
+		shell: win32,
 		env: {
 			...process.env,
 			STRYKER_VITEST_CONFIG: path

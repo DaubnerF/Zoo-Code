@@ -79,4 +79,26 @@ describe("getSystemInfoSection", () => {
 
 		expect(result).not.toContain("New terminals will be created")
 	})
+
+	it("includes the full terminal working-directory sentence when execute_command is present", () => {
+		mockOsName.mockReturnValue("Ubuntu 22.04")
+
+		const result = getSystemInfoSection(mockCwd, policyFor(true))
+
+		// Exact substring of the execute_command-gated sentence; also proves the
+		// `execute_command` lookup itself is not mutated away.
+		expect(result).toContain(
+			"New terminals will be created in the current workspace directory, however if you change directories in a terminal it will then have a different working directory; changing directories in a terminal does not modify the workspace directory, because you do not have access to change the workspace directory.",
+		)
+	})
+
+	it("joins the workspace sentence directly to the next sentence when execute_command is absent", () => {
+		mockOsName.mockReturnValue("Ubuntu 22.04")
+
+		const result = getSystemInfoSection(mockCwd, policyFor(false))
+
+		// The false branch must stay empty: any injected filler (e.g. a mutated
+		// sentinel string) breaks this exact join.
+		expect(result).toContain("default directory for all tool operations. When the user initially gives you a task")
+	})
 })

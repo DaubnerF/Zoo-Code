@@ -41,6 +41,15 @@ describe("getSkillsSection", () => {
 		await expect(getSkillsSection({ getSkillsForMode: vi.fn() }, undefined, policyFor(["skill"]))).resolves.toBe("")
 	})
 
+	it("should return empty string when the policy is missing", async () => {
+		const mockSkillsManager = { getSkillsForMode: vi.fn() }
+
+		// The `policy?.` optional chain is the only guard against an undefined
+		// policy; removing it would make this call throw.
+		await expect(getSkillsSection(mockSkillsManager, "code", undefined)).resolves.toBe("")
+		expect(mockSkillsManager.getSkillsForMode).not.toHaveBeenCalled()
+	})
+
 	it("should return empty string when the skill tool is disabled", async () => {
 		const mockSkillsManager = {
 			getSkillsForMode: vi.fn().mockReturnValue([

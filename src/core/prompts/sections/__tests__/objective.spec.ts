@@ -56,6 +56,14 @@ describe("getObjectiveSection", () => {
 		expect(objective).toContain("You accomplish a given task iteratively")
 	})
 
+	it("replaces the ask step with best-effort phrasing when ask_followup_question is absent", () => {
+		const objective = getObjectiveSection(policyFor([]))
+
+		// Exact substring of the false branch, which no other test asserts.
+		expect(objective).toContain("state your assumptions and proceed with the best available value")
+		expect(objective).not.toContain("ask_followup_question tool")
+	})
+
 	it("still names attempt_completion unconditionally when the tool is not advertised", () => {
 		// Step 4 names attempt_completion, a protocol tool, so the wording is emitted
 		// even when the policy's tools set does not include it. The local policyFor builds

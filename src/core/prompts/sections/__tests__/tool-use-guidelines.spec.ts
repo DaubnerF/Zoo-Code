@@ -53,4 +53,20 @@ describe("getToolUseGuidelinesSection", () => {
 
 		expect(guidelines).not.toContain("the list_files tool is more effective than running a command like `ls`")
 	})
+
+	it("includes the list_files example verbatim when list_files is present", () => {
+		const guidelines = getToolUseGuidelinesSection(policyFor(["list_files"]))
+
+		// Exact substring of the gated example, and of the exact join around it.
+		expect(guidelines).toContain(
+			"gathering this information. For example using the list_files tool is more effective than running a command like `ls` in the terminal. It's critical",
+		)
+	})
+
+	it("keeps the false branch empty when the example is omitted", () => {
+		const guidelines = getToolUseGuidelinesSection(policyFor([]))
+
+		// Any injected filler in the false branch breaks this exact join.
+		expect(guidelines).toContain("gathering this information. It's critical")
+	})
 })
