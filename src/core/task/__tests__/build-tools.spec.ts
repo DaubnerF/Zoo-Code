@@ -100,6 +100,8 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 		// in the logical set even though it is advertised in tools.
 		expect(toolNames(result.tools)).toContain("execute_command")
 		expect(result.allowedFunctionNames).not.toContain("execute_command")
+		// Anchor: the mode's read group is still allowed, so the list is populated.
+		expect(result.allowedFunctionNames).toContain("read_file")
 	})
 
 	it("default path (flag omitted) omits disabled tools from the sent declarations", async () => {
@@ -137,5 +139,6 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 		})
 
 		expect(result.allowedFunctionNames).not.toContain("read_file")
+		expect(result.allowedFunctionNames).toContain("attempt_completion")
 	})
 })

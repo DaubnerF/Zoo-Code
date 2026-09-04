@@ -55,7 +55,7 @@ export function getCapabilitiesSection(policy: EffectiveToolPolicy): string {
 
 	let body = `${capabilitySentence}${editRestrictionSuffix}\n`
 
-	body += `- These tools help you effectively accomplish a wide range of tasks.\n`
+	body += `- These tools help you accomplish tasks.\n`
 
 	// `list_files` guidance only — the file-tree *fact* is stated once in
 	// SYSTEM INFORMATION (and carries the cwd there).

@@ -18,7 +18,7 @@ describe("getObjectiveSection", () => {
 		// Check that all numbered items are present
 		expect(objective).toContain("1. Analyze the user's task")
 		expect(objective).toContain("2. Work through these goals sequentially")
-		expect(objective).toContain("3. Remember, you have extensive capabilities")
+		expect(objective).toContain("3. Remember, use the tools provided to you")
 		expect(objective).toContain("4. Once you've completed the user's task")
 		expect(objective).toContain("5. The user may provide feedback")
 	})
@@ -54,6 +54,15 @@ describe("getObjectiveSection", () => {
 
 		expect(objective).toContain("OBJECTIVE")
 		expect(objective).toContain("You accomplish a given task iteratively")
+	})
+
+	it("drops the broad-tool claim under a zero-clause policy", () => {
+		// Regression guard: step 3 must not claim "extensive capabilities" or a
+		// "wide range of tools" when the policy advertises no tool clauses at all.
+		const objective = getObjectiveSection(policyFor([]))
+
+		expect(objective).not.toContain("extensive capabilities")
+		expect(objective).not.toContain("wide range of tools")
 	})
 
 	it("replaces the ask step with best-effort phrasing when ask_followup_question is absent", () => {

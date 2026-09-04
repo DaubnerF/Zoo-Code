@@ -232,6 +232,32 @@ describe("generateSystemPrompt preview parity", () => {
 		expect(capabilities).toContain("execute CLI commands")
 	})
 
+	it("omits command guidance from the preview when execute_command is disabled", async () => {
+		// The preview must forward state.disabledTools to SYSTEM_PROMPT: with
+		// execute_command disabled, the CAPABILITIES section drops every
+		// command-related fragment. The once-value overrides the shared default
+		// without mutating it for other tests.
+		vi.mocked(fakeProvider.getState).mockResolvedValueOnce({
+			apiConfiguration: { apiProvider: providerIdentifiers.openai, modelId: "gpt-4o" },
+			customModePrompts: undefined,
+			customInstructions: undefined,
+			mcpEnabled: false,
+			experiments: {},
+			language: undefined,
+			enableSubfolderRules: false,
+			disabledTools: ["execute_command"],
+		})
+
+		const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+		const capabilities = extractSection(preview, "CAPABILITIES")
+
+		expect(capabilities).not.toContain("execute CLI commands")
+		expect(capabilities).not.toContain("You can use the execute_command tool")
+		// Anchor: the section is still populated, proving only execute_command
+		// guidance was removed.
+		expect(capabilities).toContain("list files")
+	})
+
 	it("resolves when settings are omitted instead of dereferencing them", async () => {
 		// generatePrompt reads `settings?.todoListEnabled`; without the optional
 		// chain this call rejects with a TypeError on the undefined settings object.
@@ -310,7 +336,7 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			expect(result).toContain(
 				"You have access to tools that let you execute CLI commands on the user's computer, list files, view source code definitions, regex search, read files, write and edit files.",
 			)
-			expect(result).toContain("\n- These tools help you effectively accomplish a wide range of tasks.\n")
+			expect(result).toContain("\n- These tools help you accomplish tasks.\n")
 			expect(result).toContain("you can use the list_files tool")
 			expect(result).toContain("You can use the execute_command tool to run commands on the user's computer")
 			expect(result).toContain(

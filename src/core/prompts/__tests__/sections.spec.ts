@@ -344,7 +344,7 @@ describe("getRulesSection", () => {
 		expect(result).toContain("The user may provide a file's contents directly")
 	})
 
-	it("includes vendor confidentiality section when isStealthModel is true (kept)", () => {
+	it("keeps a stable RULES baseline", () => {
 		// duplicate guard: ensure the describe still asserts a stable baseline even if other tests change
 		const result = getRulesSection(cwd, settings, policyFor(["read", "edit", "command"]))
 		expect(result).toContain("RULES")

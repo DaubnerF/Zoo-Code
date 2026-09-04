@@ -145,6 +145,11 @@ export interface EffectiveToolPolicy {
  * Cheap existence check: it inspects the MCP server snapshot directly (allowlist
  * + `enabledForPrompt !== false`, mirroring the `getMcpServerTools` filter) and
  * never materializes or normalizes tool schemas.
+ *
+ * @param mcpHub The MCP hub, or undefined when MCP is unavailable (always false).
+ * @param allowedServers Optional per-mode server allowlist; when provided only
+ *   these servers are considered.
+ * @returns True when at least one allowed server exposes a prompt-enabled tool.
  */
 function resolveHasMcpTools(mcpHub?: McpHub, allowedServers?: string[]): boolean {
 	if (!mcpHub) {
@@ -164,6 +169,11 @@ function resolveHasMcpTools(mcpHub?: McpHub, allowedServers?: string[]): boolean
  * When `allowedServers` is provided, only servers whose name is in the allowlist
  * are considered, keeping the `access_mcp_resource` availability check consistent
  * with the mode's MCP server allowlist.
+ *
+ * @param mcpHub The MCP hub whose server snapshot is inspected.
+ * @param allowedServers Optional per-mode server allowlist; when provided only
+ *   these servers are considered.
+ * @returns True when at least one allowed server exposes one or more resources.
  */
 export function hasAnyMcpResources(mcpHub: McpHub, allowedServers?: string[]): boolean {
 	let servers = mcpHub.getServers()
@@ -287,7 +297,8 @@ export function resolveEffectiveToolPolicy(input: EffectiveToolPolicyInput): Eff
 	// parameter, so the restriction is enforced regardless of call site
 	// (defense in depth).
 	const effectiveAllowedMcpServers = allowedMcpServers ?? modeConfig.allowedMcpServers
-	if (!mcpHub || !hasAnyMcpResources(mcpHub, effectiveAllowedMcpServers)) {
+	const hasMcpResources = !!mcpHub && hasAnyMcpResources(mcpHub, effectiveAllowedMcpServers)
+	if (!hasMcpResources) {
 		allowedToolNames.delete("access_mcp_resource")
 	}
 
@@ -299,7 +310,6 @@ export function resolveEffectiveToolPolicy(input: EffectiveToolPolicyInput): Eff
 	}
 
 	const hasMcpGroup = modeConfig.groups.some((groupEntry: GroupEntry) => getGroupName(groupEntry) === "mcp")
-	const hasMcpResources = !!mcpHub && hasAnyMcpResources(mcpHub, effectiveAllowedMcpServers)
 	const hasMcpTools = resolveHasMcpTools(mcpHub, effectiveAllowedMcpServers)
 
 	return {
