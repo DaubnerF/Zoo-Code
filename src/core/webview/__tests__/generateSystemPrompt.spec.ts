@@ -169,19 +169,24 @@ describe("generateSystemPrompt preview parity", () => {
 	 * a minimal object literal stands in for it. This is the single double
 	 * assertion in this spec.
 	 */
+	// The preview only destructures a handful of getState() fields, so the mock
+	// returns that subset instead of a full ExtensionState; keeping the raw
+	// vi.fn() (rather than vi.mocked) avoids casting the partial doubles.
+	const getStateMock = vi.fn().mockResolvedValue({
+		apiConfiguration: { apiProvider: providerIdentifiers.openai, apiModelId: "gpt-4o" },
+		customModePrompts: undefined,
+		customInstructions: undefined,
+		mcpEnabled: false,
+		experiments: {},
+		language: undefined,
+		enableSubfolderRules: false,
+		disabledTools: undefined,
+	})
+
 	const fakeProvider = {
 		context: mockContext,
 		cwd: "/test/path",
-		getState: vi.fn().mockResolvedValue({
-			apiConfiguration: { apiProvider: providerIdentifiers.openai, modelId: "gpt-4o" },
-			customModePrompts: undefined,
-			customInstructions: undefined,
-			mcpEnabled: false,
-			experiments: {},
-			language: undefined,
-			enableSubfolderRules: false,
-			disabledTools: undefined,
-		}),
+		getState: getStateMock,
 		getMcpHub: vi.fn(),
 		getCurrentTask: vi.fn().mockReturnValue(undefined),
 		getSkillsManager: vi.fn().mockReturnValue(undefined),
@@ -237,8 +242,8 @@ describe("generateSystemPrompt preview parity", () => {
 		// execute_command disabled, the CAPABILITIES section drops every
 		// command-related fragment. The once-value overrides the shared default
 		// without mutating it for other tests.
-		vi.mocked(fakeProvider.getState).mockResolvedValueOnce({
-			apiConfiguration: { apiProvider: providerIdentifiers.openai, modelId: "gpt-4o" },
+		getStateMock.mockResolvedValueOnce({
+			apiConfiguration: { apiProvider: providerIdentifiers.openai, apiModelId: "gpt-4o" },
 			customModePrompts: undefined,
 			customInstructions: undefined,
 			mcpEnabled: false,
