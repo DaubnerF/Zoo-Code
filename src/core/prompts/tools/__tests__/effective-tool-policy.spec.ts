@@ -275,6 +275,50 @@ describe("resolveEffectiveToolPolicy - MCP resource gate", () => {
 			allowedMcpServers: ["other"],
 		})
 		expect(policy.hasMcpTools).toBe(false)
+		expect(policy.tools.has("use_mcp_tool")).toBe(false)
+	})
+
+	it("keeps use_mcp_tool only when an allowed server exposes a prompt-enabled tool", () => {
+		const withTools = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([{ name: "s", tools: [{ name: "t", enabledForPrompt: true }] }]),
+		})
+		expect(withTools.tools.has("use_mcp_tool")).toBe(true)
+
+		const allDisabled = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([{ name: "s", tools: [{ name: "t", enabledForPrompt: false }] }]),
+		})
+		expect(allDisabled.tools.has("use_mcp_tool")).toBe(false)
+	})
+
+	it("drops use_mcp_tool when mcpHub is undefined even though the mcp group is granted", () => {
+		const policy = policyFor(["mcp"])
+		expect(policy.hasMcpGroup).toBe(true)
+		expect(policy.hasMcpTools).toBe(false)
+		expect(policy.tools.has("use_mcp_tool")).toBe(false)
+		expect(policy.tools.has("access_mcp_resource")).toBe(false)
+	})
+
+	it("drops use_mcp_tool when the allowedMcpServers list is empty", () => {
+		const policy = policyFor(["mcp"], {
+			mcpHub: makeMcpHub([
+				{ name: "s", tools: [{ name: "t", enabledForPrompt: true }], resources: [{ uri: "r" }] },
+			]),
+			allowedMcpServers: [],
+		})
+		// An empty allowlist permits no servers: both MCP group tools must go,
+		// even though the hub itself exposes a live tool and a resource.
+		expect(policy.hasMcpTools).toBe(false)
+		expect(policy.hasMcpResources).toBe(false)
+		expect(policy.tools.has("use_mcp_tool")).toBe(false)
+		expect(policy.tools.has("access_mcp_resource")).toBe(false)
+	})
+
+	it("keeps use_mcp_tool with resources-only hub and access_mcp_resource pruned", () => {
+		// The two group tools are gated independently: resources alone keep
+		// access_mcp_resource but must not resurrect use_mcp_tool.
+		const policy = policyFor(["mcp"], { mcpHub: makeMcpHub([{ name: "s", resources: [{ uri: "r" }] }]) })
+		expect(policy.tools.has("access_mcp_resource")).toBe(true)
+		expect(policy.tools.has("use_mcp_tool")).toBe(false)
 	})
 })
 

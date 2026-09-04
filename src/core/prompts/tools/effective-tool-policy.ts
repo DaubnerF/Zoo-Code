@@ -139,8 +139,9 @@ export interface EffectiveToolPolicy {
 
 /**
  * True when at least one dynamic MCP tool (e.g. `mcp_serverName_toolName`) is
- * enabled for the allowed servers. Used to gate the MCP capability bullet in the
- * prompt so servers whose every tool is `enabledForPrompt: false` do not count.
+ * enabled for the allowed servers. Used both to gate the MCP capability bullet in
+ * the prompt and to prune `use_mcp_tool` from the policy's tool set, so servers
+ * whose every tool is `enabledForPrompt: false` do not count.
  *
  * Cheap existence check: it inspects the MCP server snapshot directly (allowlist
  * + `enabledForPrompt !== false`, mirroring the `getMcpServerTools` filter) and
@@ -292,14 +293,21 @@ export function resolveEffectiveToolPolicy(input: EffectiveToolPolicyInput): Eff
 		}
 	}
 
-	// 10. Drop access_mcp_resource unless allowed servers expose accessible resources.
+	// 10. Drop the MCP group tools unless allowed servers actually expose them.
 	// Fall back to the mode config's own allowlist when the caller omits the
 	// parameter, so the restriction is enforced regardless of call site
-	// (defense in depth).
+	// (defense in depth). `getToolsForMode` grants both group tools together, so
+	// each is pruned independently: `access_mcp_resource` when no allowed server
+	// exposes resources, and `use_mcp_tool` when no allowed server exposes a
+	// prompt-enabled tool (mirrors `getMcpServerTools`, which would emit none).
 	const effectiveAllowedMcpServers = allowedMcpServers ?? modeConfig.allowedMcpServers
 	const hasMcpResources = !!mcpHub && hasAnyMcpResources(mcpHub, effectiveAllowedMcpServers)
 	if (!hasMcpResources) {
 		allowedToolNames.delete("access_mcp_resource")
+	}
+	const hasMcpTools = resolveHasMcpTools(mcpHub, effectiveAllowedMcpServers)
+	if (!hasMcpTools) {
+		allowedToolNames.delete("use_mcp_tool")
 	}
 
 	// 11. Protocol guarantee: re-add every protocol tool so the logical set and
@@ -310,7 +318,6 @@ export function resolveEffectiveToolPolicy(input: EffectiveToolPolicyInput): Eff
 	}
 
 	const hasMcpGroup = modeConfig.groups.some((groupEntry: GroupEntry) => getGroupName(groupEntry) === "mcp")
-	const hasMcpTools = resolveHasMcpTools(mcpHub, effectiveAllowedMcpServers)
 
 	return {
 		tools: allowedToolNames,
