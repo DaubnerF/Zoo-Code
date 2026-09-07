@@ -29,7 +29,8 @@ import { MultiSearchReplaceDiffStrategy } from "../../diff/strategies/multi-sear
 import type { ApiMessage } from "../../task-persistence"
 
 type TaskTestAccess = {
-	getSystemPrompt: () => Promise<string>
+	getSystemPrompt: (requestState?: unknown) => Promise<string>
+	handleContextWindowExceededError: () => Promise<void>
 	getEnabledMcpToolsCount: () => Promise<{ enabledToolCount: number; enabledServerCount: number }>
 	initiateTaskLoop: (userContent: Anthropic.Messages.ContentBlockParam[]) => Promise<void>
 	startTask: (task?: string, images?: string[]) => Promise<void>
@@ -645,6 +646,215 @@ describe("Cline", () => {
 			// index 17 is the modelInfo from `this.api.getModel().info`.
 			expect(systemPromptCall[16]).toEqual(["execute_command"])
 			expect(systemPromptCall[17]).toBe(modelInfo)
+		})
+
+		it("fetches dynamic model metadata before reading model info for the prompt", async () => {
+			// Router providers discover model metadata (including included/excluded
+			// tools) lazily. getSystemPrompt must await ensureModelFetched() before
+			// reading getModel().info, otherwise the prompt is built from fallback
+			// metadata with different tool guidance than the runtime path.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+
+			// ProviderState requires all declared fields; the test supplies a partial state (MCP disabled).
+			vi.spyOn(mockProvider, "getState").mockResolvedValue({
+				mcpEnabled: false,
+			} as unknown as ProviderState)
+
+			const fallbackInfo: ModelInfo = {
+				contextWindow: 32_000,
+				supportsPromptCache: false,
+			}
+			const fetchedInfo: ModelInfo = {
+				contextWindow: 128_000,
+				supportsPromptCache: true,
+				excludedTools: ["execute_command"],
+			}
+			let currentInfo = fallbackInfo
+			const ensureModelFetched = vi.fn(async () => {
+				currentInfo = fetchedInfo
+			})
+			Object.assign(task.api, { ensureModelFetched })
+			vi.spyOn(task.api, "getModel").mockImplementation(() => ({ id: "router-model", info: currentInfo }))
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
+
+			await expect(getTaskTestAccess(task).getSystemPrompt()).resolves.toBe("mock system prompt")
+
+			expect(ensureModelFetched).toHaveBeenCalledTimes(1)
+			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
+			// Argument index 17 is modelInfo: it must be the post-fetch metadata.
+			expect(systemPromptCall[17]).toBe(fetchedInfo)
+		})
+
+		it("threads the request state snapshot into the system prompt when provider state changes mid-request", async () => {
+			// attemptApiRequest captures provider state, then getSystemPrompt waits
+			// on MCP initialization. A settings change during that window must NOT
+			// leak into the prompt: the prompt and the runtime tool array (both fed
+			// from the request snapshot) have to stay aligned. The prompt must be
+			// built from that snapshot: if the prompt path re-read provider state,
+			// it would pick up the divergent disabledTools stubbed for later calls.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+
+			const realState = await mockProvider.getState()
+			// First call: the snapshot captured by attemptApiRequest.
+			vi.spyOn(mockProvider, "getState")
+				.mockResolvedValueOnce({
+					...realState,
+					mcpEnabled: false,
+					autoApprovalEnabled: false,
+					disabledTools: ["execute_command"],
+					// ProviderState requires all declared fields; the test supplies the request-scoped subset the prompt consumes.
+				} as unknown as ProviderState)
+				// Any later getState() read returns different disabledTools, so a
+				// re-read along the prompt path would change the observed behavior.
+				.mockResolvedValue({
+					...realState,
+					mcpEnabled: false,
+					autoApprovalEnabled: false,
+					disabledTools: ["read_file"],
+					// ProviderState requires all declared fields; the test supplies the changed-state subset to detect re-reads.
+				} as unknown as ProviderState)
+
+			vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
+			vi.spyOn(task, "getTokenUsage").mockReturnValue({
+				totalCost: 0,
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				contextTokens: 0,
+			})
+			vi.spyOn(task.api, "createMessage").mockReturnValue({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "text", text: "ok" }
+				},
+				async next() {
+					return { done: true, value: undefined }
+				},
+				async return() {
+					return { done: true, value: undefined }
+				},
+				async throw(error: unknown) {
+					throw error
+				},
+				async [Symbol.asyncDispose]() {},
+			} as AsyncGenerator<ApiStreamChunk>)
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
+
+			const iterator = task.attemptApiRequest(0)
+			await iterator.next()
+
+			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
+			// Argument index 16 is disabledTools: the snapshot value from the first
+			// getState call, not the changed value from later reads.
+			expect(systemPromptCall[16]).toEqual(["execute_command"])
+		})
+
+		it("threads the captured state snapshot into the system prompt when manually condensing", async () => {
+			// condenseContext captures provider state once and threads it into
+			// getSystemPrompt so the prompt and the condensing tool array resolve
+			// from one snapshot. Without threading, getSystemPrompt would re-read
+			// provider state here and pick up the divergent second state below.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+
+			// ProviderState requires all declared fields; the test supplies the
+			// snapshot subset (MCP disabled, one disabled tool).
+			const snapshot = {
+				mcpEnabled: false,
+				disabledTools: ["execute_command"],
+			} as unknown as ProviderState
+			vi.spyOn(mockProvider, "getState")
+				// First call: the snapshot captured by condenseContext.
+				.mockResolvedValueOnce(snapshot)
+				// Any later getState() read returns different disabledTools, so a
+				// re-read along the prompt path would change the observed behavior.
+				// ProviderState requires all declared fields; the test supplies the changed-state subset to detect re-reads.
+				.mockResolvedValue({
+					mcpEnabled: false,
+					disabledTools: ["read_file"],
+				} as unknown as ProviderState)
+
+			const getSystemPromptSpy = vi
+				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+				.mockResolvedValue("mock system prompt")
+
+			await task.condenseContext()
+
+			// Reference equality: without threading, the argument would be
+			// undefined and getSystemPrompt would re-read the divergent state.
+			expect(getSystemPromptSpy).toHaveBeenCalledWith(snapshot)
+		})
+
+		it("threads the captured state snapshot into the system prompt when the context window is exceeded", async () => {
+			// handleContextWindowExceededError captures provider state up front
+			// and threads it into the getSystemPrompt call feeding manageContext;
+			// a settings change mid-handler must not leak into the condensing prompt.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+
+			// ProviderState requires all declared fields; the test supplies the
+			// snapshot subset (MCP disabled, one disabled tool).
+			const snapshot = {
+				mcpEnabled: false,
+				disabledTools: ["execute_command"],
+			} as unknown as ProviderState
+			vi.spyOn(mockProvider, "getState")
+				// First call: the snapshot captured at the top of
+				// handleContextWindowExceededError.
+				.mockResolvedValueOnce(snapshot)
+				// Any later getState() read returns different disabledTools, so a
+				// re-read along the prompt path would change the observed behavior.
+				// ProviderState requires all declared fields; the test supplies the changed-state subset to detect re-reads.
+				.mockResolvedValue({
+					mcpEnabled: false,
+					disabledTools: ["read_file"],
+				} as unknown as ProviderState)
+
+			// Overflow the 50k window so manageContext takes the condense branch
+			// (the module-mocked summarizeConversation returns a summary).
+			vi.spyOn(task, "getTokenUsage").mockReturnValue({
+				totalCost: 0,
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				contextTokens: 100_000,
+			})
+			vi.spyOn(task.api, "getModel").mockReturnValue({
+				id: "ctx-model",
+				info: { contextWindow: 50_000, maxTokens: 1024, supportsPromptCache: false } as ModelInfo,
+			})
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			task.apiConversationHistory = [{ role: "user", content: [{ type: "text", text: "x" }], ts: Date.now() }]
+
+			const getSystemPromptSpy = vi
+				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+				.mockResolvedValue("mock system prompt")
+
+			await getTaskTestAccess(task).handleContextWindowExceededError()
+
+			// Reference equality: without threading, the argument would be
+			// undefined and getSystemPrompt would re-read the divergent state.
+			expect(getSystemPromptSpy).toHaveBeenCalledWith(snapshot)
 		})
 
 		it("uses the task mode when manually condensing after focused state changes", async () => {

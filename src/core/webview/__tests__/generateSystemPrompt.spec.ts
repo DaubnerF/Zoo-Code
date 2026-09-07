@@ -111,12 +111,36 @@ const fullModelInfo: ModelInfo = {
 	excludedTools: ["read_file"],
 }
 
+// Fallback metadata a lazily loaded router model exposes BEFORE its network
+// fetch resolves. Deliberately distinct from fullModelInfo on the OUTPUT axis:
+// it excludes list_files (fullModelInfo excludes read_file), so the three
+// states — fallback / fetched / undefined — render three different CAPABILITIES
+// sections. The parity tests only pass if generateSystemPrompt awaits
+// ensureModelFetched() before reading getModel().info, and the rejection test
+// below only passes if a failed fetch degrades to THIS fixture (not undefined).
+const fallbackModelInfo: ModelInfo = {
+	contextWindow: 32_000,
+	supportsPromptCache: false,
+	excludedTools: ["list_files"],
+}
+
+const modelMock = vi.hoisted(() => {
+	const state = { fetched: false }
+	const ensureModelFetched = vi.fn(async () => {
+		state.fetched = true
+	})
+	return { state, ensureModelFetched }
+})
+
 // Note: the module under test imports `../../api` from src/core/webview, which
 // resolves to src/api — from this spec's directory (one level deeper) that is
 // `../../../api`.
 vi.mock("../../../api", () => ({
 	buildApiHandler: () => ({
-		getModel: () => ({ id: "m", info: fullModelInfo }),
+		ensureModelFetched: modelMock.ensureModelFetched,
+		// The handler only knows its full metadata (incl. excludedTools) after
+		// ensureModelFetched() resolves, mirroring router providers.
+		getModel: () => ({ id: "m", info: modelMock.state.fetched ? fullModelInfo : fallbackModelInfo }),
 	}),
 }))
 
@@ -153,6 +177,27 @@ const fullSettings = {
 }
 
 describe("generateSystemPrompt preview parity", () => {
+	// Spy lifecycle owned by the describe (mirrors Task.spec.ts's consoleErrorSpy
+	// pattern): a failed assertion inside the rejection test must not leak a
+	// stubbed console.error into later tests. afterEach restores only this spy;
+	// the shared vi.fn() doubles (getStateMock, modelMock) are deliberately left
+	// untouched so their defaults persist for the other tests in this file
+	// (vi.resetAllMocks() would clobber them).
+	let errorSpy: ReturnType<typeof vi.spyOn>
+
+	// The temp handler starts every test in the lazy (pre-fetch) state so the
+	// parity tests genuinely prove the fetch is awaited before getModel().info
+	// is read.
+	beforeEach(() => {
+		modelMock.state.fetched = false
+		modelMock.ensureModelFetched.mockClear()
+		errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+	})
+
+	afterEach(() => {
+		errorSpy.mockRestore()
+	})
+
 	// Section-scoped extraction: capture the text between two "====" headers so
 	// the comparison is limited to the sections the tool policy drives.
 	function extractSection(prompt: string, header: string): string {
@@ -235,6 +280,71 @@ describe("generateSystemPrompt preview parity", () => {
 		expect(capabilities).not.toContain("read files")
 		// Other clauses survive, proving the exclusion is scoped to that tool.
 		expect(capabilities).toContain("execute CLI commands")
+	})
+
+	it("awaits ensureModelFetched before reading model info", async () => {
+		// A lazily loaded router model exposes only fallback metadata until the
+		// fetch resolves. The preview must await ensureModelFetched() first, or
+		// it would build tool guidance from the fallback metadata (which excludes
+		// list_files, not read_file) and diverge from the runtime path.
+		const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+		expect(modelMock.ensureModelFetched).toHaveBeenCalledTimes(1)
+		// "read files" only appears with the fallback metadata; the preview must
+		// reflect the fetched model info instead.
+		const capabilities = extractSection(preview, "CAPABILITIES")
+		expect(capabilities).not.toContain("read files")
+		expect(capabilities).toContain("execute CLI commands")
+	})
+
+	it("falls back to handler model info when ensureModelFetched rejects", async () => {
+		// A network failure must not drop model guidance entirely: the runtime
+		// path (Task.safeEnsureModelFetched) degrades to getModel().info
+		// fallback metadata, and the preview must do the same instead of
+		// passing modelInfo = undefined to SYSTEM_PROMPT. The fixtures make
+		// the three states distinguishable: fallbackModelInfo excludes
+		// list_files, fullModelInfo excludes read_file, and undefined excludes
+		// neither — so the assertion pair below pins the prompt to the
+		// fallback fixture, and fails if the inner try/catch is removed: the
+		// rejection would then skip getModel() and the prompt would be built
+		// with modelInfo === undefined.
+		modelMock.ensureModelFetched.mockRejectedValueOnce(new Error("network down"))
+
+		const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+		const capabilities = extractSection(preview, "CAPABILITIES")
+		// Absent only when modelInfo === fallbackModelInfo (its exclusion).
+		expect(capabilities).not.toContain("list files")
+		// Present only when read_file was NOT excluded — rules out fullModelInfo.
+		expect(capabilities).toContain("read files")
+		expect(capabilities).toContain("execute CLI commands")
+		expect(errorSpy).toHaveBeenCalled()
+	})
+
+	it("degrades to fallback metadata when ensureModelFetched hangs past the preview timeout", async () => {
+		// A hung metadata endpoint (some fetchers issue unbounded GETs) must not
+		// block the user-triggered preview: after PREVIEW_MODEL_FETCH_TIMEOUT_MS
+		// (5s — kept in sync with the production constant) the race resolves and
+		// the prompt is built from the fallback metadata, identical to the
+		// rejected-fetch degradation.
+		vi.useFakeTimers()
+		try {
+			modelMock.ensureModelFetched.mockImplementationOnce(() => new Promise<void>(() => {}))
+
+			const previewPromise = generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+			await vi.advanceTimersByTimeAsync(5_000)
+			const preview = await previewPromise
+
+			const capabilities = extractSection(preview, "CAPABILITIES")
+			// Fallback fixture signature (see fallbackModelInfo): list_files
+			// excluded, read_file still advertised — proves fallback metadata,
+			// not undefined (which would advertise both) and not fullModelInfo
+			// (which would drop "read files").
+			expect(capabilities).not.toContain("list files")
+			expect(capabilities).toContain("read files")
+		} finally {
+			vi.useRealTimers()
+		}
 	})
 
 	it("omits command guidance from the preview when execute_command is disabled", async () => {

@@ -171,6 +171,13 @@ function queuedResponseForAsk(type: ClineAsk, text?: string): QueuedAskResolutio
 const FORCED_CONTEXT_REDUCTION_PERCENT = 75 // Keep 75% of context (remove 25%) on context window errors
 const MAX_CONTEXT_WINDOW_RETRIES = 3 // Maximum retries for context window errors
 
+/**
+ * Provider state snapshot threaded from request entry points (attemptApiRequest,
+ * condenseContext, handleContextWindowExceededError) into `getSystemPrompt` so the
+ * prompt and the runtime tool array resolve from one consistent set of values.
+ */
+type SystemPromptRequestState = Awaited<ReturnType<ClineProvider["getState"]>>
+
 export interface TaskOptions extends CreateTaskOptions {
 	provider: ClineProvider
 	apiConfiguration: ProviderSettings
@@ -1711,10 +1718,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// to ensure tool_use/tool_result pairs are complete in history
 		await this.flushPendingToolResultsToHistory()
 
-		const systemPrompt = await this.getSystemPrompt()
+		// Capture provider state once and thread it into getSystemPrompt so the
+		// prompt and the condensing tool array below resolve from one snapshot.
+		const state = await this.providerRef.deref()?.getState()
+
+		const systemPrompt = await this.getSystemPrompt(state)
 
 		// Get condensing configuration
-		const state = await this.providerRef.deref()?.getState()
 		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
 		// Use task-local values, not provider state, to prevent cross-task configuration leaks.
 		const mode = await this.getTaskMode()
@@ -4037,8 +4047,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return false
 	}
 
-	private async getSystemPrompt(): Promise<string> {
-		const { mcpEnabled } = (await this.providerRef.deref()?.getState()) ?? {}
+	/**
+	 * Builds the SYSTEM_PROMPT. Callers that also construct runtime tools for the
+	 * same request must pass their state snapshot as `requestState` so the prompt
+	 * and the tool array are resolved from one consistent snapshot - otherwise a
+	 * settings change during the MCP wait can make the prompt advertise a tool the
+	 * runtime rejects, or hide a callable tool.
+	 */
+	private async getSystemPrompt(requestState?: SystemPromptRequestState): Promise<string> {
+		const { mcpEnabled } = requestState ?? (await this.providerRef.deref()?.getState()) ?? {}
 		let mcpHub: McpHub | undefined
 		if (mcpEnabled ?? true) {
 			const provider = this.providerRef.deref()
@@ -4062,7 +4079,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		const rooIgnoreInstructions = this.rooIgnoreController?.getInstructions()
 
-		const state = await this.providerRef.deref()?.getState()
+		const state = requestState ?? (await this.providerRef.deref()?.getState())
 
 		const { customModes, customModePrompts, customInstructions, experiments, language, enableSubfolderRules } =
 			state ?? {}
@@ -4077,6 +4094,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				throw new Error("Provider not available")
 			}
 
+			// Load dynamically discovered model metadata (router providers) before
+			// reading it, so the prompt's included/excluded tool guidance matches
+			// the runtime path, which fetches before tool construction.
+			await this.safeEnsureModelFetched()
 			const modelInfo = this.api.getModel().info
 
 			return SYSTEM_PROMPT(
@@ -4122,6 +4143,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * Ensures router-provider model metadata is loaded before getModel() is used for
 	 * context management or streaming. Failures fall back to hardcoded defaults rather
 	 * than aborting the task.
+	 *
+	 * The prompt- and context-critical read sites of getModel() (streaming entry,
+	 * getSystemPrompt, context-window handling) each await this immediately before
+	 * reading; the condense/tool-array read sites are covered by the immediately
+	 * preceding getSystemPrompt guard in the same request plus the router provider's
+	 * success cache. That redundancy is deliberate: router-provider caches successes
+	 * (repeat awaits are no-ops) but caches no failures, so a failing endpoint costs
+	 * one retry per guard. The per-site invariant was chosen over fetch-ordering
+	 * coupling between methods; negative caching in RouterProvider (recording failed
+	 * fetches with a TTL) remains future work if the failure-path latency ever
+	 * matters.
 	 */
 	private async safeEnsureModelFetched(): Promise<void> {
 		try {
@@ -4217,7 +4249,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				apiHandler: this.api,
 				autoCondenseContext: true,
 				autoCondenseContextPercent: FORCED_CONTEXT_REDUCTION_PERCENT,
-				systemPrompt: await this.getSystemPrompt(),
+				systemPrompt: await this.getSystemPrompt(state),
 				taskId: this.taskId,
 				profileThresholds,
 				currentProfileId,
@@ -4338,7 +4370,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// in the caller.
 		this.rateLimitClock.recordRequest()
 
-		const systemPrompt = await this.getSystemPrompt()
+		// Thread the request state snapshot into prompt generation so the prompt
+		// and the runtime tools (built below from the same `state`) stay aligned
+		// even if settings change while this method waits on MCP or rate limits.
+		const systemPrompt = await this.getSystemPrompt(state)
 		const { contextTokens } = this.getTokenUsage()
 
 		if (contextTokens) {
