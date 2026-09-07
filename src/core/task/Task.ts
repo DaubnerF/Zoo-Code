@@ -73,7 +73,13 @@ import { t } from "../../i18n"
 import { getApiMetrics, hasTokenUsageChanged, hasToolUsageChanged } from "../../shared/getApiMetrics"
 import { ClineAskResponse } from "../../shared/WebviewMessage"
 import { defaultModeSlug, getModeBySlug } from "../../shared/modes"
-import { DiffStrategy, type ToolUse, type ToolParamName, toolParamNames } from "../../shared/tools"
+import {
+	DiffStrategy,
+	type AutoApprovalContext,
+	type ToolUse,
+	type ToolParamName,
+	toolParamNames,
+} from "../../shared/tools"
 import { getModelMaxOutputTokens } from "../../shared/api"
 
 // services
@@ -131,7 +137,7 @@ import {
 import { processUserContentMentions } from "../mentions/processUserContentMentions"
 import { getMessagesSinceLastSummary, summarizeConversation, getEffectiveApiHistory } from "../condense"
 import { MessageQueueService } from "../message-queue/MessageQueueService"
-import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
+import { type AutoDenyDetail, AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
@@ -347,6 +353,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private askResponse?: ClineAskResponse
 	private askResponseText?: string
 	private askResponseImages?: string[]
+	/**
+	 * Structured detail of the automatic denial that resolved the current ask,
+	 * set when `checkAutoApproval` denies via policy (denylist, blanket
+	 * auto-deny, or a DCG block in blanket mode) and consumed (cleared) by the
+	 * `ask()` result. System-generated, unlike `askResponseText` which carries
+	 * user feedback and triggers a `user_feedback` say row.
+	 */
+	private pendingAutoDenyDetail?: AutoDenyDetail
 	public lastMessageTs?: number
 	private autoApprovalTimeoutRef?: NodeJS.Timeout
 
@@ -1283,7 +1297,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		partial?: boolean,
 		progressStatus?: ToolProgressStatus,
 		isProtected?: boolean,
-	): Promise<{ response: ClineAskResponse; text?: string; images?: string[]; queuedMessageId?: string }> {
+		autoApprovalContext?: AutoApprovalContext,
+	): Promise<{
+		response: ClineAskResponse
+		text?: string
+		images?: string[]
+		queuedMessageId?: string
+		/**
+		 * Present when the ask was resolved by an automatic (policy) denial
+		 * rather than a user click. Consumers must not treat this as a user
+		 * rejection: the denial is scoped to its own tool call.
+		 */
+		autoDenyDetail?: AutoDenyDetail
+	}> {
 		// If this Cline instance was aborted by the provider, then the only
 		// thing keeping us alive is a promise still running in the background,
 		// in which case we don't want to send its result to the webview as it
@@ -1306,8 +1332,22 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// rendered, leaving them stuck on-screen).
 		const provider = this.providerRef.deref()
 		const state = provider ? await provider.getState() : undefined
+		// The blanket auto-deny setting only engages while command auto-approval
+		// is on; with either master switch off, behavior is unchanged.
+		const blanketDenyEngaged =
+			state?.alwaysDenyUnapprovedCommands === true &&
+			state?.autoApprovalEnabled === true &&
+			state?.alwaysAllowExecute === true
+		// A queued message normally answers the pending ask, which for command asks
+		// means an unconditional auto-approve. That shortcut must never bypass
+		// blanket deny: while it is engaged, a command ask keeps its policy
+		// decision and the queued message is left in place for a later turn
+		// instead of being consumed as approval.
+		const queueMayAnswerThisAsk = !(blanketDenyEngaged && type === "command")
 		const queuedMessage =
-			partial === true || type === "command_output" ? undefined : this.messageQueueService.claimNextMessage()
+			partial === true || type === "command_output" || !queueMayAnswerThisAsk
+				? undefined
+				: this.messageQueueService.claimNextMessage()
 		const queuedAskResolution = queuedMessage ? queuedResponseForAsk(type, text) : undefined
 		// `this.cwd`, not `provider.cwd`:
 		// The path inside `text` was made relative to this task's workspace,
@@ -1315,7 +1355,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// currently reports.
 		const approval = queuedAskResolution
 			? ({ decision: "ask" } as const)
-			: await checkAutoApproval({ state, cwd: this.cwd, ask: type, text, isProtected })
+			: await checkAutoApproval({
+					state,
+					cwd: this.cwd,
+					ask: type,
+					text,
+					isProtected,
+					dcgDecision: autoApprovalContext?.dcgDecision,
+				})
 		const isAutoAnswered = approval.decision === "approve" || approval.decision === "deny"
 		const autoApprovalDecision = isAutoAnswered ? approval.decision : undefined
 
@@ -1427,6 +1474,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		const timeouts: NodeJS.Timeout[] = []
 
+		// Record the structured detail of an automatic (policy) denial so the
+		// `ask()` result can hand it to the caller. Assigned unconditionally so
+		// a stale detail from a previous ask can never leak into this result.
+		// Deliberately not routed through `askResponseText`: that field means
+		// *user feedback* and triggers a `user_feedback` say row, while this
+		// reason is system-generated.
+		this.pendingAutoDenyDetail = approval.decision === "deny" ? approval.autoDeny : undefined
+
 		if (approval.decision === "approve") {
 			this.approveAsk()
 		} else if (approval.decision === "deny") {
@@ -1505,8 +1560,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 				// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
 				// suggestion click that was incorrectly queued due to UI state), consume it
-				// immediately so the task doesn't hang.
-				if (shouldDrainQueuedMessageForAsk && !this.messageQueueService.isEmpty()) {
+				// immediately so the task doesn't hang. Command asks under blanket deny are
+				// excluded (`queueMayAnswerThisAsk`): a queued message must never stand in
+				// for the explicit approval the policy withheld.
+				if (queueMayAnswerThisAsk && shouldDrainQueuedMessageForAsk && !this.messageQueueService.isEmpty()) {
 					const message = this.messageQueueService.claimNextMessage()
 					const resolution = message ? queuedResponseForAsk(type, text) : undefined
 					if (message && resolution) {
@@ -1542,10 +1599,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			text: this.askResponseText,
 			images: this.askResponseImages,
 			queuedMessageId,
+			autoDenyDetail: this.pendingAutoDenyDetail,
 		}
 		this.askResponse = undefined
 		this.askResponseText = undefined
 		this.askResponseImages = undefined
+		this.pendingAutoDenyDetail = undefined
 
 		// Cancel the timeouts if they are still running.
 		timeouts.forEach((timeout) => clearTimeout(timeout))

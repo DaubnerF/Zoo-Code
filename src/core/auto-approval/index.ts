@@ -7,12 +7,15 @@ import {
 	isNonBlockingAsk,
 } from "@roo-code/types"
 
+import type { DcgDecision } from "../../services/destructive-command-guard/runner"
+
 import { ClineAskResponse } from "../../shared/WebviewMessage"
 
 import { isWriteToolAction, isReadOnlyToolAction } from "./tools"
 import { isMcpToolAlwaysAllowed } from "./mcp"
-import { getCommandDecision } from "./commands"
+import { containsDangerousSubstitution, getCommandDecisionDetailed } from "./commands"
 import { isFileMatchedByPatterns } from "./filePatterns"
+import { type AutoDenyDetail } from "./autoDenyReason"
 
 // We have auto-approval actions for different categories.
 export type AutoApprovalState =
@@ -37,6 +40,7 @@ export type AutoApprovalStateOptions =
 	| "allowedCommands" // For `alwaysAllowExecute`.
 	| "deniedCommands"
 	| "destructiveCommandGuardEnabled"
+	| "alwaysDenyUnapprovedCommands" // For `alwaysAllowExecute` (blanket auto-deny).
 
 /**
  * Every file a tool action names, as far as the allowlists are concerned.
@@ -135,7 +139,15 @@ function isWriteAllowedByPatterns(
 
 export type CheckAutoApprovalResult =
 	| { decision: "approve" }
-	| { decision: "deny" }
+	/**
+	 * Automatic denial. `autoDeny` carries the structured reason and the
+	 * offending sub-command when the denial came from command policy (denylist
+	 * match, blanket auto-deny, or a DCG block under blanket mode). It marks
+	 * the denial as policy-scoped — the model receives an explanatory
+	 * `auto_deny` result, and unlike a user rejection the denial does not
+	 * abort the remaining tool calls of the turn.
+	 */
+	| { decision: "deny"; autoDeny?: AutoDenyDetail }
 	| { decision: "ask" }
 	| {
 			decision: "timeout"
@@ -149,6 +161,7 @@ export async function checkAutoApproval({
 	ask,
 	text,
 	isProtected,
+	dcgDecision,
 }: {
 	state?: Pick<ExtensionState, AutoApprovalState | AutoApprovalStateOptions>
 	/**
@@ -167,6 +180,14 @@ export async function checkAutoApproval({
 	ask: ClineAsk
 	text?: string
 	isProtected?: boolean
+	/**
+	 * The verdict from a Destructive Command Guard run that the caller
+	 * (ExecuteCommandTool) already performed for this exact command. Only
+	 * provided for `ask: "command"` when DCG is enabled; undefined otherwise.
+	 * Infra failures in DCG never produce a verdict — they surface as a tool
+	 * error before this check, so a verdict here is authoritative.
+	 */
+	dcgDecision?: DcgDecision
 }): Promise<CheckAutoApprovalResult> {
 	if (isNonBlockingAsk(ask)) {
 		return { decision: "approve" }
@@ -233,23 +254,80 @@ export async function checkAutoApproval({
 		}
 
 		if (state.alwaysAllowExecute === true) {
+			const blanketDeny = state.alwaysDenyUnapprovedCommands === true
+
 			// Execute commands immediately when DCG allows them. ExecuteCommandTool
-			// marks commands blocked by DCG as protected before reaching this check,
-			// which keeps the explicit user approval prompt for those commands. When
-			// enabled, DCG is the authoritative command policy, so Zoo's allow and deny
-			// lists are intentionally bypassed for commands that DCG allows.
+			// passes the guard's verdict through so this single decision point can
+			// act on it. When enabled, DCG is the authoritative command policy, so
+			// Zoo's allow and deny lists are intentionally bypassed for commands
+			// DCG rules on — and an allowlist match cannot rescue a DCG denial.
 			if (state.destructiveCommandGuardEnabled === true) {
+				if (dcgDecision?.decision === "deny") {
+					// Blanket on: auto-deny, forwarding the guard's reason and
+					// rule to the model. Blanket off: fall through to the
+					// (protected) user prompt, as before.
+					return blanketDeny
+						? {
+								decision: "deny",
+								autoDeny: {
+									kind: "dcg",
+									command: text,
+									dcgReason: dcgDecision.reason,
+									dcgRuleId: dcgDecision.ruleId,
+								},
+							}
+						: { decision: "ask" }
+				}
+
+				// DCG allowed the command (verdict provided), or no verdict was
+				// supplied for a DCG-enabled ask (partial asks never reach an
+				// auto-approval decision). DCG remains the authoritative policy:
+				// approve.
 				return { decision: "approve" }
 			}
 
-			const decision = getCommandDecision(text, state.allowedCommands || [], state.deniedCommands || [])
+			const { decision, offendingCommand, matchedPattern, parseError } = getCommandDecisionDetailed(
+				text,
+				state.allowedCommands || [],
+				state.deniedCommands || [],
+			)
 
 			if (decision === "auto_approve") {
 				return { decision: "approve" }
 			} else if (decision === "auto_deny") {
-				return { decision: "deny" }
+				// Denylist denials are automatic denials and carry their structured
+				// detail even when the blanket setting is off: they were never user
+				// rejections, so the model gets the precise reason and the denial
+				// stays scoped to this tool call.
+				return {
+					decision: "deny",
+					autoDeny: { kind: "denylist", command: offendingCommand, pattern: matchedPattern },
+				}
+			} else if (decision === "malformed_command") {
+				// Defense in depth: ExecuteCommandTool blocks shell syntax errors as
+				// a retryable tool_error before any ask is created, so this is
+				// normally unreachable. Under blanket mode deny rather than ask.
+				return blanketDeny
+					? {
+							decision: "deny",
+							autoDeny: { kind: "malformed_command", command: offendingCommand, parseError },
+						}
+					: { decision: "ask" }
 			} else {
-				return { decision: "ask" }
+				// ask_user: with the blanket setting on, unapproved commands are
+				// auto-denied instead of interrupting a hands-free session.
+				if (!blanketDeny) {
+					return { decision: "ask" }
+				}
+
+				if (containsDangerousSubstitution(text)) {
+					return {
+						decision: "deny",
+						autoDeny: { kind: "dangerous_substitution", command: offendingCommand },
+					}
+				}
+
+				return { decision: "deny", autoDeny: { kind: "not_allowlisted", command: offendingCommand } }
 			}
 		}
 	}
@@ -329,3 +407,4 @@ export async function checkAutoApproval({
 }
 
 export { AutoApprovalHandler } from "./AutoApprovalHandler"
+export { type AutoDenyDetail, buildAutoDenyReason } from "./autoDenyReason"
