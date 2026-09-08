@@ -454,7 +454,8 @@ describe("Cline", () => {
 			let retryUserMessageCount: number | undefined
 
 			vi.spyOn(task, "ask").mockResolvedValue({ response: "yesButtonClicked" } satisfies TaskAskResult)
-			vi.spyOn(task, "attemptApiRequest")
+			const attemptApiRequestSpy = vi
+				.spyOn(task, "attemptApiRequest")
 				.mockImplementationOnce(() => stream([]))
 				.mockImplementationOnce(() => {
 					retryHistory = structuredClone(task.apiConversationHistory)
@@ -468,6 +469,14 @@ describe("Cline", () => {
 			await task.recursivelyMakeClineRequests([{ type: "text", text: "original user request" }])
 
 			expect(retryHistory).toHaveLength(1)
+			// The retry iteration must reach the request seam with its own incremented
+			// retry count; passing the initial-attempt value instead would make retries
+			// indistinguishable from the first attempt downstream.
+			expect(attemptApiRequestSpy).toHaveBeenNthCalledWith(
+				2,
+				1,
+				expect.objectContaining({ skipProviderRateLimit: true }),
+			)
 			expect(retryHistory?.[0]).toMatchObject({
 				role: "user",
 				content: expect.arrayContaining([expect.objectContaining({ text: "original user request" })]),
