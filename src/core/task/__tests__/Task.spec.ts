@@ -30,7 +30,7 @@ import type { ApiMessage } from "../../task-persistence"
 import { asyncStreamFrom } from "../../../test-utils/stream"
 
 type TaskTestAccess = {
-	getSystemPrompt: (requestState?: unknown, requestModelInfo?: unknown) => Promise<string>
+	getSystemPrompt: (requestState?: ProviderState, requestModelInfo?: ModelInfo) => Promise<string>
 	handleContextWindowExceededError: () => Promise<void>
 	getEnabledMcpToolsCount: () => Promise<{ enabledToolCount: number; enabledServerCount: number }>
 	initiateTaskLoop: (userContent: Anthropic.Messages.ContentBlockParam[]) => Promise<void>
@@ -782,7 +782,7 @@ describe("Cline", () => {
 			expect(settings).toMatchObject({ todoListEnabled: true })
 		})
 
-		it("passes undefined disabledTools when provider state becomes unavailable", async () => {
+		it("passes undefined disabledTools when provider state carries none", async () => {
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
@@ -791,17 +791,11 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			// First getState call: MCP disabled (avoids the MCP hub path). Later
-			// calls (including the state read feeding `state?.disabledTools`):
-			// undefined, modeling a provider that went unavailable mid-request;
-			// production reads guard with `state ?? {}`. Dropping the optional
-			// chain on that read makes getSystemPrompt reject with a TypeError
-			// instead of resolving.
+			// The single mcpEnabled:false gate read returns the full double, skipping
+			// the MCP-hub path; its disabledTools is undefined, so the prompt call
+			// receives undefined for that argument.
 			Object.assign(mockProvider, {
-				getState: vi
-					.fn<() => Promise<ProviderState | undefined>>()
-					.mockResolvedValueOnce(providerStateWith())
-					.mockResolvedValue(undefined),
+				getState: vi.fn<() => Promise<ProviderState | undefined>>().mockResolvedValueOnce(providerStateWith()),
 			})
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
@@ -821,11 +815,12 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			// First getState call: MCP disabled (avoids the MCP hub path). Later
-			// calls supply the state that feeds `state?.disabledTools`.
-			vi.spyOn(mockProvider, "getState")
-				.mockResolvedValueOnce(providerStateWith())
-				.mockResolvedValue(providerStateWith({ disabledTools: ["execute_command"] }))
+			// getSystemPrompt resolves provider state once, before the MCP wait;
+			// that snapshot feeds `state?.disabledTools`. mcpEnabled stays false
+			// so the MCP-hub path is skipped.
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(
+				providerStateWith({ disabledTools: ["execute_command"] }),
+			)
 
 			const modelInfo: ModelInfo = {
 				contextWindow: 128_000,
@@ -1185,8 +1180,9 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			// The ref dies after the MCP-gate state read and before the
-			// snapshot read, so only the provider guard can answer.
+			// The opening state read performs the only deref that finds the provider
+			// alive - it flips the mock's liveness flag - so the provider guard at the
+			// top of the prompt-building closure is what answers for the dead ref.
 			let providerAlive = true
 			Object.defineProperty(task, "providerRef", {
 				value: {

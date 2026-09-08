@@ -4187,7 +4187,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		requestState?: SystemPromptRequestState,
 		requestModelInfo?: ModelInfo,
 	): Promise<string> {
-		const { mcpEnabled } = requestState ?? (await this.providerRef.deref()?.getState()) ?? {}
+		// Resolve the fallback state once, before the MCP wait, so the whole call -
+		// prompt and tool guidance alike - sees one snapshot even when the caller
+		// threaded none.
+		const state = requestState ?? (await this.providerRef.deref()?.getState())
+		const { mcpEnabled } = state ?? {}
 		let mcpHub: McpHub | undefined
 		if (mcpEnabled ?? true) {
 			const provider = this.providerRef.deref()
@@ -4210,8 +4214,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		const rooIgnoreInstructions = this.rooIgnoreController?.getInstructions()
-
-		const state = requestState ?? (await this.providerRef.deref()?.getState())
 
 		const { customModes, customModePrompts, customInstructions, experiments, language, enableSubfolderRules } =
 			state ?? {}
