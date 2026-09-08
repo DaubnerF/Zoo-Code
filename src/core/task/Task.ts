@@ -3211,7 +3211,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// Yields only if the first chunk is successful, otherwise will
 				// allow the user to retry the request (most likely due to rate
 				// limit error, which gets thrown on the first chunk).
-				const stream = this.attemptApiRequest(currentItem.retryAttempt ?? 0, { skipProviderRateLimit: true })
+				const stream = this.attemptApiRequest(currentItem.retryAttempt ?? 0, {
+					skipProviderRateLimit: true,
+					requestModelInfo: streamModelInfo,
+				})
 				let assistantMessage = ""
 				let reasoningMessage = ""
 				const pendingGroundingSources: GroundingSource[] = []
@@ -4498,7 +4501,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	public async *attemptApiRequest(
 		retryAttempt: number = 0,
-		options: { skipProviderRateLimit?: boolean } = {},
+		options: { skipProviderRateLimit?: boolean; requestModelInfo?: ModelInfo } = {},
 	): ApiStream {
 		const state = await this.providerRef.deref()?.getState()
 
@@ -4533,14 +4536,26 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// and the runtime tools (built below from the same `state`) stay aligned
 		// even if settings change while this method waits on MCP or rate limits.
 		// Capture one bounded-wait model-info snapshot per request, shared by the
-		// prompt and every tool array built below.
-		const requestModelInfo = await this.safeEnsureModelFetched()
+		// prompt and every tool array built below; prefer the caller's snapshot
+		// when one was threaded.
+		const requestModelInfo = options.requestModelInfo ?? (await this.safeEnsureModelFetched())
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
+
+		// A cancellation landing during the rate-limit countdown, the bounded metadata
+		// wait, or the MCP wait inside getSystemPrompt must stop this request before any
+		// tool array, AbortController, or createMessage call is issued for it.
+		if (this.abort || this.abandoned) {
+			throw new Error(
+				`[Task#attemptApiRequest] task ${this.taskId}.${this.instanceId} aborted during request construction`,
+			)
+		}
+
 		const { contextTokens } = this.getTokenUsage()
 
 		if (contextTokens) {
-			await this.safeEnsureModelFetched()
-			const modelInfo = this.api.getModel().info
+			// Context sizing resolves from the same model-info snapshot as the prompt and
+			// every tool array of this request, not from a fresh getModel() re-read.
+			const modelInfo = requestModelInfo
 
 			const maxTokens = getModelMaxOutputTokens({
 				modelId: this.api.getModel().id,

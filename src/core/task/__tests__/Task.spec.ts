@@ -3793,6 +3793,63 @@ describe("Cline", () => {
 			expect(vi.mocked(SYSTEM_PROMPT).mock.calls.length).toBe(callsBefore + 1)
 		})
 
+		it("refuses to send a request when the task is cancelled during the bounded metadata wait", async () => {
+			// Cancellation must be honored before any provider-visible work of
+			// the request: an abort landing while the metadata wait is pending
+			// rejects the generator instead of quietly sending a request the
+			// user already cancelled.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			// The wait never settles on its own; only the bound expires it.
+			Object.assign(task.api, { ensureModelFetched: () => new Promise<void>(() => {}) })
+			const createMessageSpy = vi
+				.spyOn(task.api, "createMessage")
+				.mockReturnValue(asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "ok" }]))
+			vi.spyOn(task, "getTokenUsage").mockReturnValue({
+				totalCost: 0,
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				contextTokens: 0,
+			})
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+			vi.useFakeTimers()
+			try {
+				const first = task.attemptApiRequest(0).next()
+				// Observe the rejection the moment it can land: the generator
+				// rejects during the timer advance below, before the assertion
+				// line runs, and an unobserved rejection would surface as an
+				// unhandled rejection independent of the awaited assertion.
+				void first.catch(() => {})
+				await vi.advanceTimersByTimeAsync(0)
+				// The user cancels while the bounded metadata wait is still pending.
+				const cancelling = task.abortTask()
+				// The wait itself still expires at the bound, as it normally would.
+				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
+
+				await expect(first).rejects.toThrow(/aborted during request construction/)
+				expect(createMessageSpy).not.toHaveBeenCalled()
+				// The per-request controller is only created once the request is
+				// committed, so a cancelled construction never reaches it.
+				expect(task.currentRequestAbortController).toBeUndefined()
+				await cancelling
+			} finally {
+				vi.useRealTimers()
+			}
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
+		})
+
 		it("calls safeEnsureModelFetched from attemptApiRequest when context tokens are present", async () => {
 			const task = new Task({
 				provider: mockProvider,
@@ -3932,7 +3989,7 @@ describe("Cline", () => {
 			})
 			const safeSpy = vi.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched")
 			const resetPersistenceSpy = vi.spyOn(getTaskTestAccess(task), "resetAssistantMessagePersistence")
-			vi.spyOn(task, "attemptApiRequest").mockImplementation(() => {
+			const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest").mockImplementation(() => {
 				throw new Error("stop after model metadata fetch")
 			})
 			vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
@@ -3965,6 +4022,12 @@ describe("Cline", () => {
 			expect(safeSpy).toHaveBeenCalled()
 			expect(resetPersistenceSpy).toHaveBeenCalledTimes(1)
 			expect(ensureModelFetched).toHaveBeenCalled()
+			// Exact-object match on purpose: a partial matcher would stop pinning the
+			// options literal the streaming loop passes to attemptApiRequest.
+			expect(attemptApiRequestSpy).toHaveBeenCalledWith(0, {
+				skipProviderRateLimit: true,
+				requestModelInfo: task.cachedStreamingModel?.info,
+			})
 			expect(task.cachedStreamingModel?.id).toBe(mockApiConfig.apiModelId)
 		})
 
@@ -4271,6 +4334,94 @@ describe("Cline", () => {
 			})
 			// Same fallback snapshot: the loaded metadata's exclusion never applied.
 			expect(toolNames).toContain("read_file")
+		})
+
+		it("uses the caller's model-info snapshot for both the prompt and context sizing", async () => {
+			// A streaming turn captures its model-info snapshot before opening
+			// the request; attemptApiRequest must reuse it for the prompt, the
+			// context-window sizing, and every tool array, so a metadata fetch
+			// that lands mid-request cannot re-decide whether condensing runs.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+
+			const threadedInfo: ModelInfo = { contextWindow: 32_000, supportsPromptCache: false }
+			const lateInfo: ModelInfo = {
+				contextWindow: 128_000,
+				supportsPromptCache: true,
+				// Divergent policy: only the late metadata excludes it.
+				excludedTools: ["read_file"],
+			}
+			const fetchState = { resolved: false }
+			let resolveFetch!: () => void
+			const metadataFetch = new Promise<void>((resolve) => {
+				resolveFetch = () => {
+					fetchState.resolved = true
+					resolve()
+				}
+			})
+			Object.assign(task.api, { ensureModelFetched: () => metadataFetch })
+			vi.spyOn(task.api, "getModel").mockImplementation(() => ({
+				id: "lazy-router-model",
+				info: fetchState.resolved ? lateInfo : threadedInfo,
+			}))
+
+			vi.spyOn(task, "getTokenUsage").mockReturnValue({
+				totalCost: 0,
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				// Above the hard limit for the 32k threaded window (~24.7k tokens)
+				// but well below the limit for a 128k re-read (~111k), so whether
+				// condensing runs exposes which snapshot the sizing resolved from.
+				contextTokens: 50_000,
+			})
+			vi.spyOn(task.api, "countTokens").mockResolvedValue(1_000)
+			vi.spyOn(task.api, "createMessage").mockReturnValue(
+				asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "ok" }]),
+			)
+			const safeSpy = vi.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched")
+			// Hold the prompt build open so the metadata fetch can land after the
+			// snapshot was captured but before context sizing runs.
+			let releasePrompt!: () => void
+			const promptGate = new Promise<string>((resolve) => {
+				releasePrompt = () => resolve("mock system prompt")
+			})
+			vi.mocked(SYSTEM_PROMPT).mockImplementationOnce(() => promptGate)
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this request starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+
+			vi.useFakeTimers()
+			try {
+				const first = task.attemptApiRequest(0, { requestModelInfo: threadedInfo }).next()
+				await vi.advanceTimersByTimeAsync(0)
+				// Late metadata arrives while the request is still being built; a
+				// fresh re-read here would return the wider 128k window instead.
+				resolveFetch()
+				releasePrompt()
+				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
+				await expect(first).resolves.toMatchObject({ done: false, value: { type: "text", text: "ok" } })
+			} finally {
+				vi.useRealTimers()
+			}
+
+			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
+			// Argument index 17 is modelInfo: the prompt used the caller's snapshot.
+			expect(systemPromptCall[17]).toBe(threadedInfo)
+			// The threaded snapshot replaces the per-request guard entirely.
+			expect(safeSpy).not.toHaveBeenCalled()
+			// Condensing ran because sizing resolved from the 32k threaded
+			// window; a 128k re-read would have cleared the threshold instead.
+			expect(summarizeConversation).toHaveBeenCalledTimes(summarizeCallsBefore + 1)
 		})
 	})
 
