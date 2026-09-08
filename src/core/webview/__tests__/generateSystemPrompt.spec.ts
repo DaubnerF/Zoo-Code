@@ -319,6 +319,12 @@ describe("generateSystemPrompt preview parity", () => {
 		expect(capabilities).toContain("read files")
 		expect(capabilities).toContain("execute CLI commands")
 		expect(errorSpy).toHaveBeenCalled()
+		// The context string is part of the contract: an empty or generic log
+		// line would erase the only trace of a degraded preview.
+		expect(errorSpy).toHaveBeenCalledWith(
+			"Error fetching model metadata for system prompt preview:",
+			expect.anything(),
+		)
 	})
 
 	it("degrades to fallback metadata when ensureModelFetched hangs past the preview timeout", async () => {
@@ -393,6 +399,152 @@ describe("generateSystemPrompt preview parity", () => {
 		)
 
 		expect(prompt).toContain("OBJECTIVE")
+	})
+
+	describe("preview metadata-fetch robustness", () => {
+		it("skips the metadata fetch silently when the handler has no ensureModelFetched", async () => {
+			// Providers without lazy model discovery legitimately lack
+			// ensureModelFetched: the optional call must skip it and still build
+			// the preview from the handler's current metadata, without logging.
+			// The property is redefined to undefined on the shared double (then
+			// restored) because the mocked factory reads it per buildApiHandler()
+			// call, so a missing method reaches the code under test untyped.
+			const descriptor = Object.getOwnPropertyDescriptor(modelMock, "ensureModelFetched")
+			Object.defineProperty(modelMock, "ensureModelFetched", {
+				value: undefined,
+				configurable: true,
+				writable: true,
+			})
+			try {
+				const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+				expect(errorSpy).not.toHaveBeenCalled()
+				const capabilities = extractSection(preview, "CAPABILITIES")
+				// Fallback-fixture signature (see fallbackModelInfo): the preview is
+				// still built from a complete ModelInfo, not from undefined.
+				expect(capabilities).not.toContain("list files")
+				expect(capabilities).toContain("read files")
+			} finally {
+				if (descriptor) {
+					Object.defineProperty(modelMock, "ensureModelFetched", descriptor)
+				}
+			}
+		})
+
+		it("clears the pending preview timer once the fetch resolves first", async () => {
+			vi.useFakeTimers()
+			try {
+				modelMock.ensureModelFetched.mockResolvedValueOnce(undefined)
+				await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+				// The fetch won the race, so the still-pending timeout must have been
+				// cancelled inside the same turn; a leftover timer means every fast
+				// preview leaves a five-second handle behind.
+				expect(vi.getTimerCount()).toBe(0)
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+
+		it("hands the armed timer handle to clearTimeout when the fetch wins the race", async () => {
+			// The race arms its timeout through the real setTimeout before awaiting;
+			// the winning path must cancel exactly that handle.
+			const clearSpy = vi.spyOn(globalThis, "clearTimeout")
+			try {
+				modelMock.ensureModelFetched.mockResolvedValueOnce(undefined)
+				await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+				expect(clearSpy).toHaveBeenCalledTimes(1)
+				expect(clearSpy).toHaveBeenCalledWith(expect.any(Object))
+			} finally {
+				clearSpy.mockRestore()
+			}
+		})
+
+		it("does not clear a timer when setTimeout yields a falsy handle", async () => {
+			// The guard only treats a truthy handle as armed. The double assertion
+			// is unavoidable here: no platform handle type admits the numeric 0
+			// that such environments return, and the guard's truthiness check is
+			// exactly what this case pins down.
+			const zeroHandle = 0 as unknown as ReturnType<typeof setTimeout>
+			const setSpy = vi.spyOn(globalThis, "setTimeout").mockReturnValue(zeroHandle)
+			const clearSpy = vi.spyOn(globalThis, "clearTimeout")
+			try {
+				modelMock.ensureModelFetched.mockResolvedValueOnce(undefined)
+				await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+				expect(clearSpy).not.toHaveBeenCalled()
+			} finally {
+				setSpy.mockRestore()
+				clearSpy.mockRestore()
+			}
+		})
+
+		it("resolves the preview race exactly at the fetch timeout bound", async () => {
+			// The race bound is an absolute wall: a hung endpoint must be released
+			// precisely after 5000 ms, never a tick earlier, so a slow-but-alive
+			// fetch still wins at 4999 ms.
+			vi.useFakeTimers()
+			try {
+				modelMock.ensureModelFetched.mockImplementationOnce(() => new Promise<void>(() => {}))
+
+				let settled = false
+				const previewPromise = generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" }).then(
+					(prompt) => {
+						settled = true
+						return prompt
+					},
+				)
+				await vi.advanceTimersByTimeAsync(4_999)
+				expect(settled).toBe(false)
+
+				await vi.advanceTimersByTimeAsync(1)
+				const preview = await previewPromise
+
+				// Degradation at the bound mirrors the rejected-fetch path: fallback
+				// metadata, and no error logged (a timeout is not a failure).
+				const capabilities = extractSection(preview, "CAPABILITIES")
+				expect(capabilities).not.toContain("list files")
+				expect(capabilities).toContain("read files")
+				expect(errorSpy).not.toHaveBeenCalled()
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+
+		it("logs and degrades when the model info cannot be read", async () => {
+			// A throw while reading the model info escapes the fetch race and lands
+			// in the outer handler: the preview must still resolve — without model
+			// guidance — and log the outer-catch context string. The state double
+			// is swapped for a throwing getter because the mocked factory reads it
+			// inside getModel().info, which is the read the preview performs.
+			const stateDescriptor = Object.getOwnPropertyDescriptor(modelMock, "state")
+			Object.defineProperty(modelMock, "state", {
+				value: {
+					get fetched(): never {
+						throw new Error("model info unavailable")
+					},
+				},
+				configurable: true,
+				writable: true,
+			})
+			try {
+				const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+				expect(errorSpy).toHaveBeenCalledWith(
+					"Error reading model info for system prompt preview:",
+					expect.anything(),
+				)
+				const capabilities = extractSection(preview, "CAPABILITIES")
+				// modelInfo === undefined excludes nothing: both clause families appear.
+				expect(capabilities).toContain("read files")
+				expect(capabilities).toContain("list files")
+			} finally {
+				if (stateDescriptor) {
+					Object.defineProperty(modelMock, "state", stateDescriptor)
+				}
+			}
+		})
 	})
 })
 
