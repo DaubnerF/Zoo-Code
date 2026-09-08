@@ -104,8 +104,16 @@ async function runVerify(api: RooCodeAPI): Promise<void> {
 		const historyItem = await api.getTaskHistoryItem(taskId)
 		assert.ok(historyItem, "Task history item should be available after restart")
 		assert.ok(historyItem.task.includes("RESTART_PERSISTENCE_SMOKE"), "History title should persist after restart")
-		const conversationLength = await waitForApiConversationHistoryLength(api, taskId)
-		assert.ok(conversationLength > 0, "API conversation history should be available after restart")
+		const restoredCompletion = await api.hasTaskApiConversationHistorySequence(taskId, {
+			userText: "RESTART_PERSISTENCE_SMOKE",
+			assistantToolName: "attempt_completion",
+			assistantToolInputText: MARKER,
+		})
+		assert.strictEqual(
+			restoredCompletion,
+			true,
+			"Fresh-host history should restore the marked user turn followed by its assistant completion",
+		)
 
 		await api.resumeTask(taskId)
 		await waitFor(() => taskMessages.some(({ type, ask }) => type === "ask" && ask === "resume_completed_task"))
@@ -116,16 +124,22 @@ async function runVerify(api: RooCodeAPI): Promise<void> {
 			reopenedHistoryItem.task.includes("RESTART_PERSISTENCE_SMOKE"),
 			"Reopened task should retain its persisted history title",
 		)
-		assert.ok(
-			(await api.getTaskApiConversationHistoryLength(taskId)) >= conversationLength,
-			"Reopened task should retain its persisted API conversation history",
+		const reopenedCompletion = await api.hasTaskApiConversationHistorySequence(taskId, {
+			userText: "RESTART_PERSISTENCE_SMOKE",
+			assistantToolName: "attempt_completion",
+			assistantToolInputText: MARKER,
+		})
+		assert.strictEqual(
+			reopenedCompletion,
+			true,
+			"Reopened-host history should restore the marked user turn followed by its assistant completion",
 		)
 
 		await writePhaseResult(getResultsDir(), {
 			version: PHASE_RESULT_VERSION,
 			phase: "verify",
 			status: "passed",
-			values: { taskId, conversationLength: String(conversationLength) },
+			values: { taskId },
 		})
 		await quitGracefully()
 	} catch (error) {
