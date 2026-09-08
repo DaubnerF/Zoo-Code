@@ -28,6 +28,8 @@ import { processUserContentMentions } from "../../mentions/processUserContentMen
 import { MultiSearchReplaceDiffStrategy } from "../../diff/strategies/multi-search-replace"
 import type { ApiMessage } from "../../task-persistence"
 import { asyncStreamFrom } from "../../../test-utils/stream"
+import { McpHub } from "../../../services/mcp/McpHub"
+import { McpServerManager } from "../../../services/mcp/McpServerManager"
 
 type TaskTestAccess = {
 	getSystemPrompt: (requestState?: ProviderState, requestModelInfo?: ModelInfo) => Promise<string>
@@ -804,6 +806,40 @@ describe("Cline", () => {
 			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
 			// Argument index 16 is the disabledTools parameter fed by `state?.disabledTools`.
 			expect(systemPromptCall[16]).toBeUndefined()
+		})
+
+		it("passes undefined disabledTools to the system prompt when the provider state read resolves nothing", async () => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+
+			// The provider reference stays alive but its state read resolves nothing:
+			// the prompt path must still deliver undefined disabledTools rather than
+			// fail. Unlike the collected-provider cases, nothing here overrides
+			// providerRef, so every deref keeps finding the provider.
+			Object.assign(mockProvider, {
+				getState: vi.fn<() => Promise<ProviderState | undefined>>().mockResolvedValue(undefined),
+			})
+			// An unavailable state leaves the mcpEnabled gate open, so the hub branch
+			// runs; the spy also witnesses that the branch really was taken. The
+			// awaited connect wait is a no-op under this file's p-wait-for mock, so
+			// the hub double needs no members.
+			const hubSpy = vi.spyOn(McpServerManager, "getInstance")
+			hubSpy.mockResolvedValue(Object.create(McpHub.prototype))
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
+
+			await expect(getTaskTestAccess(task).getSystemPrompt()).resolves.toBe("mock system prompt")
+
+			expect(hubSpy).toHaveBeenCalledTimes(1)
+			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
+			// Argument index 16 is the disabledTools parameter fed by `state?.disabledTools`.
+			expect(systemPromptCall[16]).toBeUndefined()
+
+			hubSpy.mockRestore()
 		})
 
 		it("forwards non-empty disabledTools and modelInfo to the system prompt call", async () => {
