@@ -141,6 +141,17 @@ import { shouldAddUserMessageToHistory } from "./messageCounting"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
+// Upper bound on awaiting lazily loaded model metadata. Some model-catalog
+// fetchers (e.g. OpenRouter's bare axios GET) have no request timeout, so a
+// hung endpoint must not stall streaming, condense, or context-window
+// handling. On expiry the fetch is abandoned (the API-handler contract
+// exposes no AbortSignal) and callers fall back to the handler's existing
+// getModel().info metadata — the same degradation a rejected fetch produces.
+// Kept in sync with PREVIEW_MODEL_FETCH_TIMEOUT_MS in the preview path
+// (src/core/webview/generateSystemPrompt.ts). Deliberately duplicated, not
+// shared: importing from the webview layer would close the
+// Task -> generateSystemPrompt -> ClineProvider -> Task import cycle.
+export const MODEL_FETCH_TIMEOUT_MS = 5_000
 const QUEUED_FEEDBACK_SAVE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const
 
 type QueuedAskResolution = { response: ClineAskResponse; requiresDurableAck: boolean }
@@ -4140,7 +4151,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/**
 	 * Ensures router-provider model metadata is loaded before getModel() is used for
 	 * context management or streaming. Failures fall back to hardcoded defaults rather
-	 * than aborting the task.
+	 * than aborting the task; the wait is bounded by MODEL_FETCH_TIMEOUT_MS (see the
+	 * constant for the abandonment and degradation semantics).
 	 *
 	 * The prompt- and context-critical read sites of getModel() (streaming entry,
 	 * getSystemPrompt, context-window handling) each await this immediately before
@@ -4154,13 +4166,35 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * matters.
 	 */
 	private async safeEnsureModelFetched(): Promise<void> {
+		// Promise.race attaches handlers to both inputs, so the abandoned fetch
+		// rejecting after the timeout is already considered handled — no extra
+		// .catch is needed here.
+		let timeoutId: ReturnType<typeof setTimeout> | undefined
+		let timedOut = false
 		try {
-			await this.api.ensureModelFetched?.()
+			await Promise.race([
+				this.api.ensureModelFetched?.(),
+				new Promise<void>((resolve) => {
+					timeoutId = setTimeout(() => {
+						timedOut = true
+						resolve()
+					}, MODEL_FETCH_TIMEOUT_MS)
+				}),
+			])
+			if (timedOut) {
+				console.warn(
+					`[Task#${this.taskId}] Timed out after ${MODEL_FETCH_TIMEOUT_MS}ms fetching model metadata; using fallback model info.`,
+				)
+			}
 		} catch (error) {
 			console.error(
 				`[Task#${this.taskId}] Failed to fetch model metadata:`,
 				error instanceof Error ? error.message : error,
 			)
+		} finally {
+			if (timeoutId) {
+				clearTimeout(timeoutId)
+			}
 		}
 	}
 
