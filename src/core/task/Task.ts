@@ -1860,11 +1860,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// to ensure tool_use/tool_result pairs are complete in history
 		await this.flushPendingToolResultsToHistory()
 
-		// Capture provider state once and thread it into getSystemPrompt so the
-		// prompt and the condensing tool array below resolve from one snapshot.
+		// Capture provider state and one model-info snapshot once and thread them into
+		// getSystemPrompt so the prompt and the condensing tool array below resolve
+		// from one snapshot.
 		const state = await this.providerRef.deref()?.getState()
+		const requestModelInfo = await this.safeEnsureModelFetched()
 
-		const systemPrompt = await this.getSystemPrompt(state)
+		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
 
 		// Get condensing configuration
 		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
@@ -1878,7 +1880,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const provider = this.providerRef.deref()
 		let allTools: import("openai").default.Chat.ChatCompletionTool[] = []
 		if (provider) {
-			const modelInfo = this.api.getModel().info
 			const toolsResult = await buildNativeToolsArrayWithRestrictions({
 				provider,
 				cwd: this.cwd,
@@ -1887,7 +1888,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				experiments: state?.experiments,
 				apiConfiguration,
 				disabledTools: state?.disabledTools,
-				modelInfo,
+				modelInfo: requestModelInfo,
 				includeAllToolsWithRestrictions: false,
 			})
 			allTools = toolsResult.tools
@@ -4177,9 +4178,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * same request must pass their state snapshot as `requestState` so the prompt
 	 * and the tool array are resolved from one consistent snapshot - otherwise a
 	 * settings change during the MCP wait can make the prompt advertise a tool the
-	 * runtime rejects, or hide a callable tool.
+	 * runtime rejects, or hide a callable tool. Pass `requestModelInfo` (captured
+	 * via safeEnsureModelFetched) in the same situation so the prompt's tool
+	 * guidance and the request's tool arrays resolve from one model-metadata
+	 * snapshot.
 	 */
-	private async getSystemPrompt(requestState?: SystemPromptRequestState): Promise<string> {
+	private async getSystemPrompt(
+		requestState?: SystemPromptRequestState,
+		requestModelInfo?: ModelInfo,
+	): Promise<string> {
 		const { mcpEnabled } = requestState ?? (await this.providerRef.deref()?.getState()) ?? {}
 		let mcpHub: McpHub | undefined
 		if (mcpEnabled ?? true) {
@@ -4221,9 +4228,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			// Load dynamically discovered model metadata (router providers) before
 			// reading it, so the prompt's included/excluded tool guidance matches
-			// the runtime path, which fetches before tool construction.
-			await this.safeEnsureModelFetched()
-			const modelInfo = this.api.getModel().info
+			// the runtime path; prefer the caller's per-request snapshot when threaded.
+			const modelInfo = requestModelInfo ?? (await this.safeEnsureModelFetched())
 
 			return SYSTEM_PROMPT(
 				provider.context,
@@ -4270,18 +4276,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * than aborting the task; the wait is bounded by MODEL_FETCH_TIMEOUT_MS (see the
 	 * constant for the abandonment and degradation semantics).
 	 *
-	 * The prompt- and context-critical read sites of getModel() (streaming entry,
-	 * getSystemPrompt, context-window handling) each await this immediately before
-	 * reading; the condense/tool-array read sites are covered by the immediately
-	 * preceding getSystemPrompt guard in the same request plus the router provider's
-	 * success cache. That redundancy is deliberate: router-provider caches successes
-	 * (repeat awaits are no-ops) but caches no failures, so a failing endpoint costs
-	 * one retry per guard. The per-site invariant was chosen over fetch-ordering
-	 * coupling between methods; negative caching in RouterProvider (recording failed
-	 * fetches with a TTL) remains future work if the failure-path latency ever
-	 * matters.
+	 * The return value is the settled post-wait read of getModel().info: request
+	 * entry points (attemptApiRequest, condenseContext,
+	 * handleContextWindowExceededError) await this once before prompt generation
+	 * and share the returned snapshot between getSystemPrompt and every tool-array
+	 * build of the same request, so a fetch that resolves after the bounded wait
+	 * was abandoned cannot move model-specific tool policy between prompt time and
+	 * request time. Callers that do not thread a snapshot keep awaiting this
+	 * immediately before their own getModel() read; that per-site guard remains the
+	 * standalone/fallback read path, and repeat awaits stay cheap once a fetch has
+	 * succeeded because the provider caches successes. RouterProvider already
+	 * negative-caches catalog misses with a TTL (missingModelRefreshAt); recording
+	 * rejected fetches remains future work if the failure-path latency ever matters.
 	 */
-	private async safeEnsureModelFetched(): Promise<void> {
+	private async safeEnsureModelFetched(): Promise<ModelInfo> {
 		// Promise.race attaches handlers to both inputs, so the abandoned fetch
 		// rejecting after the timeout is already considered handled — no extra
 		// .catch is needed here.
@@ -4312,6 +4320,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				clearTimeout(timeoutId)
 			}
 		}
+		// The post-wait read is the settled snapshot callers must share per request.
+		return this.api.getModel().info
 	}
 
 	private async handleContextWindowExceededError(): Promise<void> {
@@ -4322,8 +4332,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const apiConfiguration = this.apiConfiguration
 
 		const { contextTokens } = this.getTokenUsage()
-		await this.safeEnsureModelFetched()
-		const modelInfo = this.api.getModel().info
+		const modelInfo = await this.safeEnsureModelFetched()
 
 		const maxTokens = getModelMaxOutputTokens({
 			modelId: this.api.getModel().id,
@@ -4397,7 +4406,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				apiHandler: this.api,
 				autoCondenseContext: true,
 				autoCondenseContextPercent: FORCED_CONTEXT_REDUCTION_PERCENT,
-				systemPrompt: await this.getSystemPrompt(state),
+				systemPrompt: await this.getSystemPrompt(state, modelInfo),
 				taskId: this.taskId,
 				profileThresholds,
 				currentProfileId,
@@ -4521,7 +4530,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Thread the request state snapshot into prompt generation so the prompt
 		// and the runtime tools (built below from the same `state`) stay aligned
 		// even if settings change while this method waits on MCP or rate limits.
-		const systemPrompt = await this.getSystemPrompt(state)
+		// Capture one bounded-wait model-info snapshot per request, shared by the
+		// prompt and every tool array built below.
+		const requestModelInfo = await this.safeEnsureModelFetched()
+		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
 		const { contextTokens } = this.getTokenUsage()
 
 		if (contextTokens) {
@@ -4588,7 +4600,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						experiments: state?.experiments,
 						apiConfiguration,
 						disabledTools: state?.disabledTools,
-						modelInfo,
+						modelInfo: requestModelInfo,
 						includeAllToolsWithRestrictions: false,
 					})
 					contextMgmtTools = toolsResult.tools
@@ -4727,8 +4739,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			throw new Error("Auto-approval limit reached and user did not approve continuation")
 		}
 
-		// Whether we include tools is determined by whether we have any tools to send.
-		const modelInfo = this.api.getModel().info
+		// Tool policy resolves from the same model-info snapshot as the system prompt
+		// built earlier in this request, not from a fresh getModel() re-read.
+		const modelInfo = requestModelInfo
 
 		// Build complete tools array: native tools + dynamic MCP tools
 		// When includeAllToolsWithRestrictions is true, returns all tools but provides
