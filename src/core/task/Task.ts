@@ -4177,24 +4177,22 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	/**
-	 * Builds the SYSTEM_PROMPT. Callers that also construct runtime tools for the
-	 * same request must pass their state snapshot as `requestState` so the prompt
-	 * and the tool array are resolved from one consistent snapshot - otherwise a
-	 * settings change during the MCP wait can make the prompt advertise a tool the
-	 * runtime rejects, or hide a callable tool. Pass `requestModelInfo` (captured
-	 * via safeEnsureModelFetched) in the same situation so the prompt's tool
-	 * guidance and the request's tool arrays resolve from one model-metadata
-	 * snapshot.
+	 * Builds the SYSTEM_PROMPT from the caller's provider-state snapshot. This
+	 * method never reads provider state itself: callers that also construct
+	 * runtime tools for the same request must thread the very snapshot they build
+	 * those tools from, or a settings change during the MCP wait can make the
+	 * prompt advertise a tool the runtime rejects, or hide a callable tool. An
+	 * `undefined` snapshot declares that the caller's own read came back empty
+	 * because the provider was already gone; the prompt then resolves from
+	 * defaults. Pass `requestModelInfo` (captured via safeEnsureModelFetched) in
+	 * the same situation so the prompt's tool guidance and the request's tool
+	 * arrays resolve from one model-metadata snapshot.
 	 */
 	private async getSystemPrompt(
-		requestState?: SystemPromptRequestState,
+		requestState: SystemPromptRequestState | undefined,
 		requestModelInfo?: ModelInfo,
 	): Promise<string> {
-		// Resolve the fallback state once, before the MCP wait, so the whole call -
-		// prompt and tool guidance alike - sees one snapshot even when the caller
-		// threaded none.
-		const state = requestState ?? (await this.providerRef.deref()?.getState())
-		const { mcpEnabled } = state ?? {}
+		const { mcpEnabled } = requestState ?? {}
 		let mcpHub: McpHub | undefined
 		if (mcpEnabled ?? true) {
 			const provider = this.providerRef.deref()
@@ -4219,7 +4217,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const rooIgnoreInstructions = this.rooIgnoreController?.getInstructions()
 
 		const { customModes, customModePrompts, customInstructions, experiments, language, enableSubfolderRules } =
-			state ?? {}
+			requestState ?? {}
 		// Use task-local values, not provider state, to prevent cross-task configuration leaks.
 		const mode = await this.getTaskMode()
 		const apiConfiguration = this.apiConfiguration
@@ -4262,7 +4260,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				undefined, // todoList
 				this.api.getModel().id,
 				provider.getSkillsManager(),
-				state?.disabledTools,
+				requestState?.disabledTools,
 				modelInfo,
 			)
 		})()

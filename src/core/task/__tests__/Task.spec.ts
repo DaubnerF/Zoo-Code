@@ -32,7 +32,7 @@ import { McpHub } from "../../../services/mcp/McpHub"
 import { McpServerManager } from "../../../services/mcp/McpServerManager"
 
 type TaskTestAccess = {
-	getSystemPrompt: (requestState?: ProviderState, requestModelInfo?: ModelInfo) => Promise<string>
+	getSystemPrompt: (requestState: ProviderState | undefined, requestModelInfo?: ModelInfo) => Promise<string>
 	handleContextWindowExceededError: () => Promise<void>
 	getEnabledMcpToolsCount: () => Promise<{ enabledToolCount: number; enabledServerCount: number }>
 	initiateTaskLoop: (userContent: Anthropic.Messages.ContentBlockParam[]) => Promise<void>
@@ -780,12 +780,14 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			vi.spyOn(mockProvider, "getState").mockResolvedValue(
-				providerStateWith({ apiConfiguration: { ...mockApiConfig, todoListEnabled: false } }),
-			)
+			// The focused provider's state diverges from the task's own
+			// configuration; threading it must not change what the prompt resolves.
+			const focusedProviderState = providerStateWith({
+				apiConfiguration: { ...mockApiConfig, todoListEnabled: false },
+			})
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
-			await getTaskTestAccess(task).getSystemPrompt()
+			await getTaskTestAccess(task).getSystemPrompt(focusedProviderState)
 
 			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
 			const [, , , , , mode, , , , , , , settings] = systemPromptCall
@@ -793,7 +795,7 @@ describe("Cline", () => {
 			expect(settings).toMatchObject({ todoListEnabled: true })
 		})
 
-		it("passes undefined disabledTools when provider state carries none", async () => {
+		it("passes undefined disabledTools when the threaded snapshot carries none", async () => {
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
@@ -802,22 +804,21 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			// The single mcpEnabled:false gate read returns the full double, skipping
-			// the MCP-hub path; its disabledTools is undefined, so the prompt call
-			// receives undefined for that argument.
-			Object.assign(mockProvider, {
-				getState: vi.fn<() => Promise<ProviderState | undefined>>().mockResolvedValueOnce(providerStateWith()),
-			})
+			// The threaded snapshot's mcpEnabled:false skips the MCP-hub path; its
+			// disabledTools is undefined, so the prompt call receives undefined for
+			// that argument.
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
-			await expect(getTaskTestAccess(task).getSystemPrompt()).resolves.toBe("mock system prompt")
+			await expect(getTaskTestAccess(task).getSystemPrompt(providerStateWith())).resolves.toBe(
+				"mock system prompt",
+			)
 
 			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
-			// Argument index 16 is the disabledTools parameter fed by `state?.disabledTools`.
+			// Argument index 16 is the disabledTools parameter fed by `requestState?.disabledTools`.
 			expect(systemPromptCall[16]).toBeUndefined()
 		})
 
-		it("passes undefined disabledTools to the system prompt when the provider state read resolves nothing", async () => {
+		it("passes undefined disabledTools to the system prompt when the threaded snapshot is undefined", async () => {
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
@@ -826,14 +827,12 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			// The provider reference stays alive but its state read resolves nothing:
-			// the prompt path must still deliver undefined disabledTools rather than
-			// fail. Unlike the collected-provider cases, nothing here overrides
-			// providerRef, so every deref keeps finding the provider.
-			Object.assign(mockProvider, {
-				getState: vi.fn<() => Promise<ProviderState | undefined>>().mockResolvedValue(undefined),
-			})
-			// An unavailable state leaves the mcpEnabled gate open, so the hub branch
+			// A caller whose own read came back empty threads undefined; the prompt
+			// path must still deliver undefined disabledTools rather than fail, and
+			// it must not read provider state to fill the gap. providerRef stays
+			// alive, so the MCP-hub branch below can run.
+			const getStateSpy = vi.spyOn(mockProvider, "getState")
+			// An unavailable snapshot leaves the mcpEnabled gate open, so the hub branch
 			// runs; the spy also witnesses that the branch really was taken. The
 			// awaited connect wait is a no-op under this file's p-wait-for mock, so
 			// the hub double needs no members.
@@ -841,14 +840,43 @@ describe("Cline", () => {
 			hubSpy.mockResolvedValue(Object.create(McpHub.prototype))
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
-			await expect(getTaskTestAccess(task).getSystemPrompt()).resolves.toBe("mock system prompt")
+			await expect(getTaskTestAccess(task).getSystemPrompt(undefined)).resolves.toBe("mock system prompt")
 
+			expect(getStateSpy).not.toHaveBeenCalled()
 			expect(hubSpy).toHaveBeenCalledTimes(1)
 			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
-			// Argument index 16 is the disabledTools parameter fed by `state?.disabledTools`.
+			// Argument index 16 is the disabledTools parameter fed by `requestState?.disabledTools`.
 			expect(systemPromptCall[16]).toBeUndefined()
 
 			hubSpy.mockRestore()
+		})
+
+		it("builds the prompt from the threaded snapshot without reading provider state", async () => {
+			// A live provider whose state read returns a divergent snapshot must
+			// not be able to influence the prompt: the prompt path performs no
+			// provider-state read at all, so a re-read here would pick up the
+			// divergent disabledTools instead of the threaded ones.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+
+			const getStateSpy = vi
+				.spyOn(mockProvider, "getState")
+				.mockResolvedValue(providerStateWith({ disabledTools: ["read_file"] }))
+			const snapshot = providerStateWith({ disabledTools: ["execute_command"] })
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
+
+			await expect(getTaskTestAccess(task).getSystemPrompt(snapshot)).resolves.toBe("mock system prompt")
+
+			expect(getStateSpy).not.toHaveBeenCalled()
+			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
+			// Argument index 16 is disabledTools: the threaded snapshot's value,
+			// not the value a provider-state re-read would have produced.
+			expect(systemPromptCall[16]).toEqual(["execute_command"])
 		})
 
 		it("forwards non-empty disabledTools and modelInfo to the system prompt call", async () => {
@@ -860,12 +888,9 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			// getSystemPrompt resolves provider state once, before the MCP wait;
-			// that snapshot feeds `state?.disabledTools`. mcpEnabled stays false
-			// so the MCP-hub path is skipped.
-			vi.spyOn(mockProvider, "getState").mockResolvedValue(
-				providerStateWith({ disabledTools: ["execute_command"] }),
-			)
+			// The threaded snapshot feeds `requestState?.disabledTools`; mcpEnabled
+			// stays false so the MCP-hub path is skipped.
+			const snapshot = providerStateWith({ disabledTools: ["execute_command"] })
 
 			const modelInfo: ModelInfo = {
 				contextWindow: 128_000,
@@ -875,10 +900,10 @@ describe("Cline", () => {
 			vi.spyOn(task.api, "getModel").mockReturnValue({ id: "distinctive-model-id", info: modelInfo })
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
-			await expect(getTaskTestAccess(task).getSystemPrompt()).resolves.toBe("mock system prompt")
+			await expect(getTaskTestAccess(task).getSystemPrompt(snapshot)).resolves.toBe("mock system prompt")
 
 			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
-			// Argument index 16 is the disabledTools parameter fed by `state?.disabledTools`;
+			// Argument index 16 is the disabledTools parameter fed by `requestState?.disabledTools`;
 			// index 17 is the modelInfo from `this.api.getModel().info`.
 			expect(systemPromptCall[16]).toEqual(["execute_command"])
 			expect(systemPromptCall[17]).toBe(modelInfo)
@@ -897,7 +922,7 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			const snapshot = providerStateWith()
 
 			const fallbackInfo: ModelInfo = {
 				contextWindow: 32_000,
@@ -916,7 +941,7 @@ describe("Cline", () => {
 			vi.spyOn(task.api, "getModel").mockImplementation(() => ({ id: "router-model", info: currentInfo }))
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
-			await expect(getTaskTestAccess(task).getSystemPrompt()).resolves.toBe("mock system prompt")
+			await expect(getTaskTestAccess(task).getSystemPrompt(snapshot)).resolves.toBe("mock system prompt")
 
 			expect(ensureModelFetched).toHaveBeenCalledTimes(1)
 			const systemPromptCall = requireDefined(vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1))
@@ -935,7 +960,6 @@ describe("Cline", () => {
 				startTask: false,
 			})
 			await task.getTaskMode()
-			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
 
 			const handlerInfo: ModelInfo = { contextWindow: 100_000, supportsPromptCache: false }
 			const threadedInfo: ModelInfo = { contextWindow: 64_000, supportsPromptCache: true, excludedTools: [] }
@@ -944,7 +968,7 @@ describe("Cline", () => {
 			vi.spyOn(task.api, "getModel").mockReturnValue({ id: "threaded-model", info: handlerInfo })
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
-			await expect(getTaskTestAccess(task).getSystemPrompt(undefined, threadedInfo)).resolves.toBe(
+			await expect(getTaskTestAccess(task).getSystemPrompt(providerStateWith(), threadedInfo)).resolves.toBe(
 				"mock system prompt",
 			)
 
@@ -1211,7 +1235,9 @@ describe("Cline", () => {
 				configurable: true,
 			})
 
-			await expect(getTaskTestAccess(task).getSystemPrompt()).rejects.toThrow(
+			// The undefined snapshot keeps the mcpEnabled gate open, so the request
+			// reaches the provider guard and rejects there.
+			await expect(getTaskTestAccess(task).getSystemPrompt(undefined)).rejects.toThrow(
 				"Provider reference lost during view transition",
 			)
 		})
@@ -1225,26 +1251,29 @@ describe("Cline", () => {
 			})
 			await task.getTaskMode()
 
-			// The opening state read performs the only deref that finds the provider
-			// alive - it flips the mock's liveness flag - so the provider guard at the
-			// top of the prompt-building closure is what answers for the dead ref.
+			// The caller's own snapshot read performs the only deref that finds the
+			// provider alive - it flips the mock's liveness flag - so the provider
+			// guard at the top of the prompt-building closure is what answers for the
+			// ref that died before the prompt was built.
 			let providerAlive = true
-			Object.defineProperty(task, "providerRef", {
-				value: {
-					deref: () => {
-						if (providerAlive) {
-							providerAlive = false
-							return mockProvider
-						}
-						return undefined
-					},
+			const providerRef = {
+				deref: () => {
+					if (providerAlive) {
+						providerAlive = false
+						return mockProvider
+					}
+					return undefined
 				},
+			}
+			Object.defineProperty(task, "providerRef", {
+				value: providerRef,
 				writable: false,
 				configurable: true,
 			})
 			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			const snapshot = await providerRef.deref()?.getState()
 
-			await expect(getTaskTestAccess(task).getSystemPrompt()).rejects.toThrow("Provider not available")
+			await expect(getTaskTestAccess(task).getSystemPrompt(snapshot)).rejects.toThrow("Provider not available")
 		})
 	})
 
@@ -3783,7 +3812,6 @@ describe("Cline", () => {
 				startTask: false,
 			})
 			await task.getTaskMode()
-			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
 
 			Object.assign(task.api, { ensureModelFetched: () => new Promise<void>(() => {}) })
 			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
@@ -3792,7 +3820,7 @@ describe("Cline", () => {
 
 			vi.useFakeTimers()
 			try {
-				const promptPromise = getTaskTestAccess(task).getSystemPrompt()
+				const promptPromise = getTaskTestAccess(task).getSystemPrompt(providerStateWith())
 				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
 
 				await expect(promptPromise).resolves.toBe("mock system prompt")
