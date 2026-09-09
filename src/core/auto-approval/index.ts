@@ -269,8 +269,8 @@ export async function checkAutoApproval({
 			if (state.destructiveCommandGuardEnabled === true) {
 				if (dcgDecision?.decision === "deny") {
 					// Blanket on: auto-deny, forwarding the guard's reason and
-					// rule to the model. Blanket off: fall through to the
-					// (protected) user prompt, as before.
+					// rule to the model. Blanket off: this ask falls through
+					// to the normal user prompt.
 					return blanketDeny
 						? {
 								decision: "deny",

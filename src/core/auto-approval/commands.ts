@@ -317,7 +317,6 @@ export function getCommandDecisionDetailed(
 	// Remove simple PowerShell-like redirections (e.g. 2>&1) before checking
 	const sanitizedCommands = subCommands.map((cmd) => cmd.replace(/\d*>&\d*/, "").trim())
 
-	// Check each sub-command and collect decisions
 	const decisions: CommandDecision[] = sanitizedCommands.map((cmd) =>
 		getSingleCommandDecision(cmd, allowedCommands, deniedCommands),
 	)

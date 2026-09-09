@@ -16,6 +16,7 @@ describe("Destructive Command Guard auto-approval precedence", () => {
 		allowedCommands: ["echo"],
 		deniedCommands: ["rm"],
 		destructiveCommandGuardEnabled: true,
+		alwaysDenyUnapprovedCommands: false,
 		mcpServers: [],
 	}
 
@@ -31,7 +32,7 @@ describe("Destructive Command Guard auto-approval precedence", () => {
 		expect(await checkAutoApproval({ state, ask: "command", text: "rm file" })).toEqual({ decision: "ask" })
 	})
 
-	it("requires explicit approval for a DCG-protected command", async () => {
+	it("requires explicit approval for a DCG-protected command when blanket auto-deny is off", async () => {
 		expect(
 			await checkAutoApproval({ state: baseState, ask: "command", text: "echo safe", isProtected: true }),
 		).toEqual({ decision: "ask" })

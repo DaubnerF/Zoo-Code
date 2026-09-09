@@ -153,10 +153,13 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 			}
 
 			// The blanket auto-deny setting only engages while command auto-approval
-			// is on; with either master switch off, behavior is unchanged and a DCG
-			// block keeps today's protected user prompt. The blanket decision is
-			// frozen to this pre-ask snapshot, while terminal behavior is re-read
-			// after approval so a settings flip during a pending prompt takes effect.
+			// is on. A DCG block keeps its protected user prompt unless the blanket
+			// setting is fully engaged, in which case it is auto-denied. The blanket
+			// decision is frozen to this pre-ask snapshot, while terminal behavior is
+			// re-read after approval so a settings flip during a pending prompt takes
+			// effect. A blanket off-flip landing between this snapshot and Task.ask's
+			// own re-read routes a DCG block to the normal prompt instead of the
+			// protected one; a user still decides either way, so the snapshot stays.
 			const providerState = await provider?.getState()
 			const blanketAutoDeny =
 				providerState?.alwaysDenyUnapprovedCommands === true &&
@@ -184,8 +187,8 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 			}
 
 			const executionId = task.lastMessageTs?.toString() ?? Date.now().toString()
-			// Re-read after approval (as HEAD did) so a settings flip while the
-			// approval prompt was pending is honored for terminal behavior.
+			// Re-read after approval so a settings flip while the approval prompt
+			// was pending is honored for terminal behavior.
 			const { terminalShellIntegrationDisabled = true } = (await provider?.getState()) ?? {}
 
 			// Get command execution timeout from VSCode configuration (in seconds)

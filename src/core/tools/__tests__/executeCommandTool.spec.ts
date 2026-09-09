@@ -753,9 +753,9 @@ describe("executeCommandTool", () => {
 		it("honors a terminal shell integration flip made during a pending approval", async () => {
 			vitest.useFakeTimers()
 			const provider = await mockCline.providerRef.deref()
-			// The pre-ask snapshot sees shell integration disabled, but the user
-			// flips the setting while the approval prompt is pending. HEAD read
-			// provider state after approval; execution must honor that fresher value.
+			// The pre-ask snapshot must not pin terminal behavior: execution
+			// reads provider state again after approval and must honor the
+			// fresher value.
 			provider.getState
 				.mockResolvedValueOnce({ terminalShellIntegrationDisabled: true })
 				.mockResolvedValueOnce({ terminalShellIntegrationDisabled: false })

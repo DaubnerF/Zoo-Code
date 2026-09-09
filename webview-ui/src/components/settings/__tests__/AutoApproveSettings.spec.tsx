@@ -270,8 +270,8 @@ describe("AutoApproveSettings - Save/Discard contract", () => {
 	})
 
 	it("hides the blanket auto-deny toggle while command auto-approval is off", () => {
-		// The setting only engages together with alwaysAllowExecute; with the
-		// master switch off, the whole Execute section (and its toggles) is hidden.
+		// With alwaysAllowExecute off, the whole Execute section (and its
+		// toggles, including the blanket auto-deny toggle) is hidden.
 		renderSettings({ alwaysAllowExecute: false })
 
 		expect(screen.queryByTestId("auto-deny-unapproved-checkbox")).not.toBeInTheDocument()

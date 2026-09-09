@@ -1482,7 +1482,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const provider = this.providerRef.deref()
 		const state = provider ? await provider.getState() : undefined
 		// The blanket auto-deny setting only engages while command auto-approval
-		// is on; with either master switch off, behavior is unchanged.
+		// is on; while it is disengaged, the queued-message shortcut below is
+		// unaffected.
 		const blanketDenyEngaged =
 			state?.alwaysDenyUnapprovedCommands === true &&
 			state?.autoApprovalEnabled === true &&

@@ -160,8 +160,9 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 	it("denies a blanket-denied command ask even when a queued message would auto-approve it", async () => {
 		const task = buildTask(provider, TASK_CWD)
 		const queue = await attachQueue(task)
-		// A queued message previously answered command asks with an unconditional
-		// yesButtonClicked — the one sequence that bypassed blanket deny. The
+		// A queued message answers command asks with an unconditional
+		// yesButtonClicked — one of the two sequences that could bypass blanket
+		// deny (the other was DCG-enabled approval without a guard verdict). The
 		// policy denial must win, and it must carry the same structured detail
 		// as the main path.
 		queue.addMessage("queued feedback arriving while blanket deny is engaged")

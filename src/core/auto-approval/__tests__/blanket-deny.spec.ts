@@ -3,7 +3,8 @@ import { checkAutoApproval } from ".."
 // Matrix over the blanket auto-deny feature (`alwaysDenyUnapprovedCommands`):
 // DCG on/off × blanket on/off × command shapes. The blanket setting only
 // engages while command auto-approval (`autoApprovalEnabled` +
-// `alwaysAllowExecute`) is on, so every case here keeps both gates on.
+// `alwaysAllowExecute`) is on, so the engagement cases keep both gates on; the
+// disengagement cases turn them off to prove the setting is inert.
 describe("blanket auto-deny for unapproved commands", () => {
 	const baseState = {
 		autoApprovalEnabled: true,
@@ -246,7 +247,7 @@ describe("blanket auto-deny for unapproved commands", () => {
 			}),
 		).toEqual({ decision: "approve" })
 
-		// A write that is not allowed still asks, exactly as before.
+		// A write that is not allowed still asks — the blanket setting is command-only.
 		expect(
 			await checkAutoApproval({
 				state: { ...state, alwaysAllowWrite: false },
