@@ -743,6 +743,45 @@ describe("ZooGatewayHandler", () => {
 			await expect(wait).rejects.toThrow()
 		})
 
+		it("settles the waiter when the fetch wins against a live signal and detaches the listener", async () => {
+			// Fetch-wins branch: resolve() must settle the await (a dropped
+			// resolve or a detached .then handler hangs this test), the abort
+			// listener must be registered with the real { once: true } options
+			// object, and the detach must target the *same* event name/handler
+			// pair that was registered — a mutated event name detaches nothing.
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+			const addEventListenerSpy = vitest.spyOn(controller.signal, "addEventListener")
+			const removeEventListenerSpy = vitest.spyOn(controller.signal, "removeEventListener")
+
+			await handler.ensureModelFetched(controller.signal)
+
+			expect(addEventListenerSpy).toHaveBeenCalledWith("abort", expect.any(Function), { once: true })
+			const registered = addEventListenerSpy.mock.calls.find(([event]) => event === "abort")
+			expect(registered).toBeDefined()
+			expect(removeEventListenerSpy).toHaveBeenCalledWith("abort", registered?.[1])
+		})
+
+		it("rejects a signal-observing waiter with the fetch error and detaches the listener", async () => {
+			// Rejection-branch twin of the fetch-wins test: reject(error) must
+			// propagate the catalog failure to the waiter (a dropped reject hangs
+			// this test) and the listener must be detached under the right event
+			// name. Existing reject coverage passes no signal, so this branch was
+			// never executed before.
+			const { getModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockRejectedValueOnce(new Error("network down"))
+
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+			const addEventListenerSpy = vitest.spyOn(controller.signal, "addEventListener")
+			const removeEventListenerSpy = vitest.spyOn(controller.signal, "removeEventListener")
+
+			await expect(handler.ensureModelFetched(controller.signal)).rejects.toThrow("network down")
+			const registered = addEventListenerSpy.mock.calls.find(([event]) => event === "abort")
+			expect(registered).toBeDefined()
+			expect(removeEventListenerSpy).toHaveBeenCalledWith("abort", registered?.[1])
+		})
+
 		it("never starts a wait when the signal is already aborted", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
 			const controller = new AbortController()

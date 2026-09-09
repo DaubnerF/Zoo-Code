@@ -45,6 +45,10 @@ type TaskTestAccess = {
 	safeEnsureModelFetched: () => Promise<ModelInfo>
 	addToApiConversationHistory: (message: unknown, reasoning?: string) => Promise<void>
 	resetAssistantMessagePersistence: () => void
+	buildCleanConversationHistory: (
+		messages: ApiMessage[],
+		requestModelInfo: ModelInfo,
+	) => Array<{ role: string; content: unknown } | { type: "reasoning"; encrypted_content: string }>
 }
 
 type TaskAskResult = Awaited<ReturnType<Task["ask"]>>
@@ -3871,6 +3875,56 @@ describe("Cline", () => {
 			)
 		})
 
+		it("releases the metadata abort controller once the wait completes", async () => {
+			// The ownership guard in safeEnsureModelFetched's finally block must
+			// clear the field for the call that still owns it: a never-cleared
+			// controller would let cancelCurrentRequest abort a long-dead signal.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+
+			Object.assign(task.api, { ensureModelFetched: () => Promise.resolve() })
+
+			await getTaskTestAccess(task).safeEnsureModelFetched()
+
+			expect(task.metadataFetchAbortController).toBeUndefined()
+		})
+
+		it("does not clear a controller owned by a newer metadata wait", async () => {
+			// Overlap guard: if a newer call replaced this call's controller while
+			// the bounded wait was pending, the finished call's finally block must
+			// leave the foreign controller in place — clearing unconditionally
+			// would silently orphan the newer wait from cancel/dispose.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+
+			let settleFetch!: () => void
+			Object.assign(task.api, {
+				ensureModelFetched: () =>
+					new Promise<void>((resolve) => {
+						settleFetch = resolve
+					}),
+			})
+
+			const settled = getTaskTestAccess(task).safeEnsureModelFetched()
+			// The per-call controller is installed synchronously before the race.
+			expect(task.metadataFetchAbortController).toBeInstanceOf(AbortController)
+			const foreignController = new AbortController()
+			task.metadataFetchAbortController = foreignController
+
+			settleFetch()
+			await settled
+
+			expect(task.metadataFetchAbortController).toBe(foreignController)
+		})
+
 		it("does not block getSystemPrompt when ensureModelFetched never settles", async () => {
 			// The prompt/condense guard site must proceed with fallback model
 			// info once the bounded wait expires instead of hanging the request.
@@ -4491,6 +4545,7 @@ describe("Cline", () => {
 				asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "ok" }]),
 			)
 			const safeSpy = vi.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched")
+			const cleanHistorySpy = vi.spyOn(getTaskTestAccess(task), "buildCleanConversationHistory")
 			// Hold the prompt build open so the metadata fetch can land after the
 			// snapshot was captured but before context sizing runs.
 			let releasePrompt!: () => void
@@ -4525,9 +4580,65 @@ describe("Cline", () => {
 			expect(systemPromptCall[17]).toBe(threadedInfo)
 			// The threaded snapshot replaces the per-request guard entirely.
 			expect(safeSpy).not.toHaveBeenCalled()
+			// The cleaned request history resolves its model-dependent flags from
+			// the same threaded snapshot, not from a fresh handler re-read.
+			expect(cleanHistorySpy).toHaveBeenCalledWith(expect.any(Array), threadedInfo)
 			// Condensing ran because sizing resolved from the 32k threaded
 			// window; a 128k re-read would have cleared the threshold instead.
 			expect(summarizeConversation).toHaveBeenCalledTimes(summarizeCallsBefore + 1)
+		})
+	})
+
+	describe("buildCleanConversationHistory", () => {
+		// Assistant message carrying a plain-text (unencrypted) reasoning block:
+		// whether the block survives into the sent history depends solely on the
+		// model snapshot's preserveReasoning flag.
+		const reasoningMessage: ApiMessage = {
+			role: "assistant",
+			content: [
+				{
+					type: "reasoning",
+					text: "hidden chain of thought",
+					summary: [],
+				} as unknown as Anthropic.Messages.ContentBlockParam,
+				{ type: "text", text: "answer" },
+			],
+			ts: 1,
+		}
+
+		function historyFor(preserveReasoning: boolean) {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			// The handler re-read deliberately disagrees with the threaded
+			// snapshot: any output that follows the re-read instead of the
+			// parameter flips the assertions below.
+			vi.spyOn(task.api, "getModel").mockReturnValue({
+				id: "lazy-router-model",
+				info: { contextWindow: 1_000, supportsPromptCache: false, preserveReasoning: !preserveReasoning },
+			})
+
+			const requestModelInfo: ModelInfo = {
+				contextWindow: 1_000,
+				supportsPromptCache: false,
+				preserveReasoning,
+			}
+			return getTaskTestAccess(task).buildCleanConversationHistory([reasoningMessage], requestModelInfo)
+		}
+
+		it("keeps plain-text reasoning when the threaded snapshot sets preserveReasoning", () => {
+			const history = historyFor(true)
+
+			expect(history).toEqual([{ role: "assistant", content: reasoningMessage.content }])
+		})
+
+		it("strips plain-text reasoning when the threaded snapshot omits preserveReasoning", () => {
+			const history = historyFor(false)
+
+			expect(history).toEqual([{ role: "assistant", content: "answer" }])
 		})
 	})
 

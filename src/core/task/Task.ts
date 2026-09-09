@@ -4764,7 +4764,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// mergeConsecutiveApiMessages implementation) without mutating stored history.
 		const mergedForApi = mergeConsecutiveApiMessages(messagesSinceLastSummary, { roles: ["user"] })
 		const messagesWithoutImages = maybeRemoveImageBlocks(mergedForApi, this.api)
-		const cleanConversationHistory = this.buildCleanConversationHistory(messagesWithoutImages as ApiMessage[])
+		const cleanConversationHistory = this.buildCleanConversationHistory(
+			messagesWithoutImages as ApiMessage[],
+			requestModelInfo,
+		)
 
 		// Check auto-approval limits
 		const approvalResult = await this.autoApprovalHandler.checkAutoApprovalLimits(
@@ -5038,6 +5041,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	private buildCleanConversationHistory(
 		messages: ApiMessage[],
+		requestModelInfo: ModelInfo,
 	): Array<
 		Anthropic.Messages.MessageParam | { type: "reasoning"; encrypted_content: string; id?: string; summary?: any[] }
 	> {
@@ -5137,10 +5141,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					continue
 				} else if (hasPlainTextReasoning) {
-					// Check if the model's preserveReasoning flag is set
+					// Check if the model's preserveReasoning flag is set, resolved from
+					// the request's threaded model snapshot (same per-request source as
+					// the prompt and tool arrays) rather than a fresh getModel() re-read,
+					// so a mid-request metadata refresh cannot change what this request sends.
 					// If true, include the reasoning block in API requests
 					// If false/undefined, strip it out (stored for history only, not sent back to API)
-					const shouldPreserveForApi = this.api.getModel().info.preserveReasoning === true
+					const shouldPreserveForApi = requestModelInfo.preserveReasoning === true
 					let assistantContent: Anthropic.Messages.MessageParam["content"]
 
 					if (shouldPreserveForApi) {

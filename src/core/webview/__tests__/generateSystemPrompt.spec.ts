@@ -521,15 +521,43 @@ describe("generateSystemPrompt preview parity", () => {
 				capturedSignal = signal
 				return new Promise<void>(() => {})
 			})
+			// Both abort sites are pinned by count: the timeout callback fires
+			// exactly when the bound elapses — detaching a hung waiter before
+			// the prompt is even built — and the finally block re-aborts on
+			// completion. Deleting either call leaves the other as the sole,
+			// strictly-too-late detach, and the count drops to one.
+			const abortSpy = vi.spyOn(AbortController.prototype, "abort")
 
 			vi.useFakeTimers()
 			try {
 				const previewPromise = generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
 				await vi.advanceTimersByTimeAsync(5_000)
+				// Both abort sites have fired by the time the preview resolves:
+				// the finally block runs before generateSystemPrompt returns, so
+				// the count is asserted while the spy still holds its history
+				// (mockRestore would clear it).
 				await previewPromise
+				expect(abortSpy).toHaveBeenCalledTimes(2)
 			} finally {
 				vi.useRealTimers()
+				abortSpy.mockRestore()
 			}
+			expect(capturedSignal?.aborted).toBe(true)
+		})
+
+		it("aborts the handler signal after a fast fetch so the waiter detaches on completion", async () => {
+			// The finally-block detach also covers the fetch-wins path: a
+			// signal-observing handler must not keep serving waiters for a
+			// preview that already finished. Without the finally abort, the
+			// captured signal is never aborted on this path (no timer fires).
+			let capturedSignal: AbortSignal | undefined
+			modelMock.ensureModelFetched.mockImplementationOnce((signal?: AbortSignal) => {
+				capturedSignal = signal
+				return Promise.resolve()
+			})
+
+			await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
 			expect(capturedSignal?.aborted).toBe(true)
 		})
 
