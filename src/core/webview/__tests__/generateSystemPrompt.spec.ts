@@ -512,6 +512,27 @@ describe("generateSystemPrompt preview parity", () => {
 			}
 		})
 
+		it("aborts the handler signal when the preview fetch times out", async () => {
+			// The preview's bound must detach the handler-side waiter, mirroring
+			// the runtime path: a signal-observing handler stops serving the
+			// abandoned fetch once the bound expires.
+			let capturedSignal: AbortSignal | undefined
+			modelMock.ensureModelFetched.mockImplementationOnce((signal?: AbortSignal) => {
+				capturedSignal = signal
+				return new Promise<void>(() => {})
+			})
+
+			vi.useFakeTimers()
+			try {
+				const previewPromise = generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+				await vi.advanceTimersByTimeAsync(5_000)
+				await previewPromise
+			} finally {
+				vi.useRealTimers()
+			}
+			expect(capturedSignal?.aborted).toBe(true)
+		})
+
 		it("logs and degrades when the model info cannot be read", async () => {
 			// A throw while reading the model info escapes the fetch race and lands
 			// in the outer handler: the preview must still resolve — without model

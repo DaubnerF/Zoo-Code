@@ -144,8 +144,8 @@ const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 // Upper bound on awaiting lazily loaded model metadata. Some model-catalog
 // fetchers (e.g. OpenRouter's bare axios GET) have no request timeout, so a
 // hung endpoint must not stall streaming, condense, or context-window
-// handling. On expiry the fetch is abandoned (the API-handler contract
-// exposes no AbortSignal) and callers fall back to the handler's existing
+// handling. On expiry the caller aborts its per-call AbortSignal (detaching
+// the provider-side waiter) and falls back to the handler's existing
 // getModel().info metadata — the same degradation a rejected fetch produces.
 // Kept in sync with PREVIEW_MODEL_FETCH_TIMEOUT_MS in the preview path
 // (src/core/webview/generateSystemPrompt.ts). Deliberately duplicated, not
@@ -328,6 +328,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private readonly globalStoragePath: string
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
+	/**
+	 * Controller for the waiter on an in-flight `ensureModelFetched()` call (see
+	 * safeEnsureModelFetched). Aborting it detaches this task from the provider-side
+	 * metadata fetch; it is aborted when the bounded wait expires and when the task's
+	 * current request is cancelled (cancel/dispose path in cancelCurrentRequest).
+	 */
+	metadataFetchAbortController?: AbortController
 	skipPrevResponseIdOnce: boolean = false
 
 	// TaskStatus
@@ -2625,6 +2632,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.currentRequestAbortController.abort()
 			this.currentRequestAbortController = undefined
 		}
+		// A metadata-fetch waiter still in flight is as stale as an abandoned
+		// stream: detach it from the provider-side fetch on cancel/dispose.
+		if (this.metadataFetchAbortController) {
+			this.metadataFetchAbortController.abort()
+			this.metadataFetchAbortController = undefined
+		}
 	}
 
 	/**
@@ -4277,7 +4290,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * Ensures router-provider model metadata is loaded before getModel() is used for
 	 * context management or streaming. Failures fall back to hardcoded defaults rather
 	 * than aborting the task; the wait is bounded by MODEL_FETCH_TIMEOUT_MS (see the
-	 * constant for the abandonment and degradation semantics).
+	 * constant for the degradation semantics). On expiry or cancellation the per-call
+	 * AbortSignal detaches this task's waiter from the provider-side fetch instead of
+	 * leaving a handler-side promise waiting on it indefinitely.
 	 *
 	 * The return value is the settled post-wait read of getModel().info: request
 	 * entry points (attemptApiRequest, condenseContext,
@@ -4293,14 +4308,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * rejected fetches remains future work if the failure-path latency ever matters.
 	 */
 	private async safeEnsureModelFetched(): Promise<ModelInfo> {
-		// Promise.race attaches handlers to both inputs, so the abandoned fetch
-		// rejecting after the timeout is already considered handled — no extra
-		// .catch is needed here.
+		// Per-call controller: its signal makes ensureModelFetched() settle on
+		// abort, so neither this race nor the provider-side waiter outlives the
+		// bounded wait. cancel/dispose aborts it early via cancelCurrentRequest.
+		const controller = new AbortController()
+		this.metadataFetchAbortController = controller
+		// Promise.race attaches handlers to both inputs, so the fetch rejecting
+		// after the abort is already considered handled — no extra .catch needed.
 		let timeoutId: ReturnType<typeof setTimeout> | undefined
 		let timedOut = false
 		try {
 			await Promise.race([
-				this.api.ensureModelFetched?.(),
+				this.api.ensureModelFetched?.(controller.signal),
 				new Promise<void>((resolve) => {
 					timeoutId = setTimeout(() => {
 						timedOut = true
@@ -4322,6 +4341,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			if (timeoutId) {
 				clearTimeout(timeoutId)
 			}
+			if (this.metadataFetchAbortController === controller) {
+				this.metadataFetchAbortController = undefined
+			}
+			// Unconditional: settles any waiter still attached to this call.
+			controller.abort()
 		}
 		// The post-wait read is the settled snapshot callers must share per request.
 		return this.api.getModel().info

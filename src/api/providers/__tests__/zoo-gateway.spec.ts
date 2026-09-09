@@ -724,6 +724,33 @@ describe("ZooGatewayHandler", () => {
 			expect(refreshModels).not.toHaveBeenCalled()
 		})
 
+		it("settles the waiter with a rejection when the signal aborts mid-fetch", async () => {
+			// A caller that gives up must not leave a handler-side waiter pending
+			// on the (shared) catalog fetch: with an observing signal, the
+			// ensureModelFetched promise rejects at abort time, while the
+			// underlying fetch continues untouched for any other waiter.
+			const { getModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockImplementationOnce(() => new Promise(() => {}))
+
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+
+			const wait = handler.ensureModelFetched(controller.signal)
+			// Let the waiter attach its abort listener before cancelling.
+			await Promise.resolve()
+			controller.abort()
+
+			await expect(wait).rejects.toThrow()
+		})
+
+		it("never starts a wait when the signal is already aborted", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+			controller.abort()
+
+			await expect(handler.ensureModelFetched(controller.signal)).rejects.toThrow()
+		})
+
 		it("skips the fetch when models are already populated", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
 			const { getModels, refreshModels } = await import("../fetchers/modelCache")

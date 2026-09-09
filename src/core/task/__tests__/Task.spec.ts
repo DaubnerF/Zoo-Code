@@ -3802,6 +3802,75 @@ describe("Cline", () => {
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
 		})
 
+		it("aborts the fetch signal when the bounded wait expires", async () => {
+			// The bound must detach this task's waiter, not just stop waiting on
+			// it: a handler that observes its signal stops serving the abandoned
+			// fetch, and one that ignores it at least sees the task move on.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+
+			let capturedSignal: AbortSignal | undefined
+			Object.assign(task.api, {
+				ensureModelFetched: (signal?: AbortSignal) => {
+					capturedSignal = signal
+					return new Promise<void>(() => {})
+				},
+			})
+			vi.spyOn(console, "warn").mockImplementation(() => {})
+
+			vi.useFakeTimers()
+			try {
+				const settled = getTaskTestAccess(task).safeEnsureModelFetched()
+				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
+				await settled
+			} finally {
+				vi.useRealTimers()
+			}
+			expect(capturedSignal?.aborted).toBe(true)
+		})
+
+		it("aborts an in-flight metadata wait when the current request is cancelled", async () => {
+			// Cancel/dispose must reach the metadata waiter, not only the stream:
+			// cancelCurrentRequest aborts the controller feeding the handler's
+			// signal, so a signal-observing handler settles the waiter immediately
+			// and the call degrades to fallback info instead of hanging until the
+			// bound.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+
+			let capturedSignal: AbortSignal | undefined
+			Object.assign(task.api, {
+				ensureModelFetched: (signal?: AbortSignal) =>
+					new Promise<void>((_resolve, reject) => {
+						capturedSignal = signal
+						signal?.addEventListener("abort", () => reject(signal.reason), { once: true })
+					}),
+			})
+			const expectedInfo = task.api.getModel().info
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+			const settled = getTaskTestAccess(task).safeEnsureModelFetched()
+			// Let the waiter attach to the handler before cancelling.
+			await Promise.resolve()
+
+			task.cancelCurrentRequest()
+
+			await expect(settled).resolves.toBe(expectedInfo)
+			expect(capturedSignal?.aborted).toBe(true)
+			expect(errorSpy).toHaveBeenCalledWith(
+				expect.stringContaining("Failed to fetch model metadata"),
+				expect.anything(),
+			)
+		})
+
 		it("does not block getSystemPrompt when ensureModelFetched never settles", async () => {
 			// The prompt/condense guard site must proceed with fallback model
 			// info once the bounded wait expires instead of hanging the request.
