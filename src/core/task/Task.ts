@@ -4904,7 +4904,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				)
 				await this.handleContextWindowExceededError()
 				// Retry the request after handling the context window error
-				yield* this.attemptApiRequest(retryAttempt + 1)
+				yield* this.attemptApiRequest(retryAttempt + 1, options)
 				return
 			}
 
@@ -4924,7 +4924,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 				// Delegate generator output from the recursive call with
 				// incremented retry count.
-				yield* this.attemptApiRequest(retryAttempt + 1)
+				yield* this.attemptApiRequest(retryAttempt + 1, options)
 
 				return
 			} else {
@@ -4942,7 +4942,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				await this.say("api_req_retried")
 
 				// Delegate generator output from the recursive call.
-				yield* this.attemptApiRequest()
+				yield* this.attemptApiRequest(0, options)
 				return
 			}
 		}

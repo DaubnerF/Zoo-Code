@@ -3719,6 +3719,127 @@ describe("Cline", () => {
 				expect(options.metadata?.abortSignal).toBeInstanceOf(AbortSignal)
 				expect(options.metadata?.abortSignal?.aborted).toBe(false)
 			})
+
+			// Shared harness for the retry-options-forwarding tests: the first
+			// createMessage fails on the first chunk, the retry attempt streams a
+			// success chunk, and the attemptApiRequest spy exposes the arguments
+			// each retry site's recursion passes downstream. A same-reference
+			// assertion on options is the point: a rebuilt object would silently
+			// refetch model metadata and restart the rate-limit wait on retries.
+			async function createRetryForwardingTask(stateOverrides: Partial<ProviderState> = {}) {
+				vi.spyOn(mockProvider, "getState").mockResolvedValue(
+					providerStateWith({
+						autoApprovalEnabled: false,
+						requestDelaySeconds: 0,
+						...stateOverrides,
+					}),
+				)
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				await task.getTaskMode()
+				vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockResolvedValue("mock system prompt")
+				vi.spyOn(task, "getTokenUsage").mockReturnValue({
+					totalCost: 0,
+					totalTokensIn: 0,
+					totalTokensOut: 0,
+					contextTokens: 0,
+				})
+				vi.spyOn(task, "say").mockResolvedValue(undefined)
+				task.apiConversationHistory = [
+					{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+				]
+				return task
+			}
+
+			const failingStream = (error: unknown): AsyncGenerator<ApiStreamChunk> =>
+				(async function* () {
+					// Yield nothing, then fail the first next() like a first-chunk
+					// stream error would.
+					yield* []
+					throw error
+				})()
+
+			const retryForwardingOptions = (): { skipProviderRateLimit: boolean; requestModelInfo: ModelInfo } => ({
+				skipProviderRateLimit: true,
+				requestModelInfo: { contextWindow: 200_000, maxTokens: 4096, supportsPromptCache: true },
+			})
+
+			it("forwards the caller's options to the context-window retry recursion", async () => {
+				const task = await createRetryForwardingTask()
+				vi.spyOn(getTaskTestAccess(task), "handleContextWindowExceededError").mockResolvedValue(undefined)
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 400, message: "context length exceeded" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const options = retryForwardingOptions()
+				const iterator = task.attemptApiRequest(0, options)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(1)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]).toBe(options)
+			})
+
+			it("forwards the caller's options to the auto-approval backoff retry recursion", async () => {
+				const task = await createRetryForwardingTask({ autoApprovalEnabled: true })
+				// An ask landing here means the auto-approval branch was not taken,
+				// so the rejection names the wrong-site failure explicitly.
+				vi.spyOn(task, "ask").mockRejectedValue(new Error("auto-approval retry must not prompt the user"))
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 500, message: "server error" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const options = retryForwardingOptions()
+				const iterator = task.attemptApiRequest(0, options)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(1)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]).toBe(options)
+			})
+
+			it("forwards the caller's options and resets the counter on the user-clicked retry recursion", async () => {
+				const task = await createRetryForwardingTask()
+				vi.spyOn(task, "ask").mockResolvedValue({ response: "yesButtonClicked" } satisfies TaskAskResult)
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 500, message: "server error" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const options = retryForwardingOptions()
+				const iterator = task.attemptApiRequest(0, options)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				// The user-confirmed retry restarts the retry counter at 0 (its own
+				// pacing is the user's click), unlike the automatic backoff retries.
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(0)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]).toBe(options)
+			})
 		})
 	})
 
