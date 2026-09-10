@@ -4295,9 +4295,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * leaving a handler-side promise waiting on it indefinitely.
 	 *
 	 * The return value is the settled post-wait read of getModel().info: request
-	 * entry points (attemptApiRequest, condenseContext,
-	 * handleContextWindowExceededError) await this once before prompt generation
-	 * and share the returned snapshot between getSystemPrompt and every tool-array
+	 * entry points (attemptApiRequest, condenseContext) await this once before
+	 * prompt generation and share the returned snapshot between getSystemPrompt
+	 * and every tool-array
 	 * build of the same request, so a fetch that resolves after the bounded wait
 	 * was abandoned cannot move model-specific tool policy between prompt time and
 	 * request time. Callers that do not thread a snapshot keep awaiting this
@@ -4351,7 +4351,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return this.api.getModel().info
 	}
 
-	private async handleContextWindowExceededError(): Promise<void> {
+	private async handleContextWindowExceededError(requestModelInfo: ModelInfo): Promise<void> {
 		const state = await this.providerRef.deref()?.getState()
 		const { profileThresholds = {} } = state ?? {}
 		// Use task-local values, not provider state, to prevent cross-task configuration leaks.
@@ -4359,7 +4359,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const apiConfiguration = this.apiConfiguration
 
 		const { contextTokens } = this.getTokenUsage()
-		const modelInfo = await this.safeEnsureModelFetched()
+		// Truncation permanently rewrites apiConversationHistory, and the retry
+		// hop that consumes the result builds from the caller's snapshot; sizing
+		// against a fresh read here could discard history the retry would still
+		// have fit, so recovery shares the caller's snapshot instead of re-fetching.
+		const modelInfo = requestModelInfo
 
 		const maxTokens = getModelMaxOutputTokens({
 			modelId: this.api.getModel().id,
@@ -4908,7 +4912,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						`Retry attempt ${retryAttempt + 1}/${MAX_CONTEXT_WINDOW_RETRIES}. ` +
 						`Attempting automatic truncation...`,
 				)
-				await this.handleContextWindowExceededError()
+				await this.handleContextWindowExceededError(requestModelInfo)
 				// Retry the request after handling the context window error
 				yield* this.attemptApiRequest(retryAttempt + 1, retryOptions)
 				return

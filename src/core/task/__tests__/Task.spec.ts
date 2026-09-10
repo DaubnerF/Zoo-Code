@@ -33,7 +33,7 @@ import { McpServerManager } from "../../../services/mcp/McpServerManager"
 
 type TaskTestAccess = {
 	getSystemPrompt: (requestState: ProviderState | undefined, requestModelInfo?: ModelInfo) => Promise<string>
-	handleContextWindowExceededError: () => Promise<void>
+	handleContextWindowExceededError: (requestModelInfo: ModelInfo) => Promise<void>
 	getEnabledMcpToolsCount: () => Promise<{ enabledToolCount: number; enabledServerCount: number }>
 	initiateTaskLoop: (userContent: Anthropic.Messages.ContentBlockParam[]) => Promise<void>
 	startTask: (task?: string, images?: string[]) => Promise<void>
@@ -1124,12 +1124,12 @@ describe("Cline", () => {
 				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
 				.mockResolvedValue("mock system prompt")
 
-			await getTaskTestAccess(task).handleContextWindowExceededError()
+			await getTaskTestAccess(task).handleContextWindowExceededError(ctxModelInfo)
 
 			// Reference equality: without threading, the arguments would be
 			// undefined and getSystemPrompt would re-read the divergent state and
-			// the model info; the second argument must be the same settled snapshot
-			// the handler exposes.
+			// the model info; the second argument must be the snapshot threaded
+			// into the handler, not a fresh re-read.
 			expect(getSystemPromptSpy).toHaveBeenCalledWith(snapshot, ctxModelInfo)
 		})
 
@@ -3869,6 +3869,52 @@ describe("Cline", () => {
 				// tool policy mid-request.
 				expect(attemptApiRequestSpy.mock.calls[1]?.[1]?.requestModelInfo).toBe(stubModelInfo)
 				// Derivation ran once per logical request, not once per hop.
+				expect(safeEnsureModelFetchedSpy).toHaveBeenCalledTimes(1)
+			})
+
+			it("recovers from a context-window overflow against the pinned request snapshot when metadata changes in between", async () => {
+				// The pinned-snapshot invariant covers the recovery half too:
+				// truncation permanently rewrites apiConversationHistory for the
+				// retry hop to consume, so recovery must size against the same
+				// snapshot the retry uses — never a fresh metadata read that
+				// landed between the failed attempt and recovery.
+				const task = await createRetryForwardingTask()
+				// Distinct object, same window as the stub: identity is what the
+				// retry hop must carry forward.
+				const pinnedInfo: ModelInfo = { ...stubModelInfo }
+				// A narrower window arriving after the first failure would drive
+				// harsher truncation math than the retry hop actually needs.
+				const freshInfo: ModelInfo = { ...stubModelInfo, contextWindow: 32_000 }
+				const safeEnsureModelFetchedSpy = vi
+					.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched")
+					.mockResolvedValueOnce(pinnedInfo)
+					.mockResolvedValue(freshInfo)
+				const getSystemPromptSpy = vi
+					.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+					.mockResolvedValue("mock system prompt")
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 400, message: "context length exceeded" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const iterator = task.attemptApiRequest(0)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				// hop 1 prompt, the recovery handler's condensing prompt, hop 2 prompt.
+				expect(getSystemPromptSpy).toHaveBeenCalledTimes(3)
+				// Without threading, the handler re-fetches and this second call
+				// carries freshInfo, so truncation is sized against a window the
+				// retry never uses.
+				expect(getSystemPromptSpy.mock.calls[1]?.[1]).toBe(pinnedInfo)
+				// Recovery and the retry hop share one snapshot object.
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]?.requestModelInfo).toBe(pinnedInfo)
+				// The handler performs no metadata fetch of its own.
 				expect(safeEnsureModelFetchedSpy).toHaveBeenCalledTimes(1)
 			})
 		})
