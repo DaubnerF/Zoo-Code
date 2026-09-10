@@ -6,6 +6,7 @@
 // (protocol guarantee) and `disabledTools`-removed tools are excluded.
 
 import type OpenAI from "openai"
+import type * as vscode from "vscode"
 
 import type { McpServer, ModeConfig, ModelInfo } from "@roo-code/types"
 
@@ -32,15 +33,22 @@ import { buildNativeToolsArrayWithRestrictions } from "../build-tools"
 
 /**
  * ClineProvider is a heavy class; build-tools only reads `context` and
- * `getMcpHub()` from it, so a minimal object literal stands in. The only
- * double assertions in this file.
+ * `getMcpHub()` from it, so a minimal object literal stands in. The double
+ * declares exactly those members, narrowed via Pick to what the MCP helpers
+ * actually call. ClineProvider itself structurally satisfies this shape, so
+ * handing the double off as ClineProvider is a single legal assertion.
  */
+type ProviderDouble = {
+	context: Pick<vscode.ExtensionContext, "extensionPath" | "globalStoragePath" | "storagePath" | "logPath">
+	getMcpHub: () => Pick<McpHub, "getServers"> | undefined
+}
+
 function makeProvider(servers: McpServer[] = []): ClineProvider {
-	const provider = {
+	const provider: ProviderDouble = {
 		context: { extensionPath: "/mock", globalStoragePath: "/mock", storagePath: "/mock", logPath: "/mock" },
-		getMcpHub: () => ({ getServers: () => servers }) as unknown as McpHub,
+		getMcpHub: () => ({ getServers: () => servers }),
 	}
-	return provider as unknown as ClineProvider
+	return provider as ClineProvider
 }
 
 function toolNames(tools: OpenAI.Chat.ChatCompletionTool[]): string[] {
@@ -180,6 +188,7 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 
 		// The MCP declaration stays advertised (all tools are sent on this path)
 		// but drops out of the callable allowlist.
+		expect(toolNames(geminiResult.tools)).toContain("mcp--test-server--test_tool")
 		expect(geminiResult.allowedFunctionNames?.some((name) => name.startsWith("mcp--"))).toBe(false)
 	})
 
