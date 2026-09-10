@@ -75,6 +75,33 @@ export function resolveToolAlias(toolName: string): string {
 }
 
 /**
+ * True when `toolName` is suppressed by the user's `disabledTools` list or the
+ * model's `excludedTools` customization, comparing alias-resolved names exactly
+ * as the resolver's exclusion steps do.
+ *
+ * This is the membership test behind those resolver steps, exposed for callers
+ * (like the MCP tool filter) that gate a whole tool class on one canonical name
+ * without computing the full policy set. It intentionally ignores the protocol
+ * guarantee: `resolveEffectiveToolPolicy` re-adds `PROTOCOL_TOOLS` after
+ * applying these lists, so this predicate answers "is it listed", not "is it
+ * finally available" — no protocol tool should be gated through here.
+ *
+ * @param toolName The canonical tool name to test (may itself be an alias).
+ * @param disabledTools The user's disabled-tools list (may contain aliases).
+ * @param modelInfo The model customization whose `excludedTools` may list it.
+ * @returns True when either list suppresses the tool.
+ */
+export function isToolDisabledOrExcluded(
+	toolName: string,
+	disabledTools: string[] | undefined,
+	modelInfo: ModelInfo | undefined,
+): boolean {
+	const canonical = resolveToolAlias(toolName)
+	const isSuppressed = (entry: string): boolean => resolveToolAlias(entry) === canonical
+	return Boolean(disabledTools?.some(isSuppressed)) || Boolean(modelInfo?.excludedTools?.some(isSuppressed))
+}
+
+/**
  * Canonical protocol-tool names already warned about. Module-level so the
  * protocol-override warning fires at most once per tool per process.
  */

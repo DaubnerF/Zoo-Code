@@ -135,9 +135,14 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 		allowedMcpServers,
 	)
 
-	// Filter MCP tools based on mode restrictions.
+	// Filter MCP tools based on mode restrictions and the effective tool policy:
+	// the same disabledTools/modelInfo the native filter consumes also gate the
+	// dynamic mcp--* declarations, which all represent use_mcp_tool.
 	const mcpTools = getMcpServerTools(mcpHub, allowedMcpServers)
-	const filteredMcpTools = filterMcpToolsForMode(mcpTools, mode, customModes, experiments)
+	const filteredMcpTools = filterMcpToolsForMode(mcpTools, mode, customModes, experiments, {
+		disabledTools,
+		modelInfo,
+	})
 
 	// Add custom tools if they are available and the experiment is enabled.
 	let nativeCustomTools: OpenAI.Chat.ChatCompletionFunctionTool[] = []

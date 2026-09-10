@@ -7,7 +7,7 @@
 
 import type OpenAI from "openai"
 
-import type { ModeConfig, ModelInfo } from "@roo-code/types"
+import type { McpServer, ModeConfig, ModelInfo } from "@roo-code/types"
 
 import type { ClineProvider } from "../../webview/ClineProvider"
 import type { McpHub } from "../../../services/mcp/McpHub"
@@ -32,13 +32,13 @@ import { buildNativeToolsArrayWithRestrictions } from "../build-tools"
 
 /**
  * ClineProvider is a heavy class; build-tools only reads `context` and
- * `getMcpHub()` from it, so a minimal object literal stands in. The single
- * double assertion in this file.
+ * `getMcpHub()` from it, so a minimal object literal stands in. The only
+ * double assertions in this file.
  */
-function makeProvider(): ClineProvider {
+function makeProvider(servers: McpServer[] = []): ClineProvider {
 	const provider = {
 		context: { extensionPath: "/mock", globalStoragePath: "/mock", storagePath: "/mock", logPath: "/mock" },
-		getMcpHub: () => ({ getServers: () => [] }) as unknown as McpHub,
+		getMcpHub: () => ({ getServers: () => servers }) as unknown as McpHub,
 	}
 	return provider as unknown as ClineProvider
 }
@@ -140,5 +140,68 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 
 		expect(result.allowedFunctionNames).not.toContain("read_file")
 		expect(result.allowedFunctionNames).toContain("attempt_completion")
+	})
+
+	it("omits dynamic MCP declarations when disabledTools disables use_mcp_tool", async () => {
+		// The builder threads disabledTools/modelInfo into the MCP filter, so a
+		// disabled use_mcp_tool removes every mcp--* declaration from the sent
+		// tools, and from allowedFunctionNames on the Gemini path.
+		const mcpProvider = makeProvider([
+			{
+				name: "test-server",
+				config: "{}",
+				status: "connected",
+				tools: [{ name: "test_tool", description: "a test tool", inputSchema: { type: "object" } }],
+			},
+		])
+
+		const result = await buildNativeToolsArrayWithRestrictions({
+			provider: mcpProvider,
+			cwd: "/test/path",
+			mode: "code",
+			customModes: undefined,
+			experiments: {},
+			apiConfiguration: undefined,
+			disabledTools: ["use_mcp_tool"],
+		})
+
+		expect(toolNames(result.tools).some((name) => name.startsWith("mcp--"))).toBe(false)
+
+		const geminiResult = await buildNativeToolsArrayWithRestrictions({
+			provider: mcpProvider,
+			cwd: "/test/path",
+			mode: "code",
+			customModes: undefined,
+			experiments: {},
+			apiConfiguration: undefined,
+			disabledTools: ["use_mcp_tool"],
+			includeAllToolsWithRestrictions: true,
+		})
+
+		// The MCP declaration stays advertised (all tools are sent on this path)
+		// but drops out of the callable allowlist.
+		expect(geminiResult.allowedFunctionNames?.some((name) => name.startsWith("mcp--"))).toBe(false)
+	})
+
+	it("keeps dynamic MCP declarations when use_mcp_tool is not disabled or excluded", async () => {
+		const mcpProvider = makeProvider([
+			{
+				name: "test-server",
+				config: "{}",
+				status: "connected",
+				tools: [{ name: "test_tool", description: "a test tool", inputSchema: { type: "object" } }],
+			},
+		])
+
+		const result = await buildNativeToolsArrayWithRestrictions({
+			provider: mcpProvider,
+			cwd: "/test/path",
+			mode: "code",
+			customModes: undefined,
+			experiments: {},
+			apiConfiguration: undefined,
+		})
+
+		expect(toolNames(result.tools)).toContain("mcp--test-server--test_tool")
 	})
 })

@@ -3,7 +3,7 @@ import type { ModeConfig, ModelInfo } from "@roo-code/types"
 import { defaultModeSlug } from "../../../shared/modes"
 import type { CodeIndexManager } from "../../../services/code-index/manager"
 import type { McpHub } from "../../../services/mcp/McpHub"
-import { resolveEffectiveToolPolicy, resolveToolAlias } from "./effective-tool-policy"
+import { resolveEffectiveToolPolicy, resolveToolAlias, isToolDisabledOrExcluded } from "./effective-tool-policy"
 import { isToolAllowedForMode } from "../../../core/tools/validateToolUse"
 
 // Re-export the resolver's alias helper so existing importers of this module
@@ -148,12 +148,16 @@ function resolveModelAliasRenames(
 }
 
 /**
- * Filters MCP tools based on whether use_mcp_tool is allowed in the current mode.
+ * Filters MCP tools based on whether use_mcp_tool is allowed in the current mode
+ * and not suppressed by the effective tool policy's disabled/excluded lists.
  *
  * @param mcpTools - Array of MCP tools
  * @param mode - Current mode slug
  * @param customModes - Custom mode configurations
  * @param experiments - Experiment flags
+ * @param settings - Optional disabled-tools list and model customization. When
+ *   omitted (or missing these fields) no disabled/excluded policy is known, so
+ *   only the mode check applies.
  * @returns Filtered array of MCP tools if use_mcp_tool is allowed, empty array otherwise
  */
 export function filterMcpToolsForMode(
@@ -161,6 +165,7 @@ export function filterMcpToolsForMode(
 	mode: string | undefined,
 	customModes: ModeConfig[] | undefined,
 	experiments: Record<string, boolean> | undefined,
+	settings?: { disabledTools?: string[]; modelInfo?: ModelInfo },
 ): OpenAI.Chat.ChatCompletionTool[] {
 	const modeSlug = mode ?? defaultModeSlug
 
@@ -174,5 +179,12 @@ export function filterMcpToolsForMode(
 		experiments ?? {},
 	)
 
-	return isMcpAllowed ? mcpTools : []
+	// The mode check alone would let every mcp--* declaration reach the provider
+	// even when the user disabled (or the model excluded) use_mcp_tool, so the
+	// dynamic declarations must honor the same policy as the native filter.
+	if (!isMcpAllowed || isToolDisabledOrExcluded("use_mcp_tool", settings?.disabledTools, settings?.modelInfo)) {
+		return []
+	}
+
+	return mcpTools
 }
