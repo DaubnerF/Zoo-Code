@@ -1881,6 +1881,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
 
+		// A cancellation landing during the prompt build's bounded MCP wait must
+		// stop manual condensation before any summarization request is issued.
+		if (this.abort || this.abandoned) {
+			return
+		}
+
 		// Get condensing configuration
 		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
 		// Use task-local values, not provider state, to prevent cross-task configuration leaks.
@@ -1950,6 +1956,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			cwd: this.cwd,
 			rooIgnoreController: this.rooIgnoreController,
 		})
+		// A cancellation landing during the summarization request must stop
+		// manual condensation before it replaces and persists the history.
+		if (this.abort || this.abandoned) {
+			return
+		}
 		if (error) {
 			await this.say(
 				"condense_context_error",

@@ -4272,6 +4272,108 @@ describe("Cline", () => {
 			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
 		})
 
+		it("stops manual condensation when the task is aborted while the system prompt is pending", async () => {
+			// A cancellation landing inside the prompt build (whose bounded MCP
+			// wait is cancellation-blind) must stop condenseContext before it
+			// issues the summarization request. The prompt gate is released only
+			// after abortTask has synchronously set its flag, so whenever the
+			// prompt await resumes the cancellation is observed.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			let resolvePrompt!: (value: string) => void
+			const promptGate = new Promise<string>((resolve) => {
+				resolvePrompt = resolve
+			})
+			const promptSpy = vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockReturnValue(promptGate)
+			// The early return this guards never reaches say; the spy only keeps
+			// the aborted task's post-overwrite say from throwing before the
+			// summarize/overwrite assertions can report a regression.
+			vi.spyOn(task, "say").mockResolvedValue(undefined)
+			const overwriteSpy = vi.spyOn(task, "overwriteApiConversationHistory").mockResolvedValue(undefined)
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this condense starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+
+			const condensing = task.condenseContext()
+			// Suspend inside the prompt build, past the entry guard, so this
+			// exercises the prompt-boundary check rather than the entry one.
+			await vi.waitFor(() => expect(promptSpy).toHaveBeenCalled())
+			const cancelling = task.abortTask()
+			resolvePrompt("mock system prompt")
+			await condensing
+			await cancelling
+
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+			expect(overwriteSpy).not.toHaveBeenCalled()
+		})
+
+		it("stops manual condensation from overwriting history when the task is aborted during summarization", async () => {
+			// The summarization round-trip is the widest cancellation window on
+			// the condense path: a cancellation landing while it is pending must
+			// stop condenseContext before it replaces and persists the history.
+			// The gate is released only after abortTask has synchronously set
+			// its flag, so whenever the summarize await resumes the cancellation
+			// is observed.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockResolvedValue("mock system prompt")
+			// The early return this guards never reaches say; the spy only keeps
+			// the aborted task's post-overwrite say from throwing before the
+			// overwrite assertion can report the regression.
+			const saySpy = vi.spyOn(task, "say").mockResolvedValue(undefined)
+			const overwriteSpy = vi.spyOn(task, "overwriteApiConversationHistory").mockResolvedValue(undefined)
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this condense starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+			type SummarizeResult = Awaited<ReturnType<typeof summarizeConversation>>
+			let releaseSummarize!: (value: SummarizeResult) => void
+			const summarizeGate = new Promise<SummarizeResult>((resolve) => {
+				releaseSummarize = resolve
+			})
+			vi.mocked(summarizeConversation).mockImplementationOnce(() => summarizeGate)
+
+			const condensing = task.condenseContext()
+			await vi.waitFor(() =>
+				expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore + 1),
+			)
+			const cancelling = task.abortTask()
+			releaseSummarize({
+				messages: [{ role: "user", content: [{ type: "text", text: "condensed" }], ts: Date.now() }],
+				summary: "summary",
+				cost: 0,
+				newContextTokens: 1,
+			})
+			await condensing
+			await cancelling
+
+			expect(overwriteSpy).not.toHaveBeenCalled()
+			expect(saySpy).not.toHaveBeenCalled()
+		})
+
 		it("calls safeEnsureModelFetched from attemptApiRequest when context tokens are present", async () => {
 			const task = new Task({
 				provider: mockProvider,
