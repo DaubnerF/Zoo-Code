@@ -3840,6 +3840,37 @@ describe("Cline", () => {
 				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(0)
 				expect(attemptApiRequestSpy.mock.calls[1]?.[1]).toBe(options)
 			})
+
+			it("carries the derived model snapshot into the retry recursion when the caller omitted one", async () => {
+				const task = await createRetryForwardingTask()
+				vi.spyOn(getTaskTestAccess(task), "handleContextWindowExceededError").mockResolvedValue(undefined)
+				const safeEnsureModelFetchedSpy = vi
+					.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched")
+					.mockResolvedValue(stubModelInfo)
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 400, message: "context length exceeded" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				// No caller-supplied snapshot: the first hop derives one locally.
+				const iterator = task.attemptApiRequest(0)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(1)
+				// The retry hop carries the snapshot derived at the first hop, so a
+				// metadata update landing between attempts cannot move model-specific
+				// tool policy mid-request.
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]?.requestModelInfo).toBe(stubModelInfo)
+				// Derivation ran once per logical request, not once per hop.
+				expect(safeEnsureModelFetchedSpy).toHaveBeenCalledTimes(1)
+			})
 		})
 	})
 

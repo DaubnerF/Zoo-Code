@@ -4561,6 +4561,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// prompt and every tool array built below; prefer the caller's snapshot
 		// when one was threaded.
 		const requestModelInfo = options.requestModelInfo ?? (await this.safeEnsureModelFetched())
+		// Retry recursions must reuse this snapshot instead of re-deriving it: a
+		// metadata fetch landing between attempts would otherwise move
+		// model-specific tool policy or `preserveReasoning` mid-request. When the
+		// caller threaded a snapshot its options object is forwarded unchanged —
+		// same reference, and never mutated.
+		const retryOptions = options.requestModelInfo === undefined ? { ...options, requestModelInfo } : options
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
 
 		// A cancellation landing during the rate-limit countdown, the bounded metadata
@@ -4904,7 +4910,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				)
 				await this.handleContextWindowExceededError()
 				// Retry the request after handling the context window error
-				yield* this.attemptApiRequest(retryAttempt + 1, options)
+				yield* this.attemptApiRequest(retryAttempt + 1, retryOptions)
 				return
 			}
 
@@ -4924,7 +4930,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 				// Delegate generator output from the recursive call with
 				// incremented retry count.
-				yield* this.attemptApiRequest(retryAttempt + 1, options)
+				yield* this.attemptApiRequest(retryAttempt + 1, retryOptions)
 
 				return
 			} else {
@@ -4942,7 +4948,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				await this.say("api_req_retried")
 
 				// Delegate generator output from the recursive call.
-				yield* this.attemptApiRequest(0, options)
+				yield* this.attemptApiRequest(0, retryOptions)
 				return
 			}
 		}
