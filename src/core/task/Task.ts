@@ -1873,6 +1873,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const state = await this.providerRef.deref()?.getState()
 		const requestModelInfo = await this.safeEnsureModelFetched()
 
+		// A cancellation landing during the bounded metadata wait must stop
+		// manual condensation before any prompt build or summarization request.
+		if (this.abort || this.abandoned) {
+			return
+		}
+
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
 
 		// Get condensing configuration

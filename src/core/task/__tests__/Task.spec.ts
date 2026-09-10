@@ -4208,6 +4208,70 @@ describe("Cline", () => {
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
 		})
 
+		it("stops manual condensation when the task is aborted during the metadata wait", async () => {
+			// Cancellation must be honored before any provider-visible work of
+			// the condense: an abort landing while the metadata wait is pending
+			// ends condenseContext instead of quietly issuing a summarization
+			// request the user already cancelled.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			// The wait never settles on its own; only the bound expires it.
+			Object.assign(task.api, { ensureModelFetched: () => new Promise<void>(() => {}) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this condense starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+			vi.useFakeTimers()
+			try {
+				const condensing = task.condenseContext()
+				await vi.advanceTimersByTimeAsync(0)
+				// The user cancels while the bounded metadata wait is still pending.
+				const cancelling = task.abortTask()
+				// The wait itself still expires at the bound, as it normally would.
+				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
+				await condensing
+				await cancelling
+			} finally {
+				vi.useRealTimers()
+			}
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+		})
+
+		it("stops manual condensation on an abandoned task", async () => {
+			// Abandonment is the other cancellation flavor: the metadata wait
+			// settles normally, yet condenseContext must still end before the
+			// prompt build and the summarization request.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.abandoned = true
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+
+			await task.condenseContext()
+
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+		})
+
 		it("calls safeEnsureModelFetched from attemptApiRequest when context tokens are present", async () => {
 			const task = new Task({
 				provider: mockProvider,
