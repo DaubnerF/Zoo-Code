@@ -61,6 +61,11 @@ import {
 import { RateLimitClock, createRateLimitClock } from "../task/RateLimitClock"
 import { TaskRegistry } from "../task/TaskRegistry"
 import { TaskScheduler } from "../task/TaskScheduler"
+import {
+	getEffectiveTaskApiConfiguration,
+	selectHandoffExecutionContext,
+	type TaskExecutionContext,
+} from "../task/providerHandoff"
 import { aggregateTaskCostsRecursive, type AggregatedCosts } from "./aggregateTaskCosts"
 import { TelemetryService } from "@roo-code/telemetry"
 import { CloudService, getRooCodeApiUrl } from "@roo-code/cloud"
@@ -138,6 +143,8 @@ export type ClineProviderEvents = {
 	clineCreated: [cline: Task]
 }
 
+type DelegatedChildContext = TaskExecutionContext
+
 function runDelegationTransition<T>(
 	locks: Map<string, Promise<void>>,
 	parentTaskId: string,
@@ -164,9 +171,14 @@ function runDelegationTransition<T>(
 	return current
 }
 
-function scheduleTask(scheduler: TaskScheduler, task: Task, source: string): void {
+function scheduleTask(
+	scheduler: TaskScheduler,
+	task: Task,
+	source: string,
+	run: () => Promise<void> = () => task.run(),
+): void {
 	void scheduler
-		.schedule(task, () => task.run())
+		.schedule(task, run)
 		.catch((error) => console.error(`[${source}] taskScheduler.schedule failed:`, error))
 }
 
@@ -198,7 +210,7 @@ export class ClineProvider
 	private view?: vscode.WebviewView | vscode.WebviewPanel
 	private taskRegistry = new TaskRegistry()
 	private taskScheduler = new TaskScheduler()
-	private delegationTransitionLocks?: Map<string, Promise<void>>
+	private static readonly delegationTransitionLocks = new Map<string, Promise<void>>()
 	private cancelledDelegationChildIds = new Set<string>()
 	private codeIndexStatusSubscription?: vscode.Disposable
 	private codeIndexManager?: CodeIndexManager
@@ -238,8 +250,7 @@ export class ClineProvider
 	private historyTaskCreationQueue = Promise.resolve()
 
 	private runDelegationTransition<T>(parentTaskId: string, fn: () => Promise<T>): Promise<T> {
-		this.delegationTransitionLocks ??= new Map()
-		return runDelegationTransition(this.delegationTransitionLocks, parentTaskId, fn)
+		return runDelegationTransition(ClineProvider.delegationTransitionLocks, parentTaskId, fn)
 	}
 
 	private enqueueProviderProfileMutation<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -1348,7 +1359,6 @@ export class ClineProvider
 			taskSyncEnabled,
 			diffFuzzyThreshold,
 		} = await this.getState()
-
 		const task = new Task({
 			provider: this,
 			apiConfiguration,
@@ -2706,6 +2716,14 @@ export class ClineProvider
 		const mergedDeniedCommands = this.mergeDeniedCommands(deniedCommands)
 		const cwd = this.cwd
 		const currentTask = this.getCurrentTask()
+		let currentTaskMode: string | undefined
+		try {
+			currentTaskMode = currentTask?.taskMode
+		} catch {
+			// A just-created task may still be initializing its mode; retain the persisted projection for this post.
+		}
+		const currentTaskApiConfigName = currentTask?.taskApiConfigName
+		const currentTaskApiConfiguration = currentTask?.apiConfiguration
 		let zooCodeState: {
 			zooCodeIsAuthenticated: boolean
 			zooCodeUserName: string | undefined
@@ -2740,7 +2758,7 @@ export class ClineProvider
 
 		return {
 			version: this.context.extension?.packageJSON?.version ?? "",
-			apiConfiguration,
+			apiConfiguration: currentTaskApiConfiguration ?? apiConfiguration,
 			customInstructions,
 			alwaysAllowReadOnly: alwaysAllowReadOnly ?? false,
 			alwaysAllowReadOnlyOutsideWorkspace: alwaysAllowReadOnlyOutsideWorkspace ?? false,
@@ -2790,10 +2808,10 @@ export class ClineProvider
 			terminalZdotdir: terminalZdotdir ?? false,
 			terminalProfile,
 			mcpEnabled: mcpEnabled ?? true,
-			currentApiConfigName: currentApiConfigName ?? "default",
+			currentApiConfigName: currentTask ? currentTaskApiConfigName : currentApiConfigName,
 			listApiConfigMeta: listApiConfigMeta ?? [],
 			pinnedApiConfigs: pinnedApiConfigs ?? {},
-			mode: mode ?? defaultModeSlug,
+			mode: currentTaskMode ?? mode ?? defaultModeSlug,
 			customModePrompts: customModePrompts ?? {},
 			customSupportPrompts: customSupportPrompts ?? {},
 			enhancementApiConfigId,
@@ -3422,7 +3440,7 @@ export class ClineProvider
 		text?: string,
 		images?: string[],
 		parentTask?: Task,
-		options: CreateTaskOptions = {},
+		options: CreateTaskOptions & { handoffExecutionContext?: DelegatedChildContext } = {},
 		configuration: RooCodeSettings = {},
 	): Promise<Task> {
 		if (configuration) {
@@ -3473,6 +3491,10 @@ export class ClineProvider
 			organizationAllowList,
 			diffFuzzyThreshold,
 		} = await this.getState()
+		const effectiveApiConfiguration = getEffectiveTaskApiConfiguration(
+			apiConfiguration,
+			options.handoffExecutionContext,
+		)
 
 		// Single-open-task invariant: always enforce for user-initiated top-level tasks.
 		if (!parentTask) {
@@ -3481,7 +3503,7 @@ export class ClineProvider
 			})
 		}
 
-		if (!ProfileValidator.isProfileAllowed(apiConfiguration, organizationAllowList)) {
+		if (!ProfileValidator.isProfileAllowed(effectiveApiConfiguration, organizationAllowList)) {
 			throw new OrganizationAllowListViolationError(t("common:errors.violated_organization_allowlist"))
 		}
 
@@ -3490,7 +3512,7 @@ export class ClineProvider
 			apiConfiguration,
 			enableCheckpoints,
 			checkpointTimeout,
-			consecutiveMistakeLimit: apiConfiguration.consecutiveMistakeLimit,
+			consecutiveMistakeLimit: effectiveApiConfiguration.consecutiveMistakeLimit,
 			task: text,
 			images,
 			experiments,
@@ -3832,6 +3854,18 @@ export class ClineProvider
 		mode: string
 		pendingActionId?: string
 	}): Promise<Task> {
+		return runDelegationTransition(ClineProvider.delegationTransitionLocks, params.parentTaskId, () =>
+			ClineProvider.prototype.delegateParentAndOpenChildUnlocked.call(this, params),
+		)
+	}
+
+	private async delegateParentAndOpenChildUnlocked(params: {
+		parentTaskId: string
+		message: string
+		initialTodos: TodoItem[]
+		mode: string
+		pendingActionId?: string
+	}): Promise<Task> {
 		const { parentTaskId, message, initialTodos, mode, pendingActionId } = params
 
 		// Metadata-driven delegation is always enabled
@@ -3846,6 +3880,19 @@ export class ClineProvider
 				`[delegateParentAndOpenChild] Parent mismatch: expected ${parentTaskId}, current ${parent.taskId}`,
 			)
 		}
+
+		// A different provider may have delegated this parent while this call
+		// waited on the shared lock. Refresh before mutating either task stack.
+		await this.taskHistoryStore.invalidate(parentTaskId)
+		const authoritativeParent = this.taskHistoryStore.get(parentTaskId)
+		if (authoritativeParent?.status === "delegated") {
+			const awaitedChildId = authoritativeParent.awaitingChildId
+			if (!awaitedChildId) throw new Error("Cannot re-delegate a parent with no awaited child")
+			await this.taskHistoryStore.invalidate(awaitedChildId)
+			if (this.taskHistoryStore.get(awaitedChildId)?.status !== "interrupted") {
+				throw new Error("Cannot re-delegate while the awaited child is not interrupted")
+			}
+		}
 		if (pendingActionId) {
 			const parentHistory = this.taskHistoryStore.get(parentTaskId)
 			if (parentHistory?.pendingAction?.actionId !== pendingActionId) {
@@ -3854,6 +3901,42 @@ export class ClineProvider
 				)
 			}
 		}
+
+		const parentExecutionContext: DelegatedChildContext = {
+			mode,
+			apiConfigName: await parent.getTaskApiConfigName(),
+			apiConfiguration: structuredClone(parent.apiConfiguration),
+		}
+		const parentMode = await parent.getTaskMode()
+		const lockApiConfigAcrossModes =
+			mode !== parentMode && this.context.workspaceState.get("lockApiConfigAcrossModes", false)
+		let savedModeProfile: { name?: string; apiConfiguration: ProviderSettings } | undefined
+		if (mode !== parentMode && !lockApiConfigAcrossModes) {
+			const savedConfigId = await this.providerSettingsManager.getModeConfigId(mode as Mode)
+			if (savedConfigId) {
+				try {
+					const {
+						name,
+						id: _id,
+						...savedConfiguration
+					} = await this.providerSettingsManager.getProfile({
+						id: savedConfigId,
+					})
+					savedModeProfile = { name, apiConfiguration: savedConfiguration }
+				} catch (error) {
+					this.log(
+						`[delegateParentAndOpenChild] Saved profile ${savedConfigId} for mode '${mode}' could not be loaded for parent ${parentTaskId}: ${error instanceof Error ? error.message : String(error)}. Using the parent task configuration.`,
+					)
+				}
+			}
+		}
+		const handoffExecutionContext = selectHandoffExecutionContext(
+			parentExecutionContext,
+			mode,
+			parentMode,
+			lockApiConfigAcrossModes,
+			savedModeProfile,
+		)
 		// 2) Flush pending tool results to API history BEFORE disposing the parent.
 		//    This is critical: when tools are called before new_task,
 		//    their tool_result blocks are in userMessageContent but not yet saved to API history.
@@ -3902,21 +3985,9 @@ export class ClineProvider
 			// Non-fatal: proceed with child creation even if parent cleanup had issues
 		}
 
-		// 3) Switch provider mode to child's requested mode BEFORE creating the child task
-		//    This ensures the child's system prompt and configuration are based on the correct mode.
-		//    The mode switch must happen before createTask() because the Task constructor
-		//    initializes its mode from provider.getState() during initializeTaskMode().
-		try {
-			await this.handleModeSwitch(mode as any)
-		} catch (e) {
-			this.log(
-				`[delegateParentAndOpenChild] handleModeSwitch failed for mode '${mode}': ${
-					(e as Error)?.message ?? String(e)
-				}`,
-			)
-		}
-
-		// 4) Create child as sole active (parent reference preserved for lineage)
+		// 4) Bind the child directly to the delegating task's local provider
+		// context. Delegation never mutates shared profile/global state.
+		// Create child as sole active (parent reference preserved for lineage)
 		// Pass initialStatus: "active" to ensure the child task's historyItem is created
 		// with status from the start, avoiding race conditions where the task might
 		// call attempt_completion before status is persisted separately.
@@ -3931,6 +4002,7 @@ export class ClineProvider
 			initialTodos,
 			initialStatus: "active",
 			startTask: false,
+			handoffExecutionContext,
 		})
 
 		// 5) Persist parent delegation metadata BEFORE the child starts writing.
@@ -4287,15 +4359,67 @@ export class ClineProvider
 					// non-fatal
 				}
 
-				// Auto-resume parent without ask("resume_task")
-				await parentInstance.resumeAfterDelegation()
-			}
+				let admitContinuation!: () => void
+				const continuationAdmitted = new Promise<void>((resolve) => {
+					admitContinuation = resolve
+				})
+				let schedulerAdmitted = false
+				// Reserve the continuation's place in the shared parent queue before this
+				// completion transition releases. Its body waits until scheduler admission,
+				// so the completing child can release its permit without deadlocking.
+				const continuation = this.runDelegationTransition(parentTaskId, async () => {
+					await continuationAdmitted
+					if (!schedulerAdmitted) return {}
+					await this.taskHistoryStore.invalidate(parentTaskId)
+					const persistedParent = this.taskHistoryStore.get(parentTaskId)
+					const currentTask = this.getCurrentTask()
+					if (
+						this.cancelledDelegationChildIds.has(childTaskId) ||
+						parentInstance.abort ||
+						parentInstance.abandoned ||
+						currentTask !== parentInstance ||
+						persistedParent?.status !== "active" ||
+						persistedParent.completedByChildId !== childTaskId ||
+						persistedParent.awaitingChildId !== undefined ||
+						persistedParent.delegatedToId !== undefined
+					) {
+						this.log(
+							`[reopenParentFromDelegation] Skipping stale parent continuation for ${parentTaskId} after child ${childTaskId}`,
+						)
+						return {}
+					}
 
-			// 9) Emit TaskDelegationResumed (provider-level)
-			try {
-				this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
-			} catch {
-				// non-fatal
+					// Keep the run promise inside an object so the transition queue does not
+					// assimilate it and retain the parent key for the full resumed task loop.
+					return { runPromise: parentInstance.resumeAfterDelegation() }
+				})
+				void this.taskScheduler
+					.schedule(parentInstance, async () => {
+						schedulerAdmitted = true
+						admitContinuation()
+						const { runPromise } = await continuation
+						if (!runPromise) return
+						try {
+							await runPromise
+							try {
+								this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
+							} catch {
+								// non-fatal
+							}
+						} catch (error) {
+							const message = `Failed to resume parent task ${parentTaskId} after subtask ${childTaskId}: ${error instanceof Error ? error.message : String(error)}`
+							this.log(`[reopenParentFromDelegation] ${message}`)
+							await vscode.window.showErrorMessage(`${message}. Open the task from history to retry.`)
+							throw error
+						}
+					})
+					.then(admitContinuation, (error) => {
+						admitContinuation()
+						console.error(
+							`[${ClineProvider.prototype.reopenParentFromDelegation.name}] taskScheduler.schedule failed:`,
+							error,
+						)
+					})
 			}
 
 			this.cancelledDelegationChildIds.delete(childTaskId)
