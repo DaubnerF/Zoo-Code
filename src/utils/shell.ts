@@ -220,6 +220,18 @@ function getShellFromEnv(): string | null {
 	return null
 }
 
+/**
+ * Returns the shell execa actually runs commands in under the Inline Terminal:
+ * Node's spawn-shell default (COMSPEC/cmd.exe on Windows, /bin/sh on POSIX),
+ * independent of the VS Code terminal profile (issue #1568).
+ */
+function execaDefaultShellForPlatform(): string {
+	if (process.platform === "win32") {
+		return process.env.COMSPEC || SHELL_PATHS.CMD
+	}
+	return SHELL_PATHS.SH
+}
+
 // -----------------------------------------------------
 // 4) Shell Validation Functions
 // -----------------------------------------------------
@@ -274,9 +286,10 @@ export function getShell(): string {
 	//    regardless of VS Code profile settings.
 	shell = BaseTerminal.getExecaShellPath() ?? null
 
-	// 2. VS Code profile config (Zoo override first, then default profile).
+	// 2. Inline Terminal active: execa spawns commands in its own default
+	//    shell, so the VS Code terminal profile does not run them (issue #1568).
 	if (!shell) {
-		shell = getShellFromVSCode()
+		shell = BaseTerminal.getShellIntegrationDisabled() ? execaDefaultShellForPlatform() : getShellFromVSCode()
 	}
 
 	// 3. If no shell from VS Code, try userInfo()
