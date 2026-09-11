@@ -4228,6 +4228,13 @@ describe("Cline", () => {
 			task.apiConversationHistory = [
 				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
 			]
+			// Spying on the prompt build pins the cancellation to the entry
+			// checkpoint: skipping summarization alone is also achieved by the
+			// checks placed after the prompt and summarize awaits, so only an
+			// unstarted prompt build proves the entry check did its work.
+			const promptSpy = vi
+				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+				.mockResolvedValue("mock system prompt")
 			// The summarizeConversation module mock is never cleared, so pin the
 			// call count this condense starts from.
 			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
@@ -4247,6 +4254,7 @@ describe("Cline", () => {
 				vi.useRealTimers()
 			}
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
+			expect(promptSpy).not.toHaveBeenCalled()
 			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
 		})
 
@@ -4265,10 +4273,16 @@ describe("Cline", () => {
 			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
 			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
 			task.abandoned = true
+			// Only an unstarted prompt build attributes the skip to the entry
+			// checkpoint rather than one of the later cancellation checks.
+			const promptSpy = vi
+				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+				.mockResolvedValue("mock system prompt")
 			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
 
 			await task.condenseContext()
 
+			expect(promptSpy).not.toHaveBeenCalled()
 			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
 		})
 
