@@ -605,10 +605,11 @@ export async function presentAssistantMessage(cline: Task) {
 				const isCustomTool = Boolean(stateExperiments?.customTools && customToolRegistry.has(block.name))
 
 				try {
-					// Use the exported resolver so `attempt_completion` (and its aliases)
-					// never enters `toolRequirements` — the runtime validator never blocks a
-					// protocol tool. See `buildToolRequirements` in effective-tool-policy.ts.
-					const toolRequirements = buildToolRequirements(disabledTools)
+					// Build requirements through the shared policy module so every suppressed
+					// entry — disabled tools, and an excluded or disabled protocol tool — reaches
+					// the validator, which checks them before the always-available class. See
+					// `buildToolRequirements` in effective-tool-policy.ts.
+					const toolRequirements = buildToolRequirements(disabledTools, modelInfo?.info)
 
 					validateToolUse(
 						block.name as ToolName,

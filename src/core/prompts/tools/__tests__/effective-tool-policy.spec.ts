@@ -118,9 +118,17 @@ describe("resolveEffectiveToolPolicy - disabledTools", () => {
 		expect(policy.tools.has("write_to_file")).toBe(false)
 	})
 
-	it("does not remove the protocol guarantee", () => {
+	it("removes a protocol tool listed in disabledTools", () => {
 		expect(
 			policyFor(["read", "edit", "command"], { disabledTools: [...PROTOCOL_TOOLS] }).tools.has(
+				"attempt_completion",
+			),
+		).toBe(false)
+	})
+
+	it("keeps the protocol tool when it is neither disabled nor excluded", () => {
+		expect(
+			policyFor(["read", "edit", "command"], { disabledTools: ["execute_command"] }).tools.has(
 				"attempt_completion",
 			),
 		).toBe(true)
@@ -140,11 +148,11 @@ describe("resolveEffectiveToolPolicy - model customization", () => {
 		expect(policy.tools.has("write_to_file")).toBe(false)
 	})
 
-	it("re-adds excludedTools that are protocol tools", () => {
+	it("removes excludedTools entries even for protocol tools", () => {
 		const policy = policyFor(["read", "edit", "command"], {
 			modelInfo: modelInfo({ excludedTools: ["attempt_completion"] }),
 		})
-		expect(policy.tools.has("attempt_completion")).toBe(true)
+		expect(policy.tools.has("attempt_completion")).toBe(false)
 	})
 
 	it("adds includedTools only when their group is allowed", () => {
@@ -344,10 +352,9 @@ describe("buildToolRequirements", () => {
 		expect(reqs).toEqual({ write_file: false, write_to_file: false })
 	})
 
-	it("skips protocol tools and their aliases", () => {
+	it("maps a disabled protocol tool to false like any other tool", () => {
 		const reqs = buildToolRequirements([...PROTOCOL_TOOLS, "ask_followup_question", "switch_mode"])
-		expect(Object.keys(reqs)).not.toContain("attempt_completion")
-		expect(reqs).toEqual({ ask_followup_question: false, switch_mode: false })
+		expect(reqs).toEqual({ attempt_completion: false, ask_followup_question: false, switch_mode: false })
 	})
 
 	it("adds alias + canonical for real aliases", () => {
@@ -355,13 +362,32 @@ describe("buildToolRequirements", () => {
 		expect(Object.keys(reqs).sort()).toEqual(["write_file", "write_to_file"].sort())
 	})
 
-	it("skips protocol tools but keeps regular tools in a mixed list", () => {
-		// A protocol tool must be skipped while the regular tool in the same list
-		// still produces its alias + canonical entries.
+	it("keeps protocol-tool and regular entries together in a mixed list", () => {
+		// An explicit protocol-tool disable reaches the validator beside the
+		// regular tools in the same list.
 		expect(buildToolRequirements(["attempt_completion", "write_file"])).toEqual({
+			attempt_completion: false,
 			write_file: false,
 			write_to_file: false,
 		})
+	})
+
+	it("maps a protocol tool excluded by the model to false", () => {
+		// A model excludedTools entry suppresses attempt_completion just as a
+		// disabledTools entry does, so the execution gate sees it too.
+		const reqs = buildToolRequirements(undefined, modelInfo({ excludedTools: ["attempt_completion"] }))
+		expect(reqs).toEqual({ attempt_completion: false })
+	})
+
+	it("leaves excluded ordinary tools out of the requirements map", () => {
+		// excludedTools stays a policy/declaration-level customization for
+		// non-protocol tools; only the protocol leg reaches the validator.
+		const reqs = buildToolRequirements(undefined, modelInfo({ excludedTools: ["write_to_file"] }))
+		expect(reqs).toEqual({})
+	})
+
+	it("returns an empty map for a model customization without exclusions", () => {
+		expect(buildToolRequirements(undefined, modelInfo())).toEqual({})
 	})
 })
 
@@ -621,86 +647,63 @@ describe("resolveEffectiveToolPolicy - MCP capability flags", () => {
 	})
 })
 
-describe("resolveEffectiveToolPolicy - protocol override warning (fresh module)", () => {
-	// The warn-dedupe set is module state and other tests in this file already resolve
-	// policies that disable protocol tools (priming the set), so each test reloads a
-	// fresh module instance whose dedupe set starts empty.
+describe("resolveEffectiveToolPolicy - protocol tool honoring (fresh module)", () => {
+	// A disabled/excluded protocol tool must stay out of the effective set even
+	// when aliased: the re-add consults the same alias-resolved predicate as the
+	// exclusion steps, so an alias in disabledTools suppresses the canonical tool.
 	async function freshResolve() {
 		vi.resetModules()
 		const mod = await import("../effective-tool-policy")
 		return mod.resolveEffectiveToolPolicy
 	}
 
-	it("skips an alias of a protocol tool when building tool requirements", async () => {
-		// buildToolRequirements skips a tool when its canonical name OR its raw name
-		// is a protocol tool. Register a temporary alias of attempt_completion so the
-		// two operands of that `||` differ: the alias must still be skipped.
+	it("suppresses the protocol tool when disabledTools lists an alias of it", async () => {
+		// Reset first, then register a temporary alias of attempt_completion, and
+		// only then load a fresh resolver: its module-load alias map (and with it
+		// the re-add gate) is built from the shared alias table as it stands at
+		// import time, so the suppression becomes reachable only through alias
+		// resolution, not a literal name match.
 		vi.resetModules()
 		const toolsMod = await import("../../../../shared/tools")
 		toolsMod.TOOL_ALIASES.wp4_attempt_alias = "attempt_completion"
 		const mod = await import("../effective-tool-policy")
 		try {
-			expect(mod.buildToolRequirements(["wp4_attempt_alias"])).toEqual({})
+			expect(
+				mod
+					.resolveEffectiveToolPolicy({ mode: "code", disabledTools: ["wp4_attempt_alias"] })
+					.tools.has("attempt_completion"),
+			).toBe(false)
 			// Sanity: the injected alias actually resolves through the fresh module.
 			expect(mod.resolveToolAlias("wp4_attempt_alias")).toBe("attempt_completion")
 		} finally {
 			delete toolsMod.TOOL_ALIASES.wp4_attempt_alias
+			vi.resetModules()
 		}
 	})
 
-	it("warns once per protocol tool, names the tool, and keeps it available", async () => {
-		vi.resetModules()
-		// Import shared/tools first and assert the alias map right after the fresh
-		// import, so a broken module-load alias map (ALIAS_TO_CANONICAL) fails here.
-		const mod = await import("../effective-tool-policy")
-		expect(mod.resolveToolAlias("write_file")).toBe("write_to_file")
-		expect(mod.resolveToolAlias("search_and_replace")).toBe("edit")
-		expect([...mod.PROTOCOL_TOOLS]).toEqual(["attempt_completion"])
-		const resolve = mod.resolveEffectiveToolPolicy
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-		try {
-			const policy = resolve({ mode: "code", disabledTools: ["attempt_completion"] })
-			expect(warnSpy).toHaveBeenCalledTimes(1)
-			const message = String(warnSpy.mock.calls[0]?.[0])
-			expect(message).toContain("[effective-tool-policy]")
-			expect(message).toContain("'attempt_completion'")
-			expect(message).toContain("no-op")
-			expect(policy.tools.has("attempt_completion")).toBe(true)
-
-			// Second resolve on the same module instance: deduped, no additional warn.
-			const policy2 = resolve({ mode: "code", disabledTools: ["attempt_completion", "execute_command"] })
-			expect(warnSpy).toHaveBeenCalledTimes(1)
-			expect(policy2.tools.has("execute_command")).toBe(false)
-		} finally {
-			warnSpy.mockRestore()
-		}
-	})
-
-	it("does not warn or throw for empty or missing disabledTools", async () => {
+	it("does not throw for empty or missing disabledTools", async () => {
 		const resolve = await freshResolve()
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-		try {
-			expect(() => resolve({ mode: "code", disabledTools: [] })).not.toThrow()
-			expect(() => resolve({ mode: "code" })).not.toThrow()
-			expect(warnSpy).not.toHaveBeenCalled()
-		} finally {
-			warnSpy.mockRestore()
-		}
+		expect(() => resolve({ mode: "code", disabledTools: [] })).not.toThrow()
+		expect(() => resolve({ mode: "code" })).not.toThrow()
 	})
 
-	it("warns again on a fresh module instance (per-process dedupe)", async () => {
-		const first = await freshResolve()
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+	it("pins the protocol list and re-adds an unlisted tool independently of the always-available roster", async () => {
+		// Two positive controls for the suppression test above, on a fresh module:
+		// the exported protocol list is pinned, and with attempt_completion
+		// stripped from the always-available roster the unlisted tool must STILL
+		// be callable — so the re-add step, not the roster, is what guarantees it.
+		vi.resetModules()
+		const toolsMod = await import("../../../../shared/tools")
+		const mod = await import("../effective-tool-policy")
+		const rosterIndex = toolsMod.ALWAYS_AVAILABLE_TOOLS.indexOf("attempt_completion")
+		expect(rosterIndex).toBeGreaterThanOrEqual(0)
+		toolsMod.ALWAYS_AVAILABLE_TOOLS.splice(rosterIndex, 1)
 		try {
-			first({ mode: "code", disabledTools: ["attempt_completion"] })
-			expect(warnSpy).toHaveBeenCalledTimes(1)
-
-			// A different module instance has its own dedupe set and warns again.
-			const second = await freshResolve()
-			second({ mode: "code", disabledTools: ["attempt_completion"] })
-			expect(warnSpy).toHaveBeenCalledTimes(2)
+			expect([...mod.PROTOCOL_TOOLS]).toEqual(["attempt_completion"])
+			expect(mod.resolveEffectiveToolPolicy({ mode: "code" }).tools.has("attempt_completion")).toBe(true)
 		} finally {
-			warnSpy.mockRestore()
+			toolsMod.ALWAYS_AVAILABLE_TOOLS.splice(rosterIndex, 0, "attempt_completion")
+			vi.resetModules()
 		}
 	})
 })

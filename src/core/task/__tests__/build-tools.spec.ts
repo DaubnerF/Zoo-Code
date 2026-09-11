@@ -2,8 +2,9 @@
 //
 // Gemini `includeAllToolsWithRestrictions` path: with the flag on, `tools`
 // contains ALL declarations while `allowedFunctionNames` is derived from the
-// resolver-filtered set — so a disabled `attempt_completion` is still allowed
-// (protocol guarantee) and `disabledTools`-removed tools are excluded.
+// resolver-filtered set, so every `disabledTools`/`excludedTools` entry —
+// protocol tools included — leaves the callable allowlist while the
+// declarations stay advertised.
 
 import type OpenAI from "openai"
 import type * as vscode from "vscode"
@@ -60,7 +61,7 @@ function toolNames(tools: OpenAI.Chat.ChatCompletionTool[]): string[] {
 describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRestrictions", () => {
 	const provider = makeProvider()
 
-	it("sends all declarations but restricts allowedFunctionNames (protocol tool stays allowed)", async () => {
+	it("sends all declarations but restricts allowedFunctionNames (protocol tool follows the allowlist once disabled)", async () => {
 		const result = await buildNativeToolsArrayWithRestrictions({
 			provider,
 			cwd: "/test/path",
@@ -77,10 +78,10 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 		expect(toolNames(result.tools)).toContain("execute_command")
 		expect(toolNames(result.tools)).toContain("attempt_completion")
 
-		// But the logical set (allowedFunctionNames) honors the policy:
-		// attempt_completion is a protocol tool and stays allowed even though
-		// disabledTools lists it; execute_command is removed.
-		expect(result.allowedFunctionNames).toContain("attempt_completion")
+		// The logical set (allowedFunctionNames) honors the policy for both:
+		// an explicit disable of a protocol tool leaves the callable allowlist
+		// just like any other tool.
+		expect(result.allowedFunctionNames).not.toContain("attempt_completion")
 		expect(result.allowedFunctionNames).not.toContain("execute_command")
 	})
 
@@ -148,6 +149,69 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 
 		expect(result.allowedFunctionNames).not.toContain("read_file")
 		expect(result.allowedFunctionNames).toContain("attempt_completion")
+	})
+
+	it("omits dynamic MCP declarations when modelInfo.excludedTools excludes use_mcp_tool", async () => {
+		// The builder forwards modelInfo to the MCP filter, so a model-level
+		// exclusion of use_mcp_tool removes every mcp--* declaration from the
+		// sent tools — exactly like the user-level disable — and from
+		// allowedFunctionNames on the Gemini path.
+		const mcpProvider = makeProvider([
+			{
+				name: "test-server",
+				config: "{}",
+				status: "connected",
+				tools: [{ name: "test_tool", description: "a test tool", inputSchema: { type: "object" } }],
+			},
+		])
+		const modelInfo: ModelInfo = {
+			contextWindow: 100_000,
+			supportsPromptCache: true,
+			excludedTools: ["use_mcp_tool"],
+		}
+
+		const result = await buildNativeToolsArrayWithRestrictions({
+			provider: mcpProvider,
+			cwd: "/test/path",
+			mode: "code",
+			customModes: undefined,
+			experiments: {},
+			apiConfiguration: undefined,
+			modelInfo,
+		})
+
+		expect(toolNames(result.tools).some((name) => name.startsWith("mcp--"))).toBe(false)
+
+		const geminiResult = await buildNativeToolsArrayWithRestrictions({
+			provider: mcpProvider,
+			cwd: "/test/path",
+			mode: "code",
+			customModes: undefined,
+			experiments: {},
+			apiConfiguration: undefined,
+			modelInfo,
+			includeAllToolsWithRestrictions: true,
+		})
+
+		// The MCP declaration stays advertised (all tools are sent on this path)
+		// but drops out of the callable allowlist.
+		expect(toolNames(geminiResult.tools)).toContain("mcp--test-server--test_tool")
+		expect(geminiResult.allowedFunctionNames?.some((name) => name.startsWith("mcp--"))).toBe(false)
+
+		// Positive control with a modelInfo present: an exclusion-free model
+		// info keeps the declarations, proving the removal above comes from the
+		// exclusion rather than from the modelInfo being ignored.
+		const controlResult = await buildNativeToolsArrayWithRestrictions({
+			provider: mcpProvider,
+			cwd: "/test/path",
+			mode: "code",
+			customModes: undefined,
+			experiments: {},
+			apiConfiguration: undefined,
+			modelInfo: { contextWindow: 100_000, supportsPromptCache: true },
+		})
+
+		expect(toolNames(controlResult.tools)).toContain("mcp--test-server--test_tool")
 	})
 
 	it("omits dynamic MCP declarations when disabledTools disables use_mcp_tool", async () => {

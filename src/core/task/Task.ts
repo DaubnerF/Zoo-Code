@@ -142,17 +142,6 @@ import { type TaskExecutionContext } from "./providerHandoff"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
-// Upper bound on awaiting lazily loaded model metadata. Some model-catalog
-// fetchers (e.g. OpenRouter's bare axios GET) have no request timeout, so a
-// hung endpoint must not stall streaming, condense, or context-window
-// handling. On expiry the caller aborts its per-call AbortSignal (detaching
-// the provider-side waiter) and falls back to the handler's existing
-// getModel().info metadata — the same degradation a rejected fetch produces.
-// Kept in sync with PREVIEW_MODEL_FETCH_TIMEOUT_MS in the preview path
-// (src/core/webview/generateSystemPrompt.ts). Deliberately duplicated, not
-// shared: importing from the webview layer would close the
-// Task -> generateSystemPrompt -> ClineProvider -> Task import cycle.
-export const MODEL_FETCH_TIMEOUT_MS = 5_000
 const QUEUED_FEEDBACK_SAVE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const
 
 type QueuedAskResolution = { response: ClineAskResponse; requiresDurableAck: boolean }
@@ -331,13 +320,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private readonly globalStoragePath: string
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
-	/**
-	 * Controller for the waiter on an in-flight `ensureModelFetched()` call (see
-	 * safeEnsureModelFetched). Aborting it detaches this task from the provider-side
-	 * metadata fetch; it is aborted when the bounded wait expires and when the task's
-	 * current request is cancelled (cancel/dispose path in cancelCurrentRequest).
-	 */
-	metadataFetchAbortController?: AbortController
 	skipPrevResponseIdOnce: boolean = false
 
 	// TaskStatus
@@ -1883,8 +1865,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const state = await this.providerRef.deref()?.getState()
 		const requestModelInfo = await this.safeEnsureModelFetched()
 
-		// A cancellation landing during the bounded metadata wait must stop
-		// manual condensation before any prompt build or summarization request.
+		// A cancellation landing during the metadata wait must stop manual
+		// condensation before any prompt build or summarization request.
 		if (this.abort || this.abandoned) {
 			return
 		}
@@ -1966,11 +1948,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			cwd: this.cwd,
 			rooIgnoreController: this.rooIgnoreController,
 		})
-		// A cancellation landing during the summarization request must stop
-		// manual condensation before it replaces and persists the history.
-		if (this.abort || this.abandoned) {
-			return
-		}
 		if (error) {
 			await this.say(
 				"condense_context_error",
@@ -2658,12 +2635,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.log(`[Task#${this.taskId}.${this.instanceId}] Aborting current HTTP request`)
 			this.currentRequestAbortController.abort()
 			this.currentRequestAbortController = undefined
-		}
-		// A metadata-fetch waiter still in flight is as stale as an abandoned
-		// stream: detach it from the provider-side fetch on cancel/dispose.
-		if (this.metadataFetchAbortController) {
-			this.metadataFetchAbortController.abort()
-			this.metadataFetchAbortController = undefined
 		}
 	}
 
@@ -4316,17 +4287,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/**
 	 * Ensures router-provider model metadata is loaded before getModel() is used for
 	 * context management or streaming. Failures fall back to hardcoded defaults rather
-	 * than aborting the task; the wait is bounded by MODEL_FETCH_TIMEOUT_MS (see the
-	 * constant for the degradation semantics). On expiry or cancellation the per-call
-	 * AbortSignal detaches this task's waiter from the provider-side fetch instead of
-	 * leaving a handler-side promise waiting on it indefinitely.
+	 * than aborting the task.
 	 *
 	 * The return value is the settled post-wait read of getModel().info: request
 	 * entry points (attemptApiRequest, condenseContext) await this once before
 	 * prompt generation and share the returned snapshot between getSystemPrompt
-	 * and every tool-array
-	 * build of the same request, so a fetch that resolves after the bounded wait
-	 * was abandoned cannot move model-specific tool policy between prompt time and
+	 * and every tool-array build of the same request, so a fetch that resolves
+	 * mid-request cannot move model-specific tool policy between prompt time and
 	 * request time. Callers that do not thread a snapshot keep awaiting this
 	 * immediately before their own getModel() read; that per-site guard remains the
 	 * standalone/fallback read path, and repeat awaits stay cheap once a fetch has
@@ -4335,46 +4302,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * rejected fetches remains future work if the failure-path latency ever matters.
 	 */
 	private async safeEnsureModelFetched(): Promise<ModelInfo> {
-		// Per-call controller: its signal makes ensureModelFetched() settle on
-		// abort, so neither this race nor the provider-side waiter outlives the
-		// bounded wait. cancel/dispose aborts it early via cancelCurrentRequest.
-		const controller = new AbortController()
-		this.metadataFetchAbortController = controller
-		// Promise.race attaches handlers to both inputs, so the fetch rejecting
-		// after the abort is already considered handled — no extra .catch needed.
-		let timeoutId: ReturnType<typeof setTimeout> | undefined
-		let timedOut = false
 		try {
-			await Promise.race([
-				this.api.ensureModelFetched?.(controller.signal),
-				new Promise<void>((resolve) => {
-					timeoutId = setTimeout(() => {
-						timedOut = true
-						resolve()
-					}, MODEL_FETCH_TIMEOUT_MS)
-				}),
-			])
-			if (timedOut) {
-				console.warn(
-					`[Task#${this.taskId}] Timed out after ${MODEL_FETCH_TIMEOUT_MS}ms fetching model metadata; using fallback model info.`,
-				)
-			}
+			await this.api.ensureModelFetched?.()
 		} catch (error) {
 			console.error(
 				`[Task#${this.taskId}] Failed to fetch model metadata:`,
 				error instanceof Error ? error.message : error,
 			)
-		} finally {
-			if (timeoutId) {
-				clearTimeout(timeoutId)
-			}
-			if (this.metadataFetchAbortController === controller) {
-				this.metadataFetchAbortController = undefined
-			}
-			// Unconditional: settles any waiter still attached to this call.
-			controller.abort()
 		}
-		// The post-wait read is the settled snapshot callers must share per request.
 		return this.api.getModel().info
 	}
 
@@ -4588,9 +4523,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Thread the request state snapshot into prompt generation so the prompt
 		// and the runtime tools (built below from the same `state`) stay aligned
 		// even if settings change while this method waits on MCP or rate limits.
-		// Capture one bounded-wait model-info snapshot per request, shared by the
-		// prompt and every tool array built below; prefer the caller's snapshot
-		// when one was threaded.
+		// Capture one model-info snapshot per request, shared by the prompt and
+		// every tool array built below; prefer the caller's snapshot when one was
+		// threaded.
 		const requestModelInfo = options.requestModelInfo ?? (await this.safeEnsureModelFetched())
 		// Retry recursions must reuse this snapshot instead of re-deriving it: a
 		// metadata fetch landing between attempts would otherwise move
@@ -4600,8 +4535,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const retryOptions = options.requestModelInfo === undefined ? { ...options, requestModelInfo } : options
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
 
-		// A cancellation landing during the rate-limit countdown, the bounded metadata
-		// wait, or the MCP wait inside getSystemPrompt must stop this request before any
+		// A cancellation landing during the rate-limit countdown, the metadata wait,
+		// or the MCP wait inside getSystemPrompt must stop this request before any
 		// tool array, AbortController, or createMessage call is issued for it.
 		if (this.abort || this.abandoned) {
 			throw new Error(

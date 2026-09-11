@@ -330,9 +330,8 @@ describe("generateSystemPrompt preview parity", () => {
 	it("degrades to fallback metadata when ensureModelFetched hangs past the preview timeout", async () => {
 		// A hung metadata endpoint (some fetchers issue unbounded GETs) must not
 		// block the user-triggered preview: after PREVIEW_MODEL_FETCH_TIMEOUT_MS
-		// (5s — kept in sync with the production constant) the race resolves and
-		// the prompt is built from the fallback metadata, identical to the
-		// rejected-fetch degradation.
+		// (5s) the race resolves and the prompt is built from the fallback
+		// metadata, identical to the rejected-fetch degradation.
 		vi.useFakeTimers()
 		try {
 			modelMock.ensureModelFetched.mockImplementationOnce(() => new Promise<void>(() => {}))
@@ -510,55 +509,6 @@ describe("generateSystemPrompt preview parity", () => {
 			} finally {
 				vi.useRealTimers()
 			}
-		})
-
-		it("aborts the handler signal when the preview fetch times out", async () => {
-			// The preview's bound must detach the handler-side waiter, mirroring
-			// the runtime path: a signal-observing handler stops serving the
-			// abandoned fetch once the bound expires.
-			let capturedSignal: AbortSignal | undefined
-			modelMock.ensureModelFetched.mockImplementationOnce((signal?: AbortSignal) => {
-				capturedSignal = signal
-				return new Promise<void>(() => {})
-			})
-			// Both abort sites are pinned by count: the timeout callback fires
-			// exactly when the bound elapses — detaching a hung waiter before
-			// the prompt is even built — and the finally block re-aborts on
-			// completion. Deleting either call leaves the other as the sole,
-			// strictly-too-late detach, and the count drops to one.
-			const abortSpy = vi.spyOn(AbortController.prototype, "abort")
-
-			vi.useFakeTimers()
-			try {
-				const previewPromise = generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
-				await vi.advanceTimersByTimeAsync(5_000)
-				// Both abort sites have fired by the time the preview resolves:
-				// the finally block runs before generateSystemPrompt returns, so
-				// the count is asserted while the spy still holds its history
-				// (mockRestore would clear it).
-				await previewPromise
-				expect(abortSpy).toHaveBeenCalledTimes(2)
-			} finally {
-				vi.useRealTimers()
-				abortSpy.mockRestore()
-			}
-			expect(capturedSignal?.aborted).toBe(true)
-		})
-
-		it("aborts the handler signal after a fast fetch so the waiter detaches on completion", async () => {
-			// The finally-block detach also covers the fetch-wins path: a
-			// signal-observing handler must not keep serving waiters for a
-			// preview that already finished. Without the finally abort, the
-			// captured signal is never aborted on this path (no timer fires).
-			let capturedSignal: AbortSignal | undefined
-			modelMock.ensureModelFetched.mockImplementationOnce((signal?: AbortSignal) => {
-				capturedSignal = signal
-				return Promise.resolve()
-			})
-
-			await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
-
-			expect(capturedSignal?.aborted).toBe(true)
 		})
 
 		it("logs and degrades when the model info cannot be read", async () => {

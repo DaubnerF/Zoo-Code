@@ -5,8 +5,8 @@ import type { EffectiveToolPolicy } from "../tools/effective-tool-policy"
  *
  * Step 3's guidance to ask the user via ask_followup_question is replaced with
  * best-effort phrasing when that tool is not in the request's effective policy.
- * Step 4 names attempt_completion, a protocol tool that is always present in the
- * effective tool policy, so it is emitted unconditionally.
+ * Step 4 names attempt_completion; the sentence is protocol wording, so it is
+ * emitted unconditionally even when the policy does not advertise the tool.
  *
  * @param policy The request's effective tool policy.
  */

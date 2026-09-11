@@ -352,9 +352,9 @@ describe("getRulesSection", () => {
 
 	it("states the attempt_completion protocol rule unconditionally", () => {
 		// The completion sentence is protocol wording — emitted even when the policy
-		// does not advertise attempt_completion. A raw literal is required: the
-		// resolver-backed policyFor cannot express this (protocol guarantee re-adds the
-		// tool in resolveEffectiveToolPolicy step 11).
+		// does not advertise attempt_completion. The raw literal expresses that state
+		// directly; a resolver-backed policyFor reaches it only by suppressing the tool
+		// via disabledTools/excludedTools, coupling this test to the resolver.
 		const rawPolicy: EffectiveToolPolicy = {
 			tools: new Set<string>(["read_file"]),
 			hasMcpGroup: false,

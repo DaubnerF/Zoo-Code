@@ -6,15 +6,17 @@ import type { McpHub } from "../../../services/mcp/McpHub"
 import { isToolAllowedForMode } from "../../../core/tools/validateToolUse"
 
 /**
- * Canonical tool names that participate in the task-completion protocol and must
- * remain logically available even when a profile disables them.
+ * Canonical tool names that participate in the task-completion protocol.
  *
- * The effective tool policy re-adds every one of these after `disabledTools` and
- * model-specific exclusions have been applied, so the system prompt and the API's
- * logical allowed set always agree that these tools can be called.
+ * The effective tool policy re-adds these after the mode/permission filters, so a
+ * mode that grants no groups still advertises them — but a `disabledTools` entry
+ * or a model `excludedTools` entry takes precedence: honoring an explicit
+ * restriction takes priority over the re-add, and the runtime validator rejects
+ * execution of a tool so restricted (see `buildToolRequirements` and the
+ * requirements-before-always-available precedence in `validateToolUse.ts`).
  *
  * `attempt_completion` is the only tool with no coherent prompt state when absent
- * (the task loop can only exit through it), so it is the sole protocol guarantee.
+ * (the task loop can only exit through it), so it is the sole protocol entry.
  */
 export const PROTOCOL_TOOLS: readonly string[] = ["attempt_completion"]
 
@@ -80,11 +82,11 @@ export function resolveToolAlias(toolName: string): string {
  * as the resolver's exclusion steps do.
  *
  * This is the membership test behind those resolver steps, exposed for callers
- * (like the MCP tool filter) that gate a whole tool class on one canonical name
- * without computing the full policy set. It intentionally ignores the protocol
- * guarantee: `resolveEffectiveToolPolicy` re-adds `PROTOCOL_TOOLS` after
- * applying these lists, so this predicate answers "is it listed", not "is it
- * finally available" — no protocol tool should be gated through here.
+ * (the MCP tool filter, the protocol-tool re-add step) that gate a whole tool
+ * class on one canonical name without computing the full policy set. It answers
+ * "is it listed", which is deliberately stricter than "is it finally available"
+ * for tools that the resolver's later steps could re-grant through
+ * `includedTools` or group membership.
  *
  * @param toolName The canonical tool name to test (may itself be an alias).
  * @param disabledTools The user's disabled-tools list (may contain aliases).
@@ -99,36 +101,6 @@ export function isToolDisabledOrExcluded(
 	const canonical = resolveToolAlias(toolName)
 	const isSuppressed = (entry: string): boolean => resolveToolAlias(entry) === canonical
 	return Boolean(disabledTools?.some(isSuppressed)) || Boolean(modelInfo?.excludedTools?.some(isSuppressed))
-}
-
-/**
- * Canonical protocol-tool names already warned about. Module-level so the
- * protocol-override warning fires at most once per tool per process.
- */
-const warnedProtocolOverrides = new Set<string>()
-
-/**
- * Warns once per process, per protocol tool, when `disabledTools` tries to
- * disable a protocol tool — which the protocol guarantee step makes a no-op.
- *
- * Uses `console.warn` (not the shared `logger`, which is a no-op in production)
- * so the no-op disable is visible to extension developers.
- *
- * @param disabledTools The raw disabled-tools list (may contain aliases).
- */
-function warnProtocolToolOverrides(disabledTools?: string[]): void {
-	if (!disabledTools?.length) {
-		return
-	}
-	for (const toolName of disabledTools) {
-		const canonical = resolveToolAlias(toolName)
-		if (PROTOCOL_TOOLS.includes(canonical) && !warnedProtocolOverrides.has(canonical)) {
-			warnedProtocolOverrides.add(canonical)
-			console.warn(
-				`[effective-tool-policy] '${canonical}' is a protocol tool: disabling it via disabledTools is a no-op; it remains available.`,
-			)
-		}
-	}
 }
 
 export interface EffectiveToolPolicyInput {
@@ -219,13 +191,11 @@ export function hasAnyMcpResources(mcpHub: McpHub, allowedServers?: string[]): b
  *
  * This is the single source of truth shared by prompt generation, API tool
  * construction, runtime validation, and preview. The numbered steps below (1-10)
- * compute the allowed tool set; step 11 adds the protocol guarantee that re-adds
- * `PROTOCOL_TOOLS`.
+ * compute the allowed tool set; step 11 re-adds `PROTOCOL_TOOLS` unless an
+ * explicit disable/exclude suppresses them.
  *
- * The returned policy is deterministic for a given input. The only side effect
- * is an intentional, process-deduplicated `console.warn` when a protocol tool is
- * disabled via `disabledTools` (such a disable is a no-op); it fires at most once
- * per tool per process, so repeated calls never re-warn and do not affect output.
+ * The returned policy is deterministic for a given input and free of side
+ * effects.
  *
  * @param input Mode, custom modes, MCP hub, disabled tools, model customization,
  *   experiment flags, todo-list enablement, and the code index manager.
@@ -337,11 +307,17 @@ export function resolveEffectiveToolPolicy(input: EffectiveToolPolicyInput): Eff
 		allowedToolNames.delete("use_mcp_tool")
 	}
 
-	// 11. Protocol guarantee: re-add every protocol tool so the logical set and
-	//     the runtime validator both agree it is callable even when disabled.
-	warnProtocolToolOverrides(disabledTools)
+	// 11. Protocol guarantee: re-add every protocol tool that neither the user's
+	//     disabledTools nor the model's excludedTools suppresses, so the logical
+	//     set and the runtime validator agree in both directions: an unlisted
+	//     protocol tool stays callable — this re-add, not the always-available
+	//     roster, is what guarantees it — while a suppressed one stays out of the
+	//     prompt, the declarations, and (via buildToolRequirements) execution,
+	//     having been removed by steps 4 and 9.
 	for (const tool of PROTOCOL_TOOLS) {
-		allowedToolNames.add(resolveToolAlias(tool))
+		if (!isToolDisabledOrExcluded(tool, disabledTools, modelInfo)) {
+			allowedToolNames.add(resolveToolAlias(tool))
+		}
 	}
 
 	const hasMcpGroup = modeConfig.groups.some((groupEntry: GroupEntry) => getGroupName(groupEntry) === "mcp")
@@ -356,26 +332,30 @@ export function resolveEffectiveToolPolicy(input: EffectiveToolPolicyInput): Eff
 }
 
 /**
- * Builds the runtime `toolRequirements` map (tool name → false) from a list of
- * disabled tool names. Protocol tools and their aliases are intentionally
- * skipped so that `attempt_completion` (and every call site that disables it)
- * can never be marked un-callable at runtime.
+ * Builds the runtime `toolRequirements` map (tool name → false): every entry of
+ * the `disabledTools` list, plus any protocol tool suppressed by either list.
+ * A requirements entry outranks the always-available class in `validateToolUse`,
+ * so a disabled or model-excluded `attempt_completion` is rejected at execution
+ * with the standard validation error tool_result — matching its removal from
+ * the effective policy set. Excluded non-protocol entries stay a
+ * policy/declaration-level concern and never reach this map.
  *
  * @param disabledTools The raw disabled-tools list (may contain aliases).
- * @returns A map of disabled canonical/alias names to `false`.
+ * @param modelInfo The model customization whose `excludedTools` may suppress a
+ *   protocol tool.
+ * @returns A map of suppressed canonical/alias names to `false`.
  */
-export function buildToolRequirements(disabledTools?: string[]): Record<string, boolean> {
+export function buildToolRequirements(disabledTools?: string[], modelInfo?: ModelInfo): Record<string, boolean> {
 	const requirements: Record<string, boolean> = {}
-	if (!disabledTools?.length) {
-		return requirements
-	}
-	for (const toolName of disabledTools) {
+	for (const toolName of disabledTools ?? []) {
 		const canonical = resolveToolAlias(toolName)
-		if (PROTOCOL_TOOLS.includes(canonical) || PROTOCOL_TOOLS.includes(toolName)) {
-			continue
-		}
 		requirements[toolName] = false
 		requirements[canonical] = false
+	}
+	for (const tool of PROTOCOL_TOOLS) {
+		if (isToolDisabledOrExcluded(tool, disabledTools, modelInfo)) {
+			requirements[tool] = false
+		}
 	}
 	return requirements
 }
