@@ -4230,8 +4230,8 @@ describe("Cline", () => {
 			]
 			// Spying on the prompt build pins the cancellation to the entry
 			// checkpoint: skipping summarization alone is also achieved by the
-			// checks placed after the prompt and summarize awaits, so only an
-			// unstarted prompt build proves the entry check did its work.
+			// check placed after the prompt await, so only an unstarted
+			// prompt build proves the entry check did its work.
 			const promptSpy = vi
 				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
 				.mockResolvedValue("mock system prompt")
