@@ -67,9 +67,7 @@ export const generateSystemPrompt = async (provider: ClineProvider, message: Web
 		} catch (error) {
 			console.error("Error fetching model metadata for system prompt preview:", error)
 		} finally {
-			if (timeoutId) {
-				clearTimeout(timeoutId)
-			}
+			clearTimeout(timeoutId)
 		}
 		modelInfo = tempApiHandler.getModel().info
 	} catch (error) {

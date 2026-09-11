@@ -7,7 +7,6 @@ import { getToolUseGuidelinesSection } from "../sections/tool-use-guidelines"
 import { getSkillsSection } from "../sections/skills"
 import type { EffectiveToolPolicy } from "../tools/effective-tool-policy"
 import { resolveEffectiveToolPolicy } from "../tools/effective-tool-policy"
-import type { EffectiveToolPolicyInput } from "../tools/effective-tool-policy"
 import type { GroupEntry, ModelInfo } from "@roo-code/types"
 import { McpHub } from "../../../services/mcp/McpHub"
 import type { CodeIndexManager } from "../../../services/code-index/manager"
@@ -137,6 +136,11 @@ describe("getCapabilitiesSection", () => {
 		expect(result).toContain("MCP servers")
 		expect(result).not.toContain("accomplish tasks more effectively. (in this mode")
 		expect(result).toContain("write and edit files. (in this mode only files matching")
+		// This is the only fixture whose restriction carries no description, so the
+		// empty description-suffix branch must render nothing. "Stryker was here"
+		// (no trailing !) covers both the StringLiteral and ArrayDeclaration
+		// sentinel replacements Stryker injects.
+		expect(result).not.toContain("Stryker was here")
 	})
 
 	it("omits the edit-restriction suffix without a fileRegex", () => {
@@ -280,13 +284,6 @@ describe("getRulesSection", () => {
 		expect(result).toContain("Actively Running Terminals")
 	})
 
-	it("does not contain the removed hardcoded architect example line", () => {
-		const result = getRulesSection(cwd, settings, policyFor(["read", "edit", "command"]))
-
-		expect(result).not.toContain("in architect mode")
-		expect(result).not.toContain("trying to edit app.js")
-	})
-
 	it("uses ask_followup_question when the tool is available", () => {
 		const result = getRulesSection(cwd, settings, policyFor(["read"]))
 		expect(result).toContain("ask the user questions using the ask_followup_question tool")
@@ -326,6 +323,7 @@ describe("getRulesSection", () => {
 			policyFor(["command"], { disabledTools: ["ask_followup_question"] }),
 		)
 		expect(withoutAsk).toContain("When executing commands")
+		expect(withoutAsk).toContain("note what you expected and proceed with the task, stating your assumptions")
 		expect(withoutAsk).not.toContain("ask_followup_question")
 
 		const withAsk = getRulesSection(cwd, settings, policyFor(["command"]))

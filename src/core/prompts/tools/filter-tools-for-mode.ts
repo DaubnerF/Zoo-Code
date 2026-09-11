@@ -6,9 +6,8 @@ import type { McpHub } from "../../../services/mcp/McpHub"
 import { resolveEffectiveToolPolicy, resolveToolAlias, isToolDisabledOrExcluded } from "./effective-tool-policy"
 import { isToolAllowedForMode } from "../../../core/tools/validateToolUse"
 
-// Re-export the resolver's alias helper so existing importers of this module
-// (NativeToolCallParser, presentAssistantMessage, build-tools) keep binding to the
-// single canonical implementation in effective-tool-policy.ts.
+// Re-exported so this module remains a stable import site for the canonical
+// alias resolver; the implementation lives in effective-tool-policy.ts.
 export { resolveToolAlias }
 
 /**

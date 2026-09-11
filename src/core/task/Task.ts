@@ -173,13 +173,6 @@ function queuedResponseForAsk(type: ClineAsk, text?: string): QueuedAskResolutio
 const FORCED_CONTEXT_REDUCTION_PERCENT = 75 // Keep 75% of context (remove 25%) on context window errors
 const MAX_CONTEXT_WINDOW_RETRIES = 3 // Maximum retries for context window errors
 
-/**
- * Provider state snapshot threaded from request entry points (attemptApiRequest,
- * condenseContext, handleContextWindowExceededError) into `getSystemPrompt` so the
- * prompt and the runtime tool array resolve from one consistent set of values.
- */
-type SystemPromptRequestState = Awaited<ReturnType<ClineProvider["getState"]>>
-
 export interface TaskOptions extends CreateTaskOptions {
 	provider: ClineProvider
 	apiConfiguration: ProviderSettings
@@ -4190,17 +4183,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/**
 	 * Builds the SYSTEM_PROMPT from the caller's provider-state snapshot. This
 	 * method never reads provider state itself: callers that also construct
-	 * runtime tools for the same request must thread the very snapshot they build
-	 * those tools from, or a settings change during the MCP wait can make the
-	 * prompt advertise a tool the runtime rejects, or hide a callable tool. An
-	 * `undefined` snapshot declares that the caller's own read came back empty
-	 * because the provider was already gone; the prompt then resolves from
-	 * defaults. Pass `requestModelInfo` (captured via safeEnsureModelFetched) in
-	 * the same situation so the prompt's tool guidance and the request's tool
-	 * arrays resolve from one model-metadata snapshot.
+	 * runtime tools for the same request (attemptApiRequest, condenseContext,
+	 * handleContextWindowExceededError) must thread the very snapshot they build
+	 * those tools from, so the prompt and the runtime tool array resolve from one
+	 * consistent set of values — otherwise a settings change during the MCP wait
+	 * can make the prompt advertise a tool the runtime rejects, or hide a
+	 * callable tool. An `undefined` snapshot declares that the caller's own read
+	 * came back empty because the provider was already gone; the prompt then
+	 * resolves from defaults. Pass `requestModelInfo` (captured via
+	 * safeEnsureModelFetched) in the same situation so the prompt's tool
+	 * guidance and the request's tool arrays resolve from one model-metadata
+	 * snapshot.
 	 */
 	private async getSystemPrompt(
-		requestState: SystemPromptRequestState | undefined,
+		requestState: Awaited<ReturnType<ClineProvider["getState"]>> | undefined,
 		requestModelInfo?: ModelInfo,
 	): Promise<string> {
 		const { mcpEnabled } = requestState ?? {}
@@ -4298,8 +4294,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * immediately before their own getModel() read; that per-site guard remains the
 	 * standalone/fallback read path, and repeat awaits stay cheap once a fetch has
 	 * succeeded because the provider caches successes. RouterProvider already
-	 * negative-caches catalog misses with a TTL (missingModelRefreshAt); recording
-	 * rejected fetches remains future work if the failure-path latency ever matters.
+	 * negative-caches catalog misses with a TTL (`missingModelRefreshAt`).
 	 */
 	private async safeEnsureModelFetched(): Promise<ModelInfo> {
 		try {

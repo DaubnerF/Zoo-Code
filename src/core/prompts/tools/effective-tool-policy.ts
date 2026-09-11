@@ -175,7 +175,7 @@ function resolveHasMcpTools(mcpHub?: McpHub, allowedServers?: string[]): boolean
  *   these servers are considered.
  * @returns True when at least one allowed server exposes one or more resources.
  */
-export function hasAnyMcpResources(mcpHub: McpHub, allowedServers?: string[]): boolean {
+function hasAnyMcpResources(mcpHub: McpHub, allowedServers?: string[]): boolean {
 	let servers = mcpHub.getServers()
 	if (allowedServers) {
 		const allowSet = new Set(allowedServers)
