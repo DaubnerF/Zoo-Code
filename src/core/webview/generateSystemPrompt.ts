@@ -53,21 +53,28 @@ export const generateSystemPrompt = async (provider: ClineProvider, message: Web
 		// A failed OR stalled metadata fetch degrades to the handler's fallback
 		// metadata (mirroring Task.safeEnsureModelFetched) rather than dropping
 		// model guidance entirely, so the preview keeps matching the runtime
-		// prompt's failure semantics. Promise.race attaches handlers to both
-		// inputs, so the fetch rejecting after the timeout is already considered
-		// handled — no extra .catch is needed here.
+		// prompt's failure semantics. The controller's signal makes the handler's
+		// waiter settle when the bound expires or this call ends, instead of
+		// leaving it pending on the shared catalog fetch. Promise.race attaches
+		// handlers to both inputs, so the fetch rejecting after the timeout is
+		// already considered handled — no extra .catch is needed here.
 		let timeoutId: ReturnType<typeof setTimeout> | undefined
+		const controller = new AbortController()
 		try {
 			await Promise.race([
-				tempApiHandler.ensureModelFetched?.(),
+				tempApiHandler.ensureModelFetched?.(controller.signal),
 				new Promise<void>((resolve) => {
-					timeoutId = setTimeout(resolve, PREVIEW_MODEL_FETCH_TIMEOUT_MS)
+					timeoutId = setTimeout(() => {
+						controller.abort()
+						resolve()
+					}, PREVIEW_MODEL_FETCH_TIMEOUT_MS)
 				}),
 			])
 		} catch (error) {
 			console.error("Error fetching model metadata for system prompt preview:", error)
 		} finally {
 			clearTimeout(timeoutId)
+			controller.abort()
 		}
 		modelInfo = tempApiHandler.getModel().info
 	} catch (error) {

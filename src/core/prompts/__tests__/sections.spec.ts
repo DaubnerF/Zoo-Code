@@ -165,6 +165,21 @@ describe("getCapabilitiesSection", () => {
 		expect(result).not.toContain("only files matching")
 	})
 
+	it("keeps the capability clause and restriction for a model-included standalone edit tool", () => {
+		// The restricted edit group's default edit tools are disabled, but the
+		// model catalog re-adds the standalone `edit` tool: it is still an edit
+		// capability, so the clause and the file restriction both render.
+		const result = getCapabilitiesSection(
+			policyFor([["edit", { fileRegex: "\\.md$", description: "Markdown files only" }]], {
+				disabledTools: ["write_to_file", "apply_diff"],
+				modelInfo: { contextWindow: 128_000, supportsPromptCache: true, includedTools: ["edit"] },
+			}),
+		)
+
+		expect(result).toContain("write and edit files")
+		expect(result).toContain("(in this mode only files matching '\\.md$' can be edited — Markdown files only)")
+	})
+
 	it("lists files guidance only when list_files is available", () => {
 		const withListFiles = getCapabilitiesSection(policyFor(["read"]))
 		expect(withListFiles).toContain("you can use the list_files tool")
