@@ -2760,6 +2760,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.error("Error flushing shutdown telemetry:", error)
 		}
 
+		// A task being disposed is no longer serving requests: set the same
+		// cancellation state `abortTask()` sets, synchronously before the aborts
+		// below, so the request-construction guard (`abort || abandoned` in
+		// attemptApiRequest) and the outer loop's `abort` checks observe disposal
+		// even when it lands before any explicit cancel. Without this, only the
+		// signals below are cancelled and a request already past those checks
+		// could still build tools and call `createMessage()`.
+		this.abort = true
+
 		// Cancel any in-progress HTTP request
 		try {
 			this.cancelCurrentRequest()

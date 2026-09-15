@@ -4269,6 +4269,66 @@ describe("Cline", () => {
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
 		})
 
+		it("refuses to send a request when the task is disposed during the bounded metadata wait", async () => {
+			// Disposal alone — no cancel button, no abortTask — must make the
+			// task observe cancellation: disposeOnce sets the abort state
+			// synchronously in its call, before its aborts land, so once the
+			// metadata wait settles at its bound the request-construction
+			// guard refuses to build tools or call createMessage for a task
+			// nobody owns anymore.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			// The wait never settles on its own; only the bound expires it.
+			Object.assign(task.api, { ensureModelFetched: () => new Promise<void>(() => {}) })
+			const createMessageSpy = vi
+				.spyOn(task.api, "createMessage")
+				.mockReturnValue(asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "ok" }]))
+			vi.spyOn(task, "getTokenUsage").mockReturnValue({
+				totalCost: 0,
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				contextTokens: 0,
+			})
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+			vi.useFakeTimers()
+			try {
+				const first = task.attemptApiRequest(0).next()
+				// Observe the rejection the moment it can land: the generator
+				// rejects during the timer advance below, before the assertion
+				// line runs, and an unobserved rejection would surface as an
+				// unhandled rejection independent of the awaited assertion.
+				void first.catch(() => {})
+				await vi.advanceTimersByTimeAsync(0)
+				// The task is disposed while the bounded metadata wait is still
+				// pending; the abort state is set synchronously in this call.
+				const disposal = task.dispose()
+				expect(task.abort).toBe(true)
+				// The wait itself still expires at the bound, as it normally would.
+				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
+
+				await expect(first).rejects.toThrow(/aborted during request construction/)
+				expect(createMessageSpy).not.toHaveBeenCalled()
+				// The per-request controller is only created once the request is
+				// committed, so a disposed construction never reaches it.
+				expect(task.currentRequestAbortController).toBeUndefined()
+				await disposal
+			} finally {
+				vi.useRealTimers()
+			}
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
+		})
+
 		it("stops manual condensation when the task is aborted during the metadata wait", async () => {
 			// Cancellation must be honored before any provider-visible work of
 			// the condense: an abort landing while the metadata wait is pending

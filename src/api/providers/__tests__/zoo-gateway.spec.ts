@@ -783,11 +783,16 @@ describe("ZooGatewayHandler", () => {
 		})
 
 		it("never starts a wait when the signal is already aborted", async () => {
+			const { getModels } = await import("../fetchers/modelCache")
 			const handler = new ZooGatewayHandler(mockOptions)
 			const controller = new AbortController()
 			controller.abort()
 
 			await expect(handler.ensureModelFetched(controller.signal)).rejects.toThrow()
+			// Without the spy, a guard relocated after fetchModel() starts would
+			// still reject here and settle identically; zero getModels calls pins
+			// that the check runs before the fetch starts.
+			expect(vitest.mocked(getModels)).not.toHaveBeenCalled()
 		})
 
 		it("skips the fetch when models are already populated", async () => {
