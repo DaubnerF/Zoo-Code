@@ -1,10 +1,12 @@
 // npx vitest run src/core/tools/__tests__/validateToolUse.spec.ts
 
-import type { ModeConfig } from "@roo-code/types"
+import type { ModeConfig, ModelInfo, ToolName } from "@roo-code/types"
+import { customToolRegistry } from "@roo-code/core"
 
 import { modes } from "../../../shared/modes"
 import { TOOL_GROUPS } from "../../../shared/tools"
 
+import { buildToolRequirements } from "../../prompts/tools/effective-tool-policy"
 import { validateToolUse, isToolAllowedForMode } from "../validateToolUse"
 
 const codeMode = modes.find((m) => m.slug === "code")?.slug || "code"
@@ -257,6 +259,50 @@ describe("mode-validator", () => {
 			)
 
 			expect(() => validateToolUse("execute_command", codeMode, [], toolRequirements)).not.toThrow()
+		})
+	})
+
+	describe("project custom tools", () => {
+		const customToolName = "deploy_site"
+		const experiments = { customTools: true }
+		const modelInfo: ModelInfo = {
+			contextWindow: 100_000,
+			supportsPromptCache: true,
+			excludedTools: [customToolName],
+		}
+
+		beforeEach(() => {
+			customToolRegistry.register({
+				name: customToolName,
+				description: "test double",
+				execute: async () => "ok",
+			})
+		})
+
+		afterEach(() => {
+			customToolRegistry.clear()
+		})
+
+		it("rejects execution of a custom tool named in model excludedTools", () => {
+			// The runtime gate builds requirements from the same lists that filter
+			// the declarations, and they outrank the custom-tool early return.
+			const toolRequirements = buildToolRequirements(undefined, modelInfo)
+
+			expect(() =>
+				validateToolUse(customToolName as ToolName, codeMode, [], toolRequirements, {}, experiments),
+			).toThrow(`Tool "${customToolName}" is not allowed in ${codeMode} mode.`)
+		})
+
+		it("allows execution of a registered custom tool that no list suppresses (positive control)", () => {
+			const toolRequirements = buildToolRequirements(undefined, {
+				contextWindow: 100_000,
+				supportsPromptCache: true,
+				excludedTools: ["unrelated_tool"],
+			})
+
+			expect(() =>
+				validateToolUse(customToolName as ToolName, codeMode, [], toolRequirements, {}, experiments),
+			).not.toThrow()
 		})
 	})
 })

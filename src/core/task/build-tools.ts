@@ -10,11 +10,8 @@ import { getRooDirectoriesForCwd } from "../../services/roo-config/index.js"
 import { getModeBySlug, defaultModeSlug } from "../../shared/modes"
 
 import { getNativeTools, getMcpServerTools } from "../prompts/tools/native-tools"
-import {
-	filterNativeToolsForMode,
-	filterMcpToolsForMode,
-	resolveToolAlias,
-} from "../prompts/tools/filter-tools-for-mode"
+import { filterNativeToolsForMode, filterMcpToolsForMode } from "../prompts/tools/filter-tools-for-mode"
+import { isToolDisabledOrExcluded } from "../prompts/tools/effective-tool-policy"
 
 interface BuildToolsOptions {
 	provider: ClineProvider
@@ -25,73 +22,20 @@ interface BuildToolsOptions {
 	apiConfiguration: ProviderSettings | undefined
 	disabledTools?: string[]
 	modelInfo?: ModelInfo
-	/**
-	 * If true, returns all tools without mode filtering, but also includes
-	 * the list of allowed tool names for use with allowedFunctionNames.
-	 * This enables providers that support function call restrictions (e.g., Gemini)
-	 * to pass all tool definitions while restricting callable tools.
-	 */
-	includeAllToolsWithRestrictions?: boolean
-}
-
-interface BuildToolsResult {
-	/**
-	 * The tools to pass to the model.
-	 * If includeAllToolsWithRestrictions is true, this includes ALL tools.
-	 * Otherwise, it includes only mode-filtered tools.
-	 */
-	tools: OpenAI.Chat.ChatCompletionTool[]
-	/**
-	 * The names of tools that are allowed to be called based on mode restrictions.
-	 * Only populated when includeAllToolsWithRestrictions is true.
-	 * Use this with allowedFunctionNames in providers that support it.
-	 */
-	allowedFunctionNames?: string[]
-}
-
-/**
- * Extracts the function name from a tool definition.
- */
-function getToolName(tool: OpenAI.Chat.ChatCompletionTool): string {
-	return (tool as OpenAI.Chat.ChatCompletionFunctionTool).function.name
 }
 
 /**
  * Builds the complete tools array for native protocol requests.
  * Combines native tools and MCP tools, filtered by mode restrictions.
+ * Every suppressed entry in `disabledTools` and `modelInfo.excludedTools` is
+ * removed from the sent declarations; execution-time validation enforces the
+ * same policy (see `buildToolRequirements` in effective-tool-policy.ts).
  *
  * @param options - Configuration options for building the tools
  * @returns Array of filtered native and MCP tools
  */
 export async function buildNativeToolsArray(options: BuildToolsOptions): Promise<OpenAI.Chat.ChatCompletionTool[]> {
-	const result = await buildNativeToolsArrayWithRestrictions(options)
-	return result.tools
-}
-
-/**
- * Builds the complete tools array for native protocol requests with optional mode restrictions.
- * When includeAllToolsWithRestrictions is true, returns ALL tools but also provides
- * the list of allowed tool names for use with allowedFunctionNames.
- *
- * This enables providers like Gemini to pass all tool definitions to the model
- * (so it can reference historical tool calls) while restricting which tools
- * can actually be invoked via allowedFunctionNames in toolConfig.
- *
- * @param options - Configuration options for building the tools
- * @returns BuildToolsResult with tools array and optional allowedFunctionNames
- */
-export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsOptions): Promise<BuildToolsResult> {
-	const {
-		provider,
-		cwd,
-		mode,
-		customModes,
-		experiments,
-		apiConfiguration,
-		disabledTools,
-		modelInfo,
-		includeAllToolsWithRestrictions,
-	} = options
+	const { provider, cwd, mode, customModes, experiments, apiConfiguration, disabledTools, modelInfo } = options
 
 	const mcpHub = provider.getMcpHub()
 
@@ -132,46 +76,30 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 		allowedMcpServers,
 	)
 
-	// Filter MCP tools based on mode restrictions.
+	// Filter MCP tools based on mode restrictions and the effective tool policy:
+	// the same disabledTools/modelInfo the native filter consumes also gate the
+	// dynamic mcp--* declarations, which all represent use_mcp_tool.
 	const mcpTools = getMcpServerTools(mcpHub, allowedMcpServers)
-	const filteredMcpTools = filterMcpToolsForMode(mcpTools, mode, customModes, experiments)
+	const filteredMcpTools = filterMcpToolsForMode(mcpTools, mode, customModes, experiments, {
+		disabledTools,
+		modelInfo,
+	})
 
-	// Add custom tools if they are available and the experiment is enabled.
+	// Add custom tools if they are available and the experiment is enabled. The
+	// effective suppression lists remove declarations here and drive the matching
+	// execution-time requirements, so a model-excluded custom tool is neither
+	// advertised nor callable. `disabledTools` is a closed built-in-name enum and
+	// cannot name a custom tool; `modelInfo.excludedTools` can.
 	let nativeCustomTools: OpenAI.Chat.ChatCompletionFunctionTool[] = []
 
 	if (experiments?.customTools) {
 		const toolDirs = getRooDirectoriesForCwd(cwd).map((dir) => path.join(dir, "tools"))
 		await customToolRegistry.loadFromDirectoriesIfStale(toolDirs)
-		const customTools = customToolRegistry.getAllSerialized()
-
-		if (customTools.length > 0) {
-			nativeCustomTools = customTools.map(formatNative)
-		}
+		nativeCustomTools = customToolRegistry
+			.getAllSerialized()
+			.filter((tool) => !isToolDisabledOrExcluded(tool.name, disabledTools, modelInfo))
+			.map(formatNative)
 	}
 
-	// Combine filtered tools (for backward compatibility and for allowedFunctionNames)
-	const filteredTools = [...filteredNativeTools, ...filteredMcpTools, ...nativeCustomTools]
-
-	// If includeAllToolsWithRestrictions is true, return ALL tools but provide
-	// allowed names based on mode filtering
-	if (includeAllToolsWithRestrictions) {
-		// Combine ALL tools (unfiltered native + all MCP + custom)
-		const allTools = [...nativeTools, ...mcpTools, ...nativeCustomTools]
-
-		// Extract names of tools that are allowed based on mode filtering.
-		// Resolve any alias names to canonical names to ensure consistency with allTools
-		// (which uses canonical names). This prevents Gemini errors when tools are renamed
-		// to aliases in filteredTools but allTools contains the original canonical names.
-		const allowedFunctionNames = filteredTools.map((tool) => resolveToolAlias(getToolName(tool)))
-
-		return {
-			tools: allTools,
-			allowedFunctionNames,
-		}
-	}
-
-	// Default behavior: return only filtered tools
-	return {
-		tools: filteredTools,
-	}
+	return [...filteredNativeTools, ...filteredMcpTools, ...nativeCustomTools]
 }

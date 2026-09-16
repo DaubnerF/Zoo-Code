@@ -305,12 +305,11 @@ export class GeminiHandler extends BaseProvider implements SingleCompletionHandl
 			...(tools.length > 0 ? { tools } : {}),
 		}
 
-		// Do not pass metadata.allowedFunctionNames to Gemini. Live API testing showed
-		// that allowedFunctionNames triggers a generic 400 INVALID_ARGUMENT at 26 or more
-		// names. It can also
-		// reject prior function calls if their names are absent from the current
-		// allowed list. We still pass all declarations for history compatibility;
-		// mode/tool restrictions are enforced by the tool execution layer.
+		// Tool policy is enforced upstream: metadata.tools already contains only the
+		// declarations allowed by the effective mode/tool policy. Do not add
+		// allowedFunctionNames to toolConfig; live API testing showed it triggers a
+		// generic 400 INVALID_ARGUMENT at 26 or more names and can reject prior
+		// function calls absent from the current list. toolConfig maps tool_choice only.
 		if (metadata?.tool_choice) {
 			const choice = metadata.tool_choice
 			let mode: FunctionCallingConfigMode

@@ -36,6 +36,7 @@ import { skillTool } from "../tools/SkillTool"
 import { generateImageTool } from "../tools/GenerateImageTool"
 import { applyDiffTool as applyDiffToolClass } from "../tools/ApplyDiffTool"
 import { isValidToolName, validateToolUse } from "../tools/validateToolUse"
+import { buildToolRequirements } from "../prompts/tools/effective-tool-policy"
 import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
@@ -154,6 +155,36 @@ export async function presentAssistantMessage(cline: Task) {
 			// Track if we've already pushed a tool result
 			let hasToolResult = false
 			const toolCallId = mcpBlock.id
+
+			// A native mcp_tool_use call is a use_mcp_tool call, so it passes the same
+			// execution-time policy gate as the static tool_use path. The declarations
+			// were built when the request was created; a tool disabled (disabledTools)
+			// or model-excluded since then must not execute here. Partial blocks are
+			// validated on completion, matching the tool_use case.
+			if (!mcpBlock.partial) {
+				const state = await cline.providerRef.deref()?.getState()
+				const taskMode = await cline.getTaskMode()
+				const modelInfo = cline.api.getModel()
+
+				try {
+					const toolRequirements = buildToolRequirements(state?.disabledTools, modelInfo?.info)
+
+					validateToolUse("use_mcp_tool", taskMode, state?.customModes ?? [], toolRequirements)
+				} catch (error) {
+					cline.consecutiveMistakeCount++
+					const errorContent = formatResponse.toolError(error.message)
+					if (toolCallId) {
+						cline.pushToolResultToUserContent({
+							type: "tool_result",
+							tool_use_id: sanitizeToolUseId(toolCallId),
+							content: typeof errorContent === "string" ? errorContent : "(validation error)",
+							is_error: true,
+						})
+					}
+					cline.recordToolError("use_mcp_tool", error.message)
+					break
+				}
+			}
 
 			// Store approval feedback to merge into tool result (GitHub #10465)
 			let approvalFeedback: { text: string; images?: string[] } | undefined
@@ -607,16 +638,11 @@ export async function presentAssistantMessage(cline: Task) {
 				const isCustomTool = Boolean(stateExperiments?.customTools && customToolRegistry.has(block.name))
 
 				try {
-					const toolRequirements =
-						disabledTools?.reduce(
-							(acc: Record<string, boolean>, tool: string) => {
-								acc[tool] = false
-								const resolvedToolName = resolveToolAlias(tool)
-								acc[resolvedToolName] = false
-								return acc
-							},
-							{} as Record<string, boolean>,
-						) ?? {}
+					// Build requirements through the shared policy module so every suppressed
+					// entry — disabled tools, and an excluded or disabled protocol tool — reaches
+					// the validator, which checks them before the always-available class. See
+					// `buildToolRequirements` in effective-tool-policy.ts.
+					const toolRequirements = buildToolRequirements(disabledTools, modelInfo?.info)
 
 					validateToolUse(
 						block.name as ToolName,

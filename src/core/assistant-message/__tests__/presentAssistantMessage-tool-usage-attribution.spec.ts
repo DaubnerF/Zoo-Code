@@ -273,6 +273,9 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 
 			await presentAssistantMessage(mockTask as unknown as Task)
 
+			// The native block is gated by the shared validator under the synthetic
+			// use_mcp_tool name with the effective policy requirements.
+			expect(validateToolUse).toHaveBeenCalledWith("use_mcp_tool", "code", [], {})
 			expect(mockTask.recordToolUsage).toHaveBeenCalledTimes(1)
 			expect(mockTask.recordToolUsage).toHaveBeenCalledWith("use_mcp_tool")
 			expect(TelemetryService.instance.captureToolUsage).toHaveBeenCalledTimes(1)
@@ -318,6 +321,121 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 			// no success attempt is recorded for a call that was never permitted to execute.
 			expect(mockTask.recordToolUsage).not.toHaveBeenCalled()
 			expect(TelemetryService.instance.captureToolUsage).not.toHaveBeenCalled()
+		})
+
+		it("returns an error tool_result instead of executing when use_mcp_tool is disabled", async () => {
+			vi.mocked(validateToolUse).mockImplementation(() => {
+				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
+			})
+
+			mockTask.providerRef = {
+				deref: () => ({
+					getState: vi.fn().mockResolvedValue({
+						mode: "code",
+						customModes: [],
+						disabledTools: ["use_mcp_tool"],
+					}),
+					getMcpHub: () => ({
+						findServerNameBySanitizedName: () => "my_server",
+					}),
+				}),
+			}
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					id: "call_native_mcp_disabled",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task)
+
+			// The validator saw the disabledTools requirement for the synthetic name.
+			expect(validateToolUse).toHaveBeenCalledWith(
+				"use_mcp_tool",
+				"code",
+				[],
+				expect.objectContaining({ use_mcp_tool: false }),
+			)
+
+			// The standard error tool_result is returned for the native call id.
+			const toolResult = mockTask.userMessageContent.find(
+				(block) => block.type === "tool_result" && block.tool_use_id === "call_native_mcp_disabled",
+			)
+			expect(toolResult).toBeDefined()
+			expect(toolResult?.is_error).toBe(true)
+
+			// No approval flow, no success attribution, one recorded failure.
+			expect(mockTask.ask).not.toHaveBeenCalled()
+			expect(mockTask.recordToolUsage).not.toHaveBeenCalled()
+			expect(TelemetryService.instance.captureToolUsage).not.toHaveBeenCalled()
+			expect(mockTask.recordToolError).toHaveBeenCalledWith(
+				"use_mcp_tool",
+				'Tool "use_mcp_tool" is not allowed in code mode.',
+			)
+		})
+
+		it("returns an error tool_result instead of executing when the model excludes use_mcp_tool", async () => {
+			vi.mocked(validateToolUse).mockImplementation(() => {
+				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
+			})
+
+			mockTask.api = {
+				getModel: () => ({ id: "test-model", info: { excludedTools: ["use_mcp_tool"] } }),
+			}
+
+			mockTask.providerRef = {
+				deref: () => ({
+					getState: vi.fn().mockResolvedValue({
+						mode: "code",
+						customModes: [],
+					}),
+					getMcpHub: () => ({
+						findServerNameBySanitizedName: () => "my_server",
+					}),
+				}),
+			}
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					id: "call_native_mcp_excluded",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task)
+
+			// The validator saw the modelInfo.excludedTools requirement.
+			expect(validateToolUse).toHaveBeenCalledWith(
+				"use_mcp_tool",
+				"code",
+				[],
+				expect.objectContaining({ use_mcp_tool: false }),
+			)
+
+			const toolResult = mockTask.userMessageContent.find(
+				(block) => block.type === "tool_result" && block.tool_use_id === "call_native_mcp_excluded",
+			)
+			expect(toolResult).toBeDefined()
+			expect(toolResult?.is_error).toBe(true)
+
+			expect(mockTask.ask).not.toHaveBeenCalled()
+			expect(mockTask.recordToolUsage).not.toHaveBeenCalled()
+			expect(TelemetryService.instance.captureToolUsage).not.toHaveBeenCalled()
+			expect(mockTask.recordToolError).toHaveBeenCalledWith(
+				"use_mcp_tool",
+				'Tool "use_mcp_tool" is not allowed in code mode.',
+			)
 		})
 	})
 

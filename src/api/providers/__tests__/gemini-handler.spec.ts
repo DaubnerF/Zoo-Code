@@ -163,7 +163,7 @@ describe("GeminiHandler backend support", () => {
 		})
 	})
 
-	describe("allowedFunctionNames support", () => {
+	describe("tool_choice support", () => {
 		const testTools = [
 			{
 				type: "function" as const,
@@ -191,119 +191,7 @@ describe("GeminiHandler backend support", () => {
 			},
 		]
 
-		it("should ignore allowedFunctionNames because Gemini rejects larger restriction lists", async () => {
-			const options = {
-				apiProvider: providerIdentifiers.gemini,
-			} as ApiHandlerOptions
-			const handler = new GeminiHandler(options)
-			const stub = vi.fn().mockReturnValue((async function* () {})())
-			// @ts-ignore access private client
-			handler["client"].models.generateContentStream = stub
-
-			await handler
-				.createMessage("test", [] as any, {
-					taskId: "test-task",
-					tools: testTools,
-					allowedFunctionNames: ["read_file", "write_to_file"],
-				})
-				.next()
-
-			const config = stub.mock.calls[0][0].config
-			expect(config.toolConfig).toBeUndefined()
-		})
-
-		it("should include all tools when allowedFunctionNames is provided", async () => {
-			const options = {
-				apiProvider: providerIdentifiers.gemini,
-			} as ApiHandlerOptions
-			const handler = new GeminiHandler(options)
-			const stub = vi.fn().mockReturnValue((async function* () {})())
-			// @ts-ignore access private client
-			handler["client"].models.generateContentStream = stub
-
-			await handler
-				.createMessage("test", [] as any, {
-					taskId: "test-task",
-					tools: testTools,
-					allowedFunctionNames: ["read_file"],
-				})
-				.next()
-
-			const config = stub.mock.calls[0][0].config
-			// All tools should be passed to the model
-			expect(config.tools[0].functionDeclarations).toHaveLength(3)
-			expect(config.toolConfig).toBeUndefined()
-		})
-
-		it("should not pass large allowedFunctionNames lists to Gemini", async () => {
-			const options = {
-				apiProvider: providerIdentifiers.gemini,
-			} as ApiHandlerOptions
-			const handler = new GeminiHandler(options)
-			const stub = vi.fn().mockReturnValue((async function* () {})())
-			// @ts-ignore access private client
-			handler["client"].models.generateContentStream = stub
-
-			const manyTools = Array.from({ length: 30 }, (_, index) => ({
-				type: "function" as const,
-				function: {
-					name: `tool_${index}`,
-					description: `Tool ${index}`,
-					parameters: { type: "object", properties: {} },
-				},
-			}))
-
-			await handler
-				.createMessage("test", [] as any, {
-					taskId: "test-task",
-					tools: manyTools,
-					allowedFunctionNames: manyTools.map((tool) => tool.function.name),
-				})
-				.next()
-
-			const config = stub.mock.calls[0][0].config
-			expect(config.tools[0].functionDeclarations).toHaveLength(30)
-			expect(config.toolConfig).toBeUndefined()
-		})
-
-		it("should not pass allowedFunctionNames even when history includes tool calls", async () => {
-			const options = {
-				apiProvider: providerIdentifiers.gemini,
-			} as ApiHandlerOptions
-			const handler = new GeminiHandler(options)
-			const stub = vi.fn().mockReturnValue((async function* () {})())
-			// @ts-ignore access private client
-			handler["client"].models.generateContentStream = stub
-
-			const manyTools = Array.from({ length: 30 }, (_, index) => ({
-				type: "function" as const,
-				function: {
-					name: `tool_${index}`,
-					description: `Tool ${index}`,
-					parameters: { type: "object", properties: {} },
-				},
-			}))
-			const messages = [
-				{
-					role: "assistant",
-					content: [{ type: "tool_use", id: "tool-call-29", name: "tool_29", input: {} }],
-				},
-			]
-
-			await handler
-				.createMessage("test", messages as any, {
-					taskId: "test-task",
-					tools: manyTools,
-					allowedFunctionNames: manyTools.slice(0, 29).map((tool) => tool.function.name),
-				})
-				.next()
-
-			const config = stub.mock.calls[0][0].config
-			expect(config.tools[0].functionDeclarations).toHaveLength(30)
-			expect(config.toolConfig).toBeUndefined()
-		})
-
-		it("should fall back to tool_choice when allowedFunctionNames is provided", async () => {
+		it("maps tool_choice auto to AUTO without allowedFunctionNames", async () => {
 			const options = {
 				apiProvider: providerIdentifiers.gemini,
 			} as ApiHandlerOptions
@@ -317,7 +205,6 @@ describe("GeminiHandler backend support", () => {
 					taskId: "test-task",
 					tools: testTools,
 					tool_choice: "auto",
-					allowedFunctionNames: ["read_file"],
 				})
 				.next()
 
@@ -326,31 +213,7 @@ describe("GeminiHandler backend support", () => {
 			expect(config.toolConfig.functionCallingConfig.allowedFunctionNames).toBeUndefined()
 		})
 
-		it("should fall back to tool_choice when allowedFunctionNames is empty", async () => {
-			const options = {
-				apiProvider: providerIdentifiers.gemini,
-			} as ApiHandlerOptions
-			const handler = new GeminiHandler(options)
-			const stub = vi.fn().mockReturnValue((async function* () {})())
-			// @ts-ignore access private client
-			handler["client"].models.generateContentStream = stub
-
-			await handler
-				.createMessage("test", [] as any, {
-					taskId: "test-task",
-					tools: testTools,
-					tool_choice: "auto",
-					allowedFunctionNames: [],
-				})
-				.next()
-
-			const config = stub.mock.calls[0][0].config
-			// Empty allowedFunctionNames should fall back to tool_choice behavior
-			expect(config.toolConfig.functionCallingConfig.mode).toBe(FunctionCallingConfigMode.AUTO)
-			expect(config.toolConfig.functionCallingConfig.allowedFunctionNames).toBeUndefined()
-		})
-
-		it("should not set toolConfig when allowedFunctionNames is undefined and no tool_choice", async () => {
+		it("should not set toolConfig when no tool_choice", async () => {
 			const options = {
 				apiProvider: providerIdentifiers.gemini,
 			} as ApiHandlerOptions
@@ -367,7 +230,6 @@ describe("GeminiHandler backend support", () => {
 				.next()
 
 			const config = stub.mock.calls[0][0].config
-			// No toolConfig should be set when neither allowedFunctionNames nor tool_choice is provided
 			expect(config.toolConfig).toBeUndefined()
 		})
 	})

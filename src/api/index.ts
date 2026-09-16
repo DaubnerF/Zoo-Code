@@ -101,15 +101,6 @@ export interface ApiHandlerCreateMessageMetadata {
 	 */
 	parallelToolCalls?: boolean
 	/**
-	 * Optional array of tool names that the model is allowed to call.
-	 * When provided, all tool definitions are passed to the model (so it can reference
-	 * historical tool calls), but only the specified tools can actually be invoked.
-	 * This is used when switching modes to prevent model errors from missing tool
-	 * definitions while still restricting callable tools to the current mode's permissions.
-	 * Only applies to providers that support function calling restrictions (e.g., Gemini).
-	 */
-	allowedFunctionNames?: string[]
-	/**
 	 * Abort signal for cancelling the HTTP request mid-stream.
 	 * Passed through to AI SDK's streamText() so the underlying HTTP request is aborted
 	 * when the user clicks stop, preventing wasted API tokens/compute on the provider side.
@@ -130,8 +121,15 @@ export interface ApiHandler {
 	 * Ensures model metadata has been fetched from the remote API so that getModel()
 	 * returns accurate info (context window, pricing, etc.) instead of hardcoded defaults.
 	 * Only router providers that discover models over the network implement this.
+	 *
+	 * `signal` bounds the caller's wait: when it aborts (e.g. the caller's bounded
+	 * metadata wait expired or the owning task was cancelled), the returned promise
+	 * settles with a rejection so no handler-side waiter outlives its caller.
+	 * Fetchers that observe the signal may also stop their network request; the
+	 * shared, de-duplicated catalog fetch may still complete and populate the model
+	 * cache, which is by design for concurrent waiters.
 	 */
-	ensureModelFetched?(): Promise<void>
+	ensureModelFetched?(signal?: AbortSignal): Promise<void>
 
 	/**
 	 * Optional context window for context-management / auto-condense when it must differ from
