@@ -13,9 +13,9 @@ import type { McpServer, ModelInfo } from "@roo-code/types"
 import type { ClineProvider } from "../../webview/ClineProvider"
 import type { McpHub } from "../../../services/mcp/McpHub"
 
-vi.mock("../../../services/code-index/manager", () => ({
-	CodeIndexManager: {
-		getInstance: () => ({ isFeatureEnabled: false, isFeatureConfigured: false, isInitialized: false }),
+vi.mock("../../../services/code-index/code-index-manager-registry", () => ({
+	CodeIndexManagerRegistry: {
+		getOrCreate: () => ({ isFeatureEnabled: false, isFeatureConfigured: false, isInitialized: false }),
 	},
 }))
 
@@ -80,6 +80,8 @@ describe("buildNativeToolsArray — sent declaration filtering", () => {
 
 		expect(toolNames(result)).not.toContain("execute_command")
 		expect(toolNames(result)).not.toContain("attempt_completion")
+		// Positive control: a built-in tool outside the disable list stays declared.
+		expect(toolNames(result)).toContain("read_file")
 	})
 
 	it("omits modelInfo.excludedTools from the sent declarations", async () => {
