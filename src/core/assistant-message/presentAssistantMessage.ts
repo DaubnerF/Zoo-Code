@@ -162,8 +162,20 @@ export async function presentAssistantMessage(cline: Task) {
 			// or model-excluded since then must not execute here. Partial blocks are
 			// validated on completion, matching the tool_use case.
 			if (!mcpBlock.partial) {
-				const state = await cline.providerRef.deref()?.getState()
-				const taskMode = await cline.getTaskMode()
+				let state:
+					| Awaited<ReturnType<NonNullable<ReturnType<typeof cline.providerRef.deref>>["getState"]>>
+					| undefined
+				let taskMode: Awaited<ReturnType<typeof cline.getTaskMode>>
+				try {
+					state = await cline.providerRef.deref()?.getState()
+					taskMode = await cline.getTaskMode()
+				} catch (error) {
+					// getState() can reject (e.g. CustomModesManager.getCustomModes does an
+					// uncaught globalState.update). Clear the lock so future presenter calls
+					// are not permanently blocked.
+					cline.presentAssistantMessageLocked = false
+					throw error
+				}
 				const modelInfo = cline.api.getModel()
 
 				try {
