@@ -1,5 +1,4 @@
 import type { SkillsManager } from "../../../services/skills/SkillsManager"
-import type { EffectiveToolPolicy } from "../tools/effective-tool-policy"
 
 type SkillsManagerLike = Pick<SkillsManager, "getSkillsForMode">
 
@@ -23,12 +22,7 @@ function escapeXml(value: string): string {
 export async function getSkillsSection(
 	skillsManager: SkillsManagerLike | undefined,
 	currentMode: string | undefined,
-	policy: EffectiveToolPolicy,
 ): Promise<string> {
-	// The protocol in this section mandates the `skill` tool; if it's not available
-	// the section would be unhelpful/unactionable, so emit nothing.
-	if (!policy.tools.has("skill")) return ""
-
 	if (!skillsManager || !currentMode) return ""
 
 	// Get skills filtered by current mode (with override resolution)

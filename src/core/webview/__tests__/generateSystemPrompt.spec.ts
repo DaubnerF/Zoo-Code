@@ -2,10 +2,10 @@
 //
 // Preview parity: generateSystemPrompt (the webview preview path) must produce
 // the same CAPABILITIES / RULES / SYSTEM INFORMATION sections as a direct
-// SYSTEM_PROMPT call built from the *same* inputs — including a full ModelInfo,
-// so model-level excludedTools/includedTools are honored in the preview exactly
-// like the runtime path. The old `{ isStealthModel }`-only typing silently
-// allowed the preview to ignore them.
+// SYSTEM_PROMPT call built from the *same* inputs — including a full ModelInfo
+// and the state's disabledTools, threaded exactly like the runtime path. The
+// prompt prose sections render their static upstream wording; the effective
+// tool policy still flows to API tool construction and runtime validation.
 
 vi.mock("os", () => ({
 	default: {
@@ -52,9 +52,6 @@ import type { ModelInfo } from "@roo-code/types"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 import { SYSTEM_PROMPT } from "../../prompts/system"
-import { getCapabilitiesSection } from "../../prompts/sections/capabilities"
-import { getRulesSection } from "../../prompts/sections/rules"
-import type { EffectiveToolPolicy } from "../../prompts/tools/effective-tool-policy"
 import { generateSystemPrompt } from "../generateSystemPrompt"
 import type { ClineProvider } from "../ClineProvider"
 import "../../../utils/path"
@@ -102,22 +99,17 @@ vi.mock("../../prompts/sections/custom-instructions", () => ({
 	addCustomInstructions: vi.fn().mockImplementation(async () => ""),
 }))
 
-// The preview must consume a *complete* ModelInfo from the API handler. This
-// locks in that contract: if generateSystemPrompt ever narrows the local
-// modelInfo back down, the excludedTools sub-assertion below fails.
+// The preview consumes a *complete* ModelInfo from the API handler. The two
+// fixtures stay deliberately distinct — mirroring router providers, which
+// expose fallback metadata before the network fetch resolves and full metadata
+// (including excludedTools) only after — so the fetch-state double below stays
+// faithful to the providers this plumbing exists for.
 const fullModelInfo: ModelInfo = {
 	contextWindow: 100_000,
 	supportsPromptCache: true,
 	excludedTools: ["read_file"],
 }
 
-// Fallback metadata a lazily loaded router model exposes BEFORE its network
-// fetch resolves. Deliberately distinct from fullModelInfo on the OUTPUT axis:
-// it excludes list_files (fullModelInfo excludes read_file), so the three
-// states — fallback / fetched / undefined — render three different CAPABILITIES
-// sections. The parity tests only pass if generateSystemPrompt awaits
-// ensureModelFetched() before reading getModel().info, and the rejection test
-// below only passes if a failed fetch degrades to THIS fixture (not undefined).
 const fallbackModelInfo: ModelInfo = {
 	contextWindow: 32_000,
 	supportsPromptCache: false,
@@ -186,8 +178,7 @@ describe("generateSystemPrompt preview parity", () => {
 	let errorSpy: ReturnType<typeof vi.spyOn>
 
 	// The temp handler starts every test in the lazy (pre-fetch) state so the
-	// parity tests genuinely prove the fetch is awaited before getModel().info
-	// is read.
+	// fetch-ordering assertions below genuinely exercise the await.
 	beforeEach(() => {
 		modelMock.state.fetched = false
 		modelMock.ensureModelFetched.mockClear()
@@ -199,7 +190,7 @@ describe("generateSystemPrompt preview parity", () => {
 	})
 
 	// Section-scoped extraction: capture the text between two "====" headers so
-	// the comparison is limited to the sections the tool policy drives.
+	// the comparison is limited to the sections the prompt plumbing drives.
 	function extractSection(prompt: string, header: string): string {
 		const marker = `\n\n${header}\n\n`
 		const idx = prompt.indexOf(marker)
@@ -272,52 +263,27 @@ describe("generateSystemPrompt preview parity", () => {
 		}
 	})
 
-	it("honors the full modelInfo.excludedTools in the preview output", async () => {
-		const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
-		const capabilities = extractSection(preview, "CAPABILITIES")
-
-		// read_file is excluded by the model info: no "read files" clause.
-		expect(capabilities).not.toContain("read files")
-		// Other clauses survive, proving the exclusion is scoped to that tool.
-		expect(capabilities).toContain("execute CLI commands")
-	})
-
-	it("awaits ensureModelFetched before reading model info", async () => {
-		// A lazily loaded router model exposes only fallback metadata until the
-		// fetch resolves. The preview must await ensureModelFetched() first, or
-		// it would build tool guidance from the fallback metadata (which excludes
-		// list_files, not read_file) and diverge from the runtime path.
-		const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+	it("awaits ensureModelFetched once before building the preview", async () => {
+		// A lazily loaded router model must be fetched before the preview reads
+		// getModel().info, so the modelInfo handed to SYSTEM_PROMPT matches the
+		// runtime path. Prose-level variance is deferred; the await contract
+		// stays observable through the fetch call itself.
+		await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
 
 		expect(modelMock.ensureModelFetched).toHaveBeenCalledTimes(1)
-		// "read files" only appears with the fallback metadata; the preview must
-		// reflect the fetched model info instead.
-		const capabilities = extractSection(preview, "CAPABILITIES")
-		expect(capabilities).not.toContain("read files")
-		expect(capabilities).toContain("execute CLI commands")
 	})
 
 	it("falls back to handler model info when ensureModelFetched rejects", async () => {
-		// A network failure must not drop model guidance entirely: the runtime
-		// path (Task.safeEnsureModelFetched) degrades to getModel().info
-		// fallback metadata, and the preview must do the same instead of
-		// passing modelInfo = undefined to SYSTEM_PROMPT. The fixtures make
-		// the three states distinguishable: fallbackModelInfo excludes
-		// list_files, fullModelInfo excludes read_file, and undefined excludes
-		// neither — so the assertion pair below pins the prompt to the
-		// fallback fixture, and fails if the inner try/catch is removed: the
-		// rejection would then skip getModel() and the prompt would be built
-		// with modelInfo === undefined.
+		// A network failure must not abort the preview: the runtime path
+		// (Task.safeEnsureModelFetched) degrades to getModel().info fallback
+		// metadata, and the preview must do the same instead of rejecting or
+		// dropping the modelInfo argument entirely.
 		modelMock.ensureModelFetched.mockRejectedValueOnce(new Error("network down"))
 
 		const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
 
-		const capabilities = extractSection(preview, "CAPABILITIES")
-		// Absent only when modelInfo === fallbackModelInfo (its exclusion).
-		expect(capabilities).not.toContain("list files")
-		// Present only when read_file was NOT excluded — rules out fullModelInfo.
-		expect(capabilities).toContain("read files")
-		expect(capabilities).toContain("execute CLI commands")
+		// The preview still resolves to a prompt.
+		expect(preview).toContain("====")
 		expect(errorSpy).toHaveBeenCalled()
 		// The context string is part of the contract: an empty or generic log
 		// line would erase the only trace of a degraded preview.
@@ -330,8 +296,8 @@ describe("generateSystemPrompt preview parity", () => {
 	it("degrades to fallback metadata when ensureModelFetched hangs past the preview timeout", async () => {
 		// A hung metadata endpoint (some fetchers issue unbounded GETs) must not
 		// block the user-triggered preview: after PREVIEW_MODEL_FETCH_TIMEOUT_MS
-		// (5s) the race resolves and the prompt is built from the fallback
-		// metadata, identical to the rejected-fetch degradation.
+		// (5s) the race resolves and the prompt is built from the handler's
+		// current metadata, identical to the rejected-fetch degradation.
 		vi.useFakeTimers()
 		try {
 			modelMock.ensureModelFetched.mockImplementationOnce(() => new Promise<void>(() => {}))
@@ -340,42 +306,11 @@ describe("generateSystemPrompt preview parity", () => {
 			await vi.advanceTimersByTimeAsync(5_000)
 			const preview = await previewPromise
 
-			const capabilities = extractSection(preview, "CAPABILITIES")
-			// Fallback fixture signature (see fallbackModelInfo): list_files
-			// excluded, read_file still advertised — proves fallback metadata,
-			// not undefined (which would advertise both) and not fullModelInfo
-			// (which would drop "read files").
-			expect(capabilities).not.toContain("list files")
-			expect(capabilities).toContain("read files")
+			// The preview still resolves to a prompt past the bound.
+			expect(preview).toContain("====")
 		} finally {
 			vi.useRealTimers()
 		}
-	})
-
-	it("omits command guidance from the preview when execute_command is disabled", async () => {
-		// The preview must forward state.disabledTools to SYSTEM_PROMPT: with
-		// execute_command disabled, the CAPABILITIES section drops every
-		// command-related fragment. The once-value overrides the shared default
-		// without mutating it for other tests.
-		getStateMock.mockResolvedValueOnce({
-			apiConfiguration: { apiProvider: providerIdentifiers.openai, apiModelId: "gpt-4o" },
-			customModePrompts: undefined,
-			customInstructions: undefined,
-			mcpEnabled: false,
-			experiments: {},
-			language: undefined,
-			enableSubfolderRules: false,
-			disabledTools: ["execute_command"],
-		})
-
-		const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
-		const capabilities = extractSection(preview, "CAPABILITIES")
-
-		expect(capabilities).not.toContain("execute CLI commands")
-		expect(capabilities).not.toContain("You can use the execute_command tool")
-		// Anchor: the section is still populated, proving only execute_command
-		// guidance was removed.
-		expect(capabilities).toContain("list files")
 	})
 
 	it("resolves when settings are omitted instead of dereferencing them", async () => {
@@ -418,11 +353,7 @@ describe("generateSystemPrompt preview parity", () => {
 				const preview = await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
 
 				expect(errorSpy).not.toHaveBeenCalled()
-				const capabilities = extractSection(preview, "CAPABILITIES")
-				// Fallback-fixture signature (see fallbackModelInfo): the preview is
-				// still built from a complete ModelInfo, not from undefined.
-				expect(capabilities).not.toContain("list files")
-				expect(capabilities).toContain("read files")
+				expect(preview).toContain("====")
 			} finally {
 				if (descriptor) {
 					Object.defineProperty(modelMock, "ensureModelFetched", descriptor)
@@ -464,13 +395,9 @@ describe("generateSystemPrompt preview parity", () => {
 				expect(settled).toBe(false)
 
 				await vi.advanceTimersByTimeAsync(1)
-				const preview = await previewPromise
+				await previewPromise
 
-				// Degradation at the bound mirrors the rejected-fetch path: fallback
-				// metadata, and no error logged (a timeout is not a failure).
-				const capabilities = extractSection(preview, "CAPABILITIES")
-				expect(capabilities).not.toContain("list files")
-				expect(capabilities).toContain("read files")
+				// Degradation at the bound is not a failure: no error is logged.
 				expect(errorSpy).not.toHaveBeenCalled()
 			} finally {
 				vi.useRealTimers()
@@ -528,10 +455,10 @@ describe("generateSystemPrompt preview parity", () => {
 
 		it("logs and degrades when the model info cannot be read", async () => {
 			// A throw while reading the model info escapes the fetch race and lands
-			// in the outer handler: the preview must still resolve — without model
-			// guidance — and log the outer-catch context string. The state double
-			// is swapped for a throwing getter because the mocked factory reads it
-			// inside getModel().info, which is the read the preview performs.
+			// in the outer handler: the preview must still resolve and log the
+			// outer-catch context string. The state double is swapped for a
+			// throwing getter because the mocked factory reads it inside
+			// getModel().info, which is the read the preview performs.
 			const stateDescriptor = Object.getOwnPropertyDescriptor(modelMock, "state")
 			Object.defineProperty(modelMock, "state", {
 				value: {
@@ -549,214 +476,13 @@ describe("generateSystemPrompt preview parity", () => {
 					"Error reading model info for system prompt preview:",
 					expect.anything(),
 				)
-				const capabilities = extractSection(preview, "CAPABILITIES")
-				// modelInfo === undefined excludes nothing: both clause families appear.
-				expect(capabilities).toContain("read files")
-				expect(capabilities).toContain("list files")
+				// The preview still resolves to a prompt without model guidance.
+				expect(preview).toContain("====")
 			} finally {
 				if (stateDescriptor) {
 					Object.defineProperty(modelMock, "state", stateDescriptor)
 				}
 			}
-		})
-	})
-})
-
-// ---------------------------------------------------------------------------
-// Raw-policy fragment tests for the CAPABILITIES and RULES builders: drives the
-// branch cells the resolver-backed specs in core/prompts/__tests__/sections.spec.ts
-// cannot produce (policy objects are built directly, bypassing the resolver).
-// ---------------------------------------------------------------------------
-describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
-	const cwd = "/test/path"
-	const settings = { ...fullSettings }
-
-	/**
-	 * Raw policy double: the section builders only read `tools` plus the MCP and
-	 * edit-restriction fields, so a literal captures every branch the resolver
-	 * could produce for these two sections.
-	 */
-	function sectionPolicy(
-		tools: string[],
-		extra: Partial<
-			Pick<EffectiveToolPolicy, "hasMcpGroup" | "hasMcpTools" | "hasMcpResources" | "editRestriction">
-		> = {},
-	): EffectiveToolPolicy {
-		return {
-			tools: new Set(tools),
-			hasMcpGroup: false,
-			hasMcpTools: false,
-			hasMcpResources: false,
-			...extra,
-		}
-	}
-
-	describe("getCapabilitiesSection", () => {
-		it("emits every clause and paragraph when all capability tools are advertised", () => {
-			const result = getCapabilitiesSection(
-				sectionPolicy(
-					[
-						"execute_command",
-						"list_files",
-						"codebase_search",
-						"search_files",
-						"read_file",
-						"write_to_file",
-						"apply_diff",
-					],
-					{ hasMcpGroup: true, hasMcpTools: true },
-				),
-			)
-
-			expect(result).toContain("====\n\nCAPABILITIES\n\n")
-			expect(result).toContain(
-				"You have access to tools that let you execute CLI commands on the user's computer, list files, view source code definitions, regex search, read files, write and edit files.",
-			)
-			expect(result).toContain("\n- These tools help you accomplish tasks.\n")
-			expect(result).toContain("you can use the list_files tool")
-			expect(result).toContain("You can use the execute_command tool to run commands on the user's computer")
-			expect(result).toContain(
-				"You have access to MCP servers that may provide additional tools and/or resources",
-			)
-			expect(result).not.toContain("Stryker was here")
-			// The trailing newline is trimmed; the result must end with the last bullet.
-			expect(result.endsWith("accomplish tasks more effectively.")).toBe(true)
-		})
-
-		it("falls back to the limited-tools sentence and omits every fragment when no capability tools are advertised", () => {
-			const result = getCapabilitiesSection(sectionPolicy([]))
-
-			expect(result).toContain(
-				"You have access to a limited set of tools for this mode; only the tools you are provided may be called.",
-			)
-			expect(result).not.toContain("You have access to tools that let you")
-			expect(result).not.toContain("execute CLI commands")
-			expect(result).not.toContain("list files")
-			expect(result).not.toContain("view source code definitions")
-			expect(result).not.toContain("regex search")
-			expect(result).not.toContain("read files")
-			expect(result).not.toContain("write and edit files")
-			expect(result).not.toContain("you can use the list_files tool")
-			expect(result).not.toContain("You can use the execute_command tool")
-			expect(result).not.toContain("MCP servers")
-		})
-
-		it("gates each clause on exactly its advertised tool", () => {
-			expect(getCapabilitiesSection(sectionPolicy(["list_files"]))).toContain(
-				"You have access to tools that let you list files.",
-			)
-			expect(getCapabilitiesSection(sectionPolicy(["codebase_search"]))).toContain(
-				"You have access to tools that let you view source code definitions.",
-			)
-			expect(getCapabilitiesSection(sectionPolicy(["search_files"]))).toContain(
-				"You have access to tools that let you regex search.",
-			)
-			expect(getCapabilitiesSection(sectionPolicy(["search_files"]))).not.toContain(
-				"view source code definitions",
-			)
-			expect(getCapabilitiesSection(sectionPolicy(["read_file"]))).toContain(
-				"You have access to tools that let you read files.",
-			)
-			expect(getCapabilitiesSection(sectionPolicy(["write_to_file"]))).toContain("write and edit files")
-			expect(getCapabilitiesSection(sectionPolicy(["apply_diff"]))).toContain("write and edit files")
-			expect(getCapabilitiesSection(sectionPolicy(["read_file"]))).not.toContain("write and edit files")
-		})
-	})
-
-	describe("getRulesSection", () => {
-		it("includes every tool-gated fragment when all relevant tools are advertised", () => {
-			const result = getRulesSection(
-				cwd,
-				settings,
-				sectionPolicy(
-					[
-						"execute_command",
-						"ask_followup_question",
-						"list_files",
-						"read_file",
-						"write_to_file",
-						"attempt_completion",
-					],
-					{ editRestriction: { fileRegex: "\\.md$" } },
-				),
-			)
-
-			expect(result).toContain("====\n\nRULES\n\n- ")
-			expect(result).toContain("The project base directory is: /test/path")
-			expect(result).toContain(
-				"All file paths must be relative to this directory. However, commands may change directories in terminals, so respect working directory specified by the response to execute_command.",
-			)
-			expect(result).toContain("You are stuck operating from '/test/path'")
-			expect(result).toContain("Do not use the ~ character or $HOME to refer to the home directory.")
-			expect(result).toContain(
-				"Before using the execute_command tool, you must first think about the SYSTEM INFORMATION context",
-			)
-			expect(result).toContain("Some modes have restrictions on which files they can edit")
-			expect(result).toContain("Be sure to consider the type of project")
-			expect(result).toContain("When making changes to code, always consider the context")
-			expect(result).toContain("Do not ask for more information than necessary")
-			expect(result).toContain(
-				"You are only allowed to ask the user questions using the ask_followup_question tool",
-			)
-			expect(result).toContain("you should use the list_files tool to list the files in the Desktop")
-			expect(result).not.toContain("Provide your best-effort result")
-			expect(result).toContain("When executing commands, if you don't see the expected output")
-			expect(result).toContain(
-				"use the ask_followup_question tool to request the user to copy and paste it back to you",
-			)
-			expect(result).not.toContain("note what you expected and proceed with the task")
-			expect(result).toContain("The user may provide a file's contents directly")
-			expect(result).toContain(
-				"Your goal is to try to accomplish the user's task, NOT engage in a back and forth conversation.",
-			)
-			expect(result).toContain("NEVER end attempt_completion result with a question")
-			expect(result).toContain("STRICTLY FORBIDDEN from starting your messages")
-			expect(result).toContain("When presented with images, utilize your vision capabilities")
-			expect(result).toContain("you will automatically receive environment_details")
-			expect(result).toContain('"Actively Running Terminals"')
-			expect(result).toContain("It is critical you wait for the user's response after each tool use")
-			expect(result).not.toContain("MCP operations should be used one at a time")
-			expect(result).not.toContain("VENDOR CONFIDENTIALITY")
-			// join separator: rules are bulleted one per line, not concatenated
-			expect(result).toContain("/test/path\n- All file paths must be relative")
-			expect(result).not.toContain("Stryker was here")
-		})
-
-		it("keeps the ask guidance but drops the list_files example when only ask_followup_question is advertised", () => {
-			const result = getRulesSection(cwd, settings, sectionPolicy(["ask_followup_question"]))
-
-			expect(result).toContain(
-				"You are only allowed to ask the user questions using the ask_followup_question tool",
-			)
-			expect(result).not.toContain("the list_files tool")
-			expect(result).not.toContain("Stryker was here!")
-		})
-
-		it("emits the MCP usage rule only when the mcp group is present and tools or resources are effective", () => {
-			const mcpRule = "MCP operations should be used one at a time"
-
-			expect(
-				getRulesSection(cwd, settings, sectionPolicy([], { hasMcpGroup: true, hasMcpTools: true })),
-			).toContain(mcpRule)
-			expect(
-				getRulesSection(cwd, settings, sectionPolicy([], { hasMcpGroup: true, hasMcpResources: true })),
-			).toContain(mcpRule)
-			expect(getRulesSection(cwd, settings, sectionPolicy([], { hasMcpGroup: true }))).not.toContain(mcpRule)
-			expect(
-				getRulesSection(cwd, settings, sectionPolicy([], { hasMcpTools: true, hasMcpResources: true })),
-			).not.toContain(mcpRule)
-		})
-
-		it("tolerates undefined settings and emits vendor confidentiality only for stealth models", () => {
-			const full = sectionPolicy(["execute_command", "ask_followup_question", "list_files", "read_file"])
-
-			// The `settings?.isStealthModel` optional chain must survive an undefined settings
-			// object; dropping the chain throws a TypeError inside getRulesSection.
-			expect(() => getRulesSection(cwd, undefined, full)).not.toThrow()
-			expect(getRulesSection(cwd, undefined, full)).not.toContain("VENDOR CONFIDENTIALITY")
-			expect(getRulesSection(cwd, { ...settings, isStealthModel: true }, full)).toContain(
-				"VENDOR CONFIDENTIALITY",
-			)
 		})
 	})
 })

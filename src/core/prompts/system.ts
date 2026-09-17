@@ -18,7 +18,6 @@ import { CodeIndexManagerRegistry } from "../../services/code-index/code-index-m
 import { SkillsManager } from "../../services/skills/SkillsManager"
 
 import type { SystemPromptSettings } from "./types"
-import type { EffectiveToolPolicy } from "./tools/effective-tool-policy"
 import { resolveEffectiveToolPolicy } from "./tools/effective-tool-policy"
 import {
 	getRulesSection,
@@ -76,10 +75,10 @@ async function generatePrompt(
 
 	const codeIndexManager = CodeIndexManagerRegistry.getOrCreate(context, cwd)
 
-	// Resolve the single, request-scoped effective tool policy ONCE, then have every
-	// prompt section and the MCP short-circuit derive from it. This is the one source of
-	// truth shared by prompt generation, API tool construction, runtime validation, and
-	// preview, so the prose never advertises a tool the model cannot actually call.
+	// Resolve the single, request-scoped effective tool policy ONCE. This is the one
+	// source of truth shared by prompt generation, API tool construction, runtime
+	// validation, and preview. Prompt prose sections still render their static
+	// upstream wording; only the MCP capability gate derives from the policy here.
 	const policy = resolveEffectiveToolPolicy({
 		mode,
 		customModes: customModeConfigs,
@@ -96,7 +95,7 @@ async function generatePrompt(
 
 	const [modesSection, skillsSection] = await Promise.all([
 		getModesSection(context),
-		getSkillsSection(skillsManager, mode as string, policy),
+		getSkillsSection(skillsManager, mode as string),
 	])
 
 	// Tools catalog is not included in the system prompt.
@@ -108,17 +107,17 @@ ${markdownFormattingSection()}
 
 ${getSharedToolUseSection()}${toolsCatalog}
 
-	${getToolUseGuidelinesSection(policy)}
+	${getToolUseGuidelinesSection()}
 
-${getCapabilitiesSection(policy)}
+${getCapabilitiesSection(cwd, policy.hasMcpGroup ? mcpHub : undefined, modeConfig.allowedMcpServers)}
 
 ${modesSection}
 ${skillsSection ? `\n${skillsSection}` : ""}
-${getRulesSection(cwd, settings, policy)}
+${getRulesSection(cwd, settings)}
 
-${getSystemInfoSection(cwd, policy)}
+${getSystemInfoSection(cwd)}
 
-${getObjectiveSection(policy)}
+${getObjectiveSection()}
 
 ${await addCustomInstructions(baseInstructions, globalCustomInstructions || "", cwd, mode, {
 	language: language ?? formatLanguage(vscode.env.language),
