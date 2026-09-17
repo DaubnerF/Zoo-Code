@@ -14,9 +14,13 @@ import type { McpServer, ModeConfig, ModelInfo } from "@roo-code/types"
 import type { ClineProvider } from "../../webview/ClineProvider"
 import type { McpHub } from "../../../services/mcp/McpHub"
 
-vi.mock("../../../services/code-index/manager", () => ({
-	CodeIndexManager: {
-		getInstance: () => ({ isFeatureEnabled: false, isFeatureConfigured: false, isInitialized: false }),
+// build-tools resolves the per-cwd CodeIndexManager through the registry; left
+// real, getOrCreate would construct a live manager from the stubbed context.
+// The all-false flags keep codebase_search out of every filter result, matching
+// the disabled-index baseline the assertions below assume.
+vi.mock("../../../services/code-index/code-index-manager-registry", () => ({
+	CodeIndexManagerRegistry: {
+		getOrCreate: () => ({ isFeatureEnabled: false, isFeatureConfigured: false, isInitialized: false }),
 	},
 }))
 
