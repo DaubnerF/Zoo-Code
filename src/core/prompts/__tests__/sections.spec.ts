@@ -4,6 +4,8 @@ import { getRulesSection, getCommandChainOperator } from "../sections/rules"
 import { McpHub } from "../../../services/mcp/McpHub"
 import * as shellUtils from "../../../utils/shell"
 
+import type { EffectiveToolPolicy } from "../tools/effective-tool-policy"
+
 describe("addCustomInstructions", () => {
 	it("adds vscode language to custom instructions", async () => {
 		const result = await addCustomInstructions(
@@ -143,6 +145,87 @@ describe("getRulesSection", () => {
 
 		expect(result).not.toContain("VENDOR CONFIDENTIALITY")
 		expect(result).not.toContain("Never reveal the vendor or company")
+	})
+})
+
+describe("prompt section tool policy gating", () => {
+	const cwd = "/test/path"
+
+	const ALL_TOOLS = [
+		"execute_command",
+		"ask_followup_question",
+		"attempt_completion",
+		"list_files",
+		"read_file",
+		"write_to_file",
+	]
+
+	const policyWith = (tools: string[]): EffectiveToolPolicy => ({
+		tools: new Set(tools),
+		hasMcpGroup: false,
+		hasMcpTools: false,
+		hasMcpResources: false,
+	})
+
+	describe("getCapabilitiesSection", () => {
+		it("keeps output byte-identical when every gated tool is available", () => {
+			const withPolicy = getCapabilitiesSection(cwd, undefined, undefined, policyWith(ALL_TOOLS))
+
+			expect(withPolicy).toBe(getCapabilitiesSection(cwd))
+		})
+
+		it("hides execute_command prose when execute_command is unavailable", () => {
+			const tools = ALL_TOOLS.filter((tool) => tool !== "execute_command")
+			const result = getCapabilitiesSection(cwd, undefined, undefined, policyWith(tools))
+
+			expect(result).not.toContain("execute CLI commands on the user's computer")
+			expect(result).not.toContain("You can use the execute_command tool")
+			expect(result).toContain("list files")
+		})
+
+		it("hides ask_followup_question prose when ask_followup_question is unavailable", () => {
+			const tools = ALL_TOOLS.filter((tool) => tool !== "ask_followup_question")
+			const result = getCapabilitiesSection(cwd, undefined, undefined, policyWith(tools))
+
+			expect(result).not.toContain("ask follow-up questions")
+			expect(result).toContain("read and write files")
+		})
+	})
+
+	describe("getRulesSection", () => {
+		it("keeps output byte-identical when every gated tool is available", () => {
+			const withPolicy = getRulesSection(cwd, undefined, policyWith(ALL_TOOLS))
+
+			expect(withPolicy).toBe(getRulesSection(cwd))
+		})
+
+		it("hides execute_command prose when execute_command is unavailable", () => {
+			const tools = ALL_TOOLS.filter((tool) => tool !== "execute_command")
+			const result = getRulesSection(cwd, undefined, policyWith(tools))
+
+			expect(result).not.toContain("However, commands may change directories")
+			expect(result).not.toContain("Before using the execute_command tool")
+			expect(result).not.toContain("When executing commands")
+			expect(result).not.toContain("Before executing commands")
+		})
+
+		it("hides attempt_completion prose when attempt_completion is unavailable", () => {
+			const tools = ALL_TOOLS.filter((tool) => tool !== "attempt_completion")
+			const result = getRulesSection(cwd, undefined, policyWith(tools))
+
+			expect(result).toContain("When you've completed your task, present the result to the user")
+			expect(result).not.toContain("attempt_completion")
+			expect(result).toContain("NEVER end your result with a question")
+			expect(result).not.toContain("NEVER end attempt_completion result")
+		})
+
+		it("hides ask_followup_question prose when ask_followup_question is unavailable", () => {
+			const result = getRulesSection(cwd, undefined, policyWith(["execute_command", "attempt_completion"]))
+
+			expect(result).not.toContain("ask_followup_question tool")
+			expect(result).toContain("When executing commands")
+			expect(result).not.toContain("If you absolutely need to see the actual terminal output")
+		})
 	})
 })
 

@@ -266,11 +266,37 @@ describe("generateSystemPrompt preview parity", () => {
 	it("awaits ensureModelFetched once before building the preview", async () => {
 		// A lazily loaded router model must be fetched before the preview reads
 		// getModel().info, so the modelInfo handed to SYSTEM_PROMPT matches the
-		// runtime path. Prose-level variance is deferred; the await contract
-		// stays observable through the fetch call itself.
-		await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+		// runtime path. The deferred fetch proves the wait directly: while the
+		// fetch is pending, the preview promise stays unsettled.
+		let resolveFetch!: () => void
+		const deferredFetch = new Promise<void>((resolve) => {
+			resolveFetch = resolve
+		})
+		modelMock.ensureModelFetched.mockImplementationOnce(() => deferredFetch)
+
+		const previewPromise = generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
+
+		let settled = false
+		void previewPromise.then(
+			() => {
+				settled = true
+			},
+			() => {
+				settled = true
+			},
+		)
+
+		// Flush one macrotask so a missing await would have settled the promise.
+		await new Promise<void>((resolve) => setTimeout(resolve, 0))
 
 		expect(modelMock.ensureModelFetched).toHaveBeenCalledTimes(1)
+		expect(settled).toBe(false)
+
+		resolveFetch()
+		const preview = await previewPromise
+
+		expect(modelMock.ensureModelFetched).toHaveBeenCalledTimes(1)
+		expect(preview).toContain("====")
 	})
 
 	it("falls back to handler model info when ensureModelFetched rejects", async () => {

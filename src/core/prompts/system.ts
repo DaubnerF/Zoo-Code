@@ -77,8 +77,10 @@ async function generatePrompt(
 
 	// Resolve the single, request-scoped effective tool policy ONCE. This is the one
 	// source of truth shared by prompt generation, API tool construction, runtime
-	// validation, and preview. Prompt prose sections still render their static
-	// upstream wording; only the MCP capability gate derives from the policy here.
+	// validation, and preview. Most prompt prose renders static upstream wording;
+	// the MCP capability gate and the capabilities/rules guidance for
+	// execute_command, ask_followup_question, and attempt_completion derive from
+	// the policy.
 	const policy = resolveEffectiveToolPolicy({
 		mode,
 		customModes: customModeConfigs,
@@ -109,11 +111,11 @@ ${getSharedToolUseSection()}${toolsCatalog}
 
 	${getToolUseGuidelinesSection()}
 
-${getCapabilitiesSection(cwd, policy.hasMcpGroup ? mcpHub : undefined, modeConfig.allowedMcpServers)}
+${getCapabilitiesSection(cwd, policy.hasMcpGroup ? mcpHub : undefined, modeConfig.allowedMcpServers, policy)}
 
 ${modesSection}
 ${skillsSection ? `\n${skillsSection}` : ""}
-${getRulesSection(cwd, settings)}
+${getRulesSection(cwd, settings, policy)}
 
 ${getSystemInfoSection(cwd)}
 
