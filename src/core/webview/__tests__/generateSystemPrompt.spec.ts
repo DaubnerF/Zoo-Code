@@ -610,7 +610,7 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 
 			expect(result).toContain("====\n\nCAPABILITIES\n\n")
 			expect(result).toContain(
-				"You have access to tools that let you execute CLI commands on the user's computer, list files, view source code definitions, regex search, read files, write and edit files.",
+				"You have access to tools that let you execute CLI commands on the user's computer, list files, semantically search the codebase, regex search, read files, write and edit files.",
 			)
 			expect(result).toContain("\n- These tools help you accomplish tasks.\n")
 			expect(result).toContain("you can use the list_files tool")
@@ -632,7 +632,7 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			expect(result).not.toContain("You have access to tools that let you")
 			expect(result).not.toContain("execute CLI commands")
 			expect(result).not.toContain("list files")
-			expect(result).not.toContain("view source code definitions")
+			expect(result).not.toContain("semantically search the codebase")
 			expect(result).not.toContain("regex search")
 			expect(result).not.toContain("read files")
 			expect(result).not.toContain("write and edit files")
@@ -646,13 +646,13 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 				"You have access to tools that let you list files.",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["codebase_search"]))).toContain(
-				"You have access to tools that let you view source code definitions.",
+				"You have access to tools that let you semantically search the codebase.",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["search_files"]))).toContain(
 				"You have access to tools that let you regex search.",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["search_files"]))).not.toContain(
-				"view source code definitions",
+				"semantically search the codebase",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["read_file"]))).toContain(
 				"You have access to tools that let you read files.",

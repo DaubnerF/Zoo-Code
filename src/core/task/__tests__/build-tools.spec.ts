@@ -87,6 +87,8 @@ describe("buildNativeToolsArrayWithRestrictions — Gemini includeAllToolsWithRe
 		// just like any other tool.
 		expect(result.allowedFunctionNames).not.toContain("attempt_completion")
 		expect(result.allowedFunctionNames).not.toContain("execute_command")
+		// Anchor: code mode still grants read_file, so the allowlist is populated.
+		expect(result.allowedFunctionNames).toContain("read_file")
 	})
 
 	it("flows mode filtering through the resolver into allowedFunctionNames", async () => {

@@ -25,7 +25,7 @@ export function getCapabilitiesSection(policy: EffectiveToolPolicy): string {
 		clauses.push("list files")
 	}
 	if (tools.has("codebase_search")) {
-		clauses.push("view source code definitions")
+		clauses.push("semantically search the codebase")
 	}
 	if (tools.has("search_files")) {
 		clauses.push("regex search")
