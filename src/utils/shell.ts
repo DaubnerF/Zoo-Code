@@ -224,6 +224,9 @@ function getShellFromEnv(): string | null {
  * Returns the shell execa actually runs commands in under the Inline Terminal:
  * Node's spawn-shell default (COMSPEC/cmd.exe on Windows, /bin/sh on POSIX),
  * independent of the VS Code terminal profile (issue #1568).
+ * Note: a COMSPEC outside the SHELL_ALLOWLIST is reported as the platform-safe
+ * fallback by getShell()'s step-6 gate, so on such machines the reported string
+ * and the spawned executable can differ (allowlist security tradeoff).
  */
 function execaDefaultShellForPlatform(): string {
 	if (process.platform === "win32") {

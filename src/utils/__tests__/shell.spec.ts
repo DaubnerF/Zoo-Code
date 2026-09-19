@@ -711,4 +711,54 @@ describe("Shell Detection Tests", () => {
 			expect(getShell()).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
 		})
 	})
+
+	// --------------------------------------------------------------------------
+	// Unseeded static default
+	// --------------------------------------------------------------------------
+	describe("Unseeded inline-terminal default", () => {
+		// A reset module registry reproduces the headless host state: no
+		// resolveWebviewView or updateSettings ever seeds the static, so the
+		// declaration defaults are exactly what a fresh process starts with.
+		it("fresh module exposes inline-terminal default matching the execution default", async () => {
+			vi.resetModules()
+			const { BaseTerminal: FreshBaseTerminal } = await import("../../integrations/terminal/BaseTerminal")
+			expect(FreshBaseTerminal.getShellIntegrationDisabled()).toBe(true)
+		})
+
+		it("unseeded static reports the execa shell, not the VS Code profile", async () => {
+			vi.resetModules()
+			Object.defineProperty(process, "platform", { value: "win32" })
+			process.env.COMSPEC = "C:\\Windows\\System32\\cmd.exe"
+			const psPath = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+			// A freshly imported shell.ts resolves its own imports from the reset
+			// registry, so the stubs below must target that generation. The profile
+			// must actually resolve (existsSync true): a non-inline regression would
+			// then report the profile path instead of COMSPEC and fail this test,
+			// whereas a failed profile resolution would mask it via the COMSPEC env.
+			const freshFs = await import("fs")
+			vi.mocked(freshFs.existsSync).mockImplementation((p) => String(p) === psPath)
+			// Object.assign avoids a type assertion: the fresh mock's getConfiguration
+			// carries the generic inspect<T> signature, which a plain literal stub
+			// cannot satisfy without widening.
+			const freshVscode = await import("vscode")
+			Object.assign(freshVscode.workspace, {
+				getConfiguration: (section?: string) => ({
+					get: () => undefined,
+					has: () => false,
+					inspect: (key: string) => {
+						if (section === "terminal.integrated" && key === "defaultProfile.windows") {
+							return { key, globalValue: "PowerShell" }
+						}
+						if (section === "terminal.integrated.profiles" && key === "windows") {
+							return { key, globalValue: { PowerShell: { path: psPath } } }
+						}
+						return undefined
+					},
+					update: async () => {},
+				}),
+			})
+			const { getShell: freshGetShell } = await import("../shell")
+			expect(freshGetShell()).toBe("C:\\Windows\\System32\\cmd.exe")
+		})
+	})
 })
