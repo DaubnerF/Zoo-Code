@@ -110,6 +110,28 @@ describe("getPoeModels", () => {
 		})
 	})
 
+	it("accepts an abort signal without changing results (SDK exposes no cancellation surface)", async () => {
+		mockFetchPoeModels.mockResolvedValue([])
+		mockGetModels.mockReturnValue([
+			{
+				id: "some-model",
+				rawId: "some-model",
+				contextWindow: 4096,
+				maxOutputTokens: 1024,
+				supportsImages: false,
+				supportsPromptCache: false,
+			},
+		])
+		const controller = new AbortController()
+
+		const models = await getPoeModels("key", undefined, { signal: controller.signal })
+
+		// The signal is accepted for interface parity; the Poe SDK call is
+		// issued unchanged because the client exposes no cancellation option.
+		expect(mockFetchPoeModels).toHaveBeenCalledWith({ apiKey: "key", baseURL: undefined })
+		expect(models["some-model"]).toBeDefined()
+	})
+
 	it("maps supportsReasoningEffort when present", async () => {
 		mockFetchPoeModels.mockResolvedValue([])
 		mockGetModels.mockReturnValue([
