@@ -135,6 +135,25 @@ describe("Task.ask resolves blanket command denials with structured detail", () 
 		const addToClineMessages = task["addToClineMessages"] as ReturnType<typeof vi.fn>
 		expect(addToClineMessages.mock.calls[0][0].autoApprovalDecision).toBe("deny")
 	})
+
+	it("routes a forwarded DCG verdict into the policy decision", async () => {
+		// The seam: Task.ask must hand the tool-supplied verdict to
+		// checkAutoApproval. Without the forwarding this DCG-enabled ask
+		// (verdict-less from checkAutoApproval's view) approves instead of
+		// carrying the guard's structured denial.
+		state.destructiveCommandGuardEnabled = true
+		const task = buildTask(provider, TASK_CWD)
+		await attachQueue(task)
+
+		const result = await task.ask("command", "rm x", false, undefined, false, {
+			dcgDecision: { decision: "deny", reason: "matches a destructive pattern" },
+		})
+
+		expect(result.response).toBe("noButtonClicked")
+		expect(result.autoDenyDetail?.kind).toBe("dcg")
+		expect(result.autoDenyDetail?.command).toBe("rm x")
+		expect(result.autoDenyDetail?.dcgReason).toBe("matches a destructive pattern")
+	})
 })
 
 describe("Task.ask queue path cannot bypass blanket deny", () => {
@@ -161,10 +180,9 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		const task = buildTask(provider, TASK_CWD)
 		const queue = await attachQueue(task)
 		// A queued message answers command asks with an unconditional
-		// yesButtonClicked — one of the two sequences that could bypass blanket
-		// deny (the other was DCG-enabled approval without a guard verdict). The
-		// policy denial must win, and it must carry the same structured detail
-		// as the main path.
+		// yesButtonClicked — exactly the shortcut that must never stand in for
+		// approval while blanket deny is engaged. The policy denial must win,
+		// and it must carry the same structured detail as the main path.
 		queue.addMessage("queued feedback arriving while blanket deny is engaged")
 
 		const result = await task.ask("command", "rm x", false)

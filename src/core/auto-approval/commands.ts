@@ -263,9 +263,10 @@ export function getCommandDecision(
 }
 
 /**
- * Extended result of {@link getCommandDecisionDetailed}, naming the specific
- * sub-command responsible for the decision so automatic denials can tell the
- * model exactly what went wrong.
+ * Result of {@link getCommandDecisionDetailed}: {@link getCommandDecision}'s
+ * plain decision plus the offending sub-command and the matched pattern that
+ * produced it, so automatic denials can tell the model exactly what went
+ * wrong.
  */
 export interface CommandDecisionDetail {
 	decision: CommandDecision

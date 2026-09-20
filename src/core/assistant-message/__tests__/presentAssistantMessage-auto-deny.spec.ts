@@ -5,6 +5,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest"
 import { presentAssistantMessage } from "../presentAssistantMessage"
 import { validateToolUse } from "../../tools/validateToolUse"
 import type { Task } from "../../task/Task"
+import type { AskApproval } from "../../../shared/tools"
 
 vi.mock("../../task/Task")
 vi.mock("../../tools/validateToolUse", async (importOriginal) => {
@@ -161,6 +162,9 @@ const NOT_ALLOWLISTED_DETAIL = {
 	kind: "not_allowlisted" as const,
 	command: "rm x && npm test",
 }
+
+const DCG_ALLOW = { decision: "allow" } as const
+const AUTO_APPROVAL_CONTEXT = { dcgDecision: DCG_ALLOW }
 
 describe("presentAssistantMessage - automatic (policy) denials", () => {
 	let mockTask: MockTask
@@ -330,5 +334,61 @@ describe("presentAssistantMessage - automatic (policy) denials", () => {
 		expect(payload.status).toBe("denied")
 		expect(payload.feedback).toBe("do not run that")
 		expect(payload.type).toBeUndefined()
+	})
+
+	it("forwards autoApprovalContext from the tool askApproval copy into cline.ask", async () => {
+		mockTask.assistantMessageContent = [executeCommandBlock]
+
+		// The seam: whatever a tool hands to askApproval must reach Task.ask
+		// positionally — dropping the argument re-opens the DCG-context bypass.
+		executeCommandHandle.mockImplementation(
+			async (_task: unknown, _block: unknown, { askApproval }: { askApproval: AskApproval }) => {
+				await askApproval("command", "rm x", undefined, false, AUTO_APPROVAL_CONTEXT)
+			},
+		)
+
+		await presentAssistantMessage(mockTask as unknown as Task)
+
+		expect(mockTask.ask).toHaveBeenCalledWith("command", "rm x", false, undefined, false, AUTO_APPROVAL_CONTEXT)
+	})
+
+	it("forwards autoApprovalContext from the MCP askApproval copy into cline.ask", async () => {
+		mockTask.assistantMessageContent = [
+			{
+				type: "mcp_tool_use",
+				id: "call_mcp",
+				name: "mcp_my_server_do_thing",
+				serverName: "my_server",
+				toolName: "do_thing",
+				arguments: {},
+				partial: false,
+			},
+		]
+
+		mockTask.providerRef = {
+			deref: () => ({
+				getState: vi.fn().mockResolvedValue({ mode: "code", customModes: [] }),
+				getMcpHub: () => ({ findServerNameBySanitizedName: () => undefined }),
+			}),
+		}
+
+		// The same seam on the mcp_tool_use copy of the closure: the context
+		// must survive the positional forwarding to cline.ask here too.
+		useMcpToolHandle.mockImplementation(
+			async (_task: unknown, _block: unknown, { askApproval }: { askApproval: AskApproval }) => {
+				await askApproval("use_mcp_server", "{}", undefined, false, AUTO_APPROVAL_CONTEXT)
+			},
+		)
+
+		await presentAssistantMessage(mockTask as unknown as Task)
+
+		expect(mockTask.ask).toHaveBeenCalledWith(
+			"use_mcp_server",
+			"{}",
+			false,
+			undefined,
+			false,
+			AUTO_APPROVAL_CONTEXT,
+		)
 	})
 })
