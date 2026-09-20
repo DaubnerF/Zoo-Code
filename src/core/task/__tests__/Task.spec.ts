@@ -22,6 +22,7 @@ import { MODEL_FETCH_TIMEOUT_MS, Task } from "../Task"
 import { SYSTEM_PROMPT } from "../../prompts/system"
 import { createRateLimitClock } from "../RateLimitClock"
 import { summarizeConversation } from "../../condense"
+import { getEnvironmentDetails } from "../../environment/getEnvironmentDetails"
 import { ClineProvider } from "../../webview/ClineProvider"
 import { ApiStreamChunk } from "../../../api/transform/stream"
 import { ContextProxy } from "../../config/ContextProxy"
@@ -34,7 +35,7 @@ import { McpServerManager } from "../../../services/mcp/McpServerManager"
 
 type TaskTestAccess = {
 	getSystemPrompt: (requestState: ProviderState | undefined, requestModelInfo?: ModelInfo) => Promise<string>
-	handleContextWindowExceededError: () => Promise<void>
+	handleContextWindowExceededError: (requestModelInfo: ModelInfo) => Promise<void>
 	getEnabledMcpToolsCount: () => Promise<{ enabledToolCount: number; enabledServerCount: number }>
 	initiateTaskLoop: (userContent: Anthropic.Messages.ContentBlockParam[]) => Promise<void>
 	startTask: (task?: string, images?: string[]) => Promise<void>
@@ -44,6 +45,7 @@ type TaskTestAccess = {
 	updateClineMessage: (message: import("@roo-code/types").ClineMessage) => Promise<void>
 	saveClineMessages: () => Promise<boolean>
 	safeEnsureModelFetched: () => Promise<ModelInfo>
+	getFilesReadByRooSafely: (context: string) => Promise<string[] | undefined>
 	addToApiConversationHistory: (message: unknown, reasoning?: string) => Promise<void>
 	resetAssistantMessagePersistence: () => void
 	buildCleanConversationHistory: (
@@ -136,6 +138,15 @@ vi.mock("fs/promises", async (importOriginal) => {
 
 vi.mock("p-wait-for", () => ({
 	default: vi.fn().mockImplementation(async () => Promise.resolve()),
+}))
+
+// Task tests do not exercise indexing; keep workspace resolution and its cache out of this suite.
+vi.mock("../../../services/code-index/code-index-manager-registry", () => ({
+	CodeIndexManagerRegistry: {
+		getOrCreate: vi.fn().mockReturnValue(undefined),
+		getAllInstances: vi.fn().mockReturnValue([]),
+		disposeAll: vi.fn(),
+	},
 }))
 
 vi.mock("vscode", () => {
@@ -1183,12 +1194,12 @@ describe("Cline", () => {
 				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
 				.mockResolvedValue("mock system prompt")
 
-			await getTaskTestAccess(task).handleContextWindowExceededError()
+			await getTaskTestAccess(task).handleContextWindowExceededError(ctxModelInfo)
 
 			// Reference equality: without threading, the arguments would be
 			// undefined and getSystemPrompt would re-read the divergent state and
-			// the model info; the second argument must be the same settled snapshot
-			// the handler exposes.
+			// the model info; the second argument must be the snapshot threaded
+			// into the handler, not a fresh re-read.
 			expect(getSystemPromptSpy).toHaveBeenCalledWith(snapshot, ctxModelInfo)
 		})
 
@@ -3778,6 +3789,204 @@ describe("Cline", () => {
 				expect(options.metadata?.abortSignal).toBeInstanceOf(AbortSignal)
 				expect(options.metadata?.abortSignal?.aborted).toBe(false)
 			})
+
+			// Shared harness for the retry-options-forwarding tests: the first
+			// createMessage fails on the first chunk, the retry attempt streams a
+			// success chunk, and the attemptApiRequest spy exposes the arguments
+			// each retry site's recursion passes downstream. A same-reference
+			// assertion on options is the point: a rebuilt object would silently
+			// refetch model metadata and restart the rate-limit wait on retries.
+			async function createRetryForwardingTask(stateOverrides: Partial<ProviderState> = {}) {
+				vi.spyOn(mockProvider, "getState").mockResolvedValue(
+					providerStateWith({
+						autoApprovalEnabled: false,
+						requestDelaySeconds: 0,
+						...stateOverrides,
+					}),
+				)
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				await task.getTaskMode()
+				vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockResolvedValue("mock system prompt")
+				vi.spyOn(task, "getTokenUsage").mockReturnValue({
+					totalCost: 0,
+					totalTokensIn: 0,
+					totalTokensOut: 0,
+					contextTokens: 0,
+				})
+				vi.spyOn(task, "say").mockResolvedValue(undefined)
+				task.apiConversationHistory = [
+					{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+				]
+				return task
+			}
+
+			const failingStream = (error: unknown): AsyncGenerator<ApiStreamChunk> =>
+				(async function* () {
+					// Yield nothing, then fail the first next() like a first-chunk
+					// stream error would.
+					yield* []
+					throw error
+				})()
+
+			const retryForwardingOptions = (): { skipProviderRateLimit: boolean; requestModelInfo: ModelInfo } => ({
+				skipProviderRateLimit: true,
+				requestModelInfo: { contextWindow: 200_000, maxTokens: 4096, supportsPromptCache: true },
+			})
+
+			it("forwards the caller's options to the context-window retry recursion", async () => {
+				const task = await createRetryForwardingTask()
+				vi.spyOn(getTaskTestAccess(task), "handleContextWindowExceededError").mockResolvedValue(undefined)
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 400, message: "context length exceeded" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const options = retryForwardingOptions()
+				const iterator = task.attemptApiRequest(0, options)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(1)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]).toBe(options)
+			})
+
+			it("forwards the caller's options to the auto-approval backoff retry recursion", async () => {
+				const task = await createRetryForwardingTask({ autoApprovalEnabled: true })
+				// An ask landing here means the auto-approval branch was not taken,
+				// so the rejection names the wrong-site failure explicitly.
+				vi.spyOn(task, "ask").mockRejectedValue(new Error("auto-approval retry must not prompt the user"))
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 500, message: "server error" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const options = retryForwardingOptions()
+				const iterator = task.attemptApiRequest(0, options)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(1)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]).toBe(options)
+			})
+
+			it("forwards the caller's options and resets the counter on the user-clicked retry recursion", async () => {
+				const task = await createRetryForwardingTask()
+				vi.spyOn(task, "ask").mockResolvedValue({ response: "yesButtonClicked" } satisfies TaskAskResult)
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 500, message: "server error" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const options = retryForwardingOptions()
+				const iterator = task.attemptApiRequest(0, options)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				// The user-confirmed retry restarts the retry counter at 0 (its own
+				// pacing is the user's click), unlike the automatic backoff retries.
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(0)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]).toBe(options)
+			})
+
+			it("carries the derived model snapshot into the retry recursion when the caller omitted one", async () => {
+				const task = await createRetryForwardingTask()
+				vi.spyOn(getTaskTestAccess(task), "handleContextWindowExceededError").mockResolvedValue(undefined)
+				const safeEnsureModelFetchedSpy = vi
+					.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched")
+					.mockResolvedValue(stubModelInfo)
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 400, message: "context length exceeded" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				// No caller-supplied snapshot: the first hop derives one locally.
+				const iterator = task.attemptApiRequest(0)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+				expect(attemptApiRequestSpy.mock.calls[1]?.[0]).toBe(1)
+				// The retry hop carries the snapshot derived at the first hop, so a
+				// metadata update landing between attempts cannot move model-specific
+				// tool policy mid-request.
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]?.requestModelInfo).toBe(stubModelInfo)
+				// Derivation ran once per logical request, not once per hop.
+				expect(safeEnsureModelFetchedSpy).toHaveBeenCalledTimes(1)
+			})
+
+			it("recovers from a context-window overflow against the pinned request snapshot when metadata changes in between", async () => {
+				// The pinned-snapshot invariant covers the recovery half too:
+				// truncation permanently rewrites apiConversationHistory for the
+				// retry hop to consume, so recovery must size against the same
+				// snapshot the retry uses — never a fresh metadata read that
+				// landed between the failed attempt and recovery.
+				const task = await createRetryForwardingTask()
+				// Distinct object, same window as the stub: identity is what the
+				// retry hop must carry forward.
+				const pinnedInfo: ModelInfo = { ...stubModelInfo }
+				// A narrower window arriving after the first failure would drive
+				// harsher truncation math than the retry hop actually needs.
+				const freshInfo: ModelInfo = { ...stubModelInfo, contextWindow: 32_000 }
+				const safeEnsureModelFetchedSpy = vi
+					.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched")
+					.mockResolvedValueOnce(pinnedInfo)
+					.mockResolvedValue(freshInfo)
+				const getSystemPromptSpy = vi
+					.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+					.mockResolvedValue("mock system prompt")
+				vi.spyOn(task.api, "createMessage")
+					.mockImplementationOnce(() => failingStream({ status: 400, message: "context length exceeded" }))
+					.mockImplementationOnce(() =>
+						asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "retry response" }]),
+					)
+
+				const attemptApiRequestSpy = vi.spyOn(task, "attemptApiRequest")
+				const iterator = task.attemptApiRequest(0)
+
+				await expect(iterator.next()).resolves.toMatchObject({
+					done: false,
+					value: { type: "text", text: "retry response" },
+				})
+
+				// hop 1 prompt, the recovery handler's condensing prompt, hop 2 prompt.
+				expect(getSystemPromptSpy).toHaveBeenCalledTimes(3)
+				// Without threading, the handler re-fetches and this second call
+				// carries freshInfo, so truncation is sized against a window the
+				// retry never uses.
+				expect(getSystemPromptSpy.mock.calls[1]?.[1]).toBe(pinnedInfo)
+				// Recovery and the retry hop share one snapshot object.
+				expect(attemptApiRequestSpy.mock.calls[1]?.[1]?.requestModelInfo).toBe(pinnedInfo)
+				// The handler performs no metadata fetch of its own.
+				expect(safeEnsureModelFetchedSpy).toHaveBeenCalledTimes(1)
+			})
 		})
 	})
 
@@ -4067,6 +4276,343 @@ describe("Cline", () => {
 				vi.useRealTimers()
 			}
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
+		})
+
+		it("refuses to send a request when the task is disposed during the bounded metadata wait", async () => {
+			// Disposal alone — no cancel button, no abortTask — must make the
+			// task observe cancellation: disposeOnce sets the abort state
+			// synchronously in its call, before its aborts land, so once the
+			// metadata wait settles at its bound the request-construction
+			// guard refuses to build tools or call createMessage for a task
+			// nobody owns anymore.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			// The wait never settles on its own; only the bound expires it.
+			Object.assign(task.api, { ensureModelFetched: () => new Promise<void>(() => {}) })
+			const createMessageSpy = vi
+				.spyOn(task.api, "createMessage")
+				.mockReturnValue(asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "ok" }]))
+			vi.spyOn(task, "getTokenUsage").mockReturnValue({
+				totalCost: 0,
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				contextTokens: 0,
+			})
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+			vi.useFakeTimers()
+			try {
+				const first = task.attemptApiRequest(0).next()
+				// Observe the rejection the moment it can land: the generator
+				// rejects during the timer advance below, before the assertion
+				// line runs, and an unobserved rejection would surface as an
+				// unhandled rejection independent of the awaited assertion.
+				void first.catch(() => {})
+				await vi.advanceTimersByTimeAsync(0)
+				// The task is disposed while the bounded metadata wait is still
+				// pending; the abort state is set synchronously in this call.
+				const disposal = task.dispose()
+				expect(task.abort).toBe(true)
+				// The wait itself still expires at the bound, as it normally would.
+				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
+
+				await expect(first).rejects.toThrow(/aborted during request construction/)
+				expect(createMessageSpy).not.toHaveBeenCalled()
+				// The per-request controller is only created once the request is
+				// committed, so a disposed construction never reaches it.
+				expect(task.currentRequestAbortController).toBeUndefined()
+				await disposal
+			} finally {
+				vi.useRealTimers()
+			}
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
+		})
+
+		it("stops manual condensation when the task is aborted during the metadata wait", async () => {
+			// Cancellation must be honored before any provider-visible work of
+			// the condense: an abort landing while the metadata wait is pending
+			// ends condenseContext instead of quietly issuing a summarization
+			// request the user already cancelled.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			// The wait never settles on its own; only the bound expires it.
+			Object.assign(task.api, { ensureModelFetched: () => new Promise<void>(() => {}) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			// Spying on the prompt build pins the cancellation to the entry
+			// checkpoint: skipping summarization alone is also achieved by the
+			// check placed after the prompt await, so only an unstarted
+			// prompt build proves the entry check did its work.
+			const promptSpy = vi
+				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+				.mockResolvedValue("mock system prompt")
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this condense starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+			vi.useFakeTimers()
+			try {
+				const condensing = task.condenseContext()
+				await vi.advanceTimersByTimeAsync(0)
+				// The user cancels while the bounded metadata wait is still pending.
+				const cancelling = task.abortTask()
+				// The wait itself still expires at the bound, as it normally would.
+				await vi.advanceTimersByTimeAsync(MODEL_FETCH_TIMEOUT_MS)
+				await condensing
+				await cancelling
+			} finally {
+				vi.useRealTimers()
+			}
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Timed out"))
+			expect(promptSpy).not.toHaveBeenCalled()
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+		})
+
+		it("stops manual condensation on an abandoned task", async () => {
+			// Abandonment is the other cancellation flavor: the metadata wait
+			// settles normally, yet condenseContext must still end before the
+			// prompt build and the summarization request.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.abandoned = true
+			// Only an unstarted prompt build attributes the skip to the entry
+			// checkpoint rather than one of the later cancellation checks.
+			const promptSpy = vi
+				.spyOn(getTaskTestAccess(task), "getSystemPrompt")
+				.mockResolvedValue("mock system prompt")
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+
+			await task.condenseContext()
+
+			expect(promptSpy).not.toHaveBeenCalled()
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+		})
+
+		it("stops manual condensation when the task is aborted while the system prompt is pending", async () => {
+			// A cancellation landing inside the prompt build (whose bounded MCP
+			// wait is cancellation-blind) must stop condenseContext before it
+			// issues the summarization request. The prompt gate is released only
+			// after abortTask has synchronously set its flag, so whenever the
+			// prompt await resumes the cancellation is observed.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			let resolvePrompt!: (value: string) => void
+			const promptGate = new Promise<string>((resolve) => {
+				resolvePrompt = resolve
+			})
+			const promptSpy = vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockReturnValue(promptGate)
+			// The early return this guards never reaches say; the spy only keeps
+			// the aborted task's post-overwrite say from throwing before the
+			// summarize/overwrite assertions can report a regression.
+			vi.spyOn(task, "say").mockResolvedValue(undefined)
+			const overwriteSpy = vi.spyOn(task, "overwriteApiConversationHistory").mockResolvedValue(undefined)
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this condense starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+			// Attribution pin: the summarize-count assertion alone is also
+			// satisfied by the later input-gathering checkpoint, so the collectors
+			// must additionally stay unstarted to prove THIS prompt-boundary check
+			// (not a downstream one) stopped the condense.
+			const envCallsBefore = vi.mocked(getEnvironmentDetails).mock.calls.length
+			const filesReadSpy = vi.spyOn(getTaskTestAccess(task), "getFilesReadByRooSafely")
+
+			const condensing = task.condenseContext()
+			// Suspend inside the prompt build, past the entry guard, so this
+			// exercises the prompt-boundary check rather than the entry one.
+			await vi.waitFor(() => expect(promptSpy).toHaveBeenCalled())
+			const cancelling = task.abortTask()
+			resolvePrompt("mock system prompt")
+			await condensing
+			await cancelling
+
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+			expect(overwriteSpy).not.toHaveBeenCalled()
+			expect(vi.mocked(getEnvironmentDetails).mock.calls.length).toBe(envCallsBefore)
+			expect(filesReadSpy).not.toHaveBeenCalled()
+		})
+
+		it("stops manual condensation from overwriting history when the task is aborted during summarization", async () => {
+			// The summarization round-trip is the widest cancellation window on
+			// the condense path: a cancellation landing while it is pending must
+			// stop condenseContext before it replaces and persists the history.
+			// The gate is released only after abortTask has synchronously set
+			// its flag, so whenever the summarize await resumes the cancellation
+			// is observed.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockResolvedValue("mock system prompt")
+			// The early return this guards never reaches say; the spy only keeps
+			// the aborted task's post-overwrite say from throwing before the
+			// overwrite assertion can report the regression.
+			const saySpy = vi.spyOn(task, "say").mockResolvedValue(undefined)
+			const overwriteSpy = vi.spyOn(task, "overwriteApiConversationHistory").mockResolvedValue(undefined)
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this condense starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+			type SummarizeResult = Awaited<ReturnType<typeof summarizeConversation>>
+			let releaseSummarize!: (value: SummarizeResult) => void
+			const summarizeGate = new Promise<SummarizeResult>((resolve) => {
+				releaseSummarize = resolve
+			})
+			vi.mocked(summarizeConversation).mockImplementationOnce(() => summarizeGate)
+
+			const condensing = task.condenseContext()
+			await vi.waitFor(() =>
+				expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore + 1),
+			)
+			const cancelling = task.abortTask()
+			releaseSummarize({
+				messages: [{ role: "user", content: [{ type: "text", text: "condensed" }], ts: Date.now() }],
+				summary: "summary",
+				cost: 0,
+				newContextTokens: 1,
+			})
+			await condensing
+			await cancelling
+
+			expect(overwriteSpy).not.toHaveBeenCalled()
+			expect(saySpy).not.toHaveBeenCalled()
+		})
+
+		it("stops manual condensation when the task is aborted while environment details are pending", async () => {
+			// Gathering the summary inputs suspends twice before the
+			// summarization request: a cancellation landing while the
+			// environment-details collector is pending must stop condenseContext
+			// before any summarization request or history rewrite is issued.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockResolvedValue("mock system prompt")
+			vi.spyOn(task, "say").mockResolvedValue(undefined)
+			const overwriteSpy = vi.spyOn(task, "overwriteApiConversationHistory").mockResolvedValue(undefined)
+			// Suspend inside the collector so the abort lands while the
+			// summarization request cannot have started yet.
+			let releaseEnvDetails!: (value: string) => void
+			const envDetailsGate = new Promise<string>((resolve) => {
+				releaseEnvDetails = resolve
+			})
+			vi.mocked(getEnvironmentDetails).mockReturnValueOnce(envDetailsGate)
+			// The summarizeConversation module mock is never cleared, so pin the
+			// call count this condense starts from.
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+			// Same for the environment-details module mock: waiting on a count
+			// delta proves THIS condense reached the collector before the abort.
+			const envCallsBefore = vi.mocked(getEnvironmentDetails).mock.calls.length
+
+			const condensing = task.condenseContext()
+			await vi.waitFor(() => expect(vi.mocked(getEnvironmentDetails).mock.calls.length).toBe(envCallsBefore + 1))
+			const cancelling = task.abortTask()
+			releaseEnvDetails("")
+			await condensing
+			await cancelling
+
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+			expect(overwriteSpy).not.toHaveBeenCalled()
+		})
+
+		it("stops manual condensation when the task is aborted while the files-read collector is pending", async () => {
+			// The second input-gathering suspension sits between the
+			// environment-details collector and the summarization request: a
+			// cancellation landing while the files-read collector is pending must
+			// likewise stop condenseContext before either is issued.
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await task.getTaskMode()
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(providerStateWith())
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
+			vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+			Object.assign(task.api, { ensureModelFetched: vi.fn().mockResolvedValue(undefined) })
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockResolvedValue("mock system prompt")
+			vi.spyOn(task, "say").mockResolvedValue(undefined)
+			const overwriteSpy = vi.spyOn(task, "overwriteApiConversationHistory").mockResolvedValue(undefined)
+			let releaseFilesRead!: (value: string[] | undefined) => void
+			const filesReadGate = new Promise<string[] | undefined>((resolve) => {
+				releaseFilesRead = resolve
+			})
+			const filesReadSpy = vi
+				.spyOn(getTaskTestAccess(task), "getFilesReadByRooSafely")
+				.mockReturnValue(filesReadGate)
+			const summarizeCallsBefore = vi.mocked(summarizeConversation).mock.calls.length
+
+			const condensing = task.condenseContext()
+			await vi.waitFor(() => expect(filesReadSpy).toHaveBeenCalled())
+			const cancelling = task.abortTask()
+			releaseFilesRead(undefined)
+			await condensing
+			await cancelling
+
+			expect(vi.mocked(summarizeConversation).mock.calls.length).toBe(summarizeCallsBefore)
+			expect(overwriteSpy).not.toHaveBeenCalled()
 		})
 
 		it("calls safeEnsureModelFetched from attemptApiRequest when context tokens are present", async () => {

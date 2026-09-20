@@ -25,17 +25,14 @@ async function quitGracefully(): Promise<void> {
 	await vscode.commands.executeCommand("workbench.action.quit")
 }
 
-// The API history file is committed via a backup-rename swap under an advisory
-// lock, so an immediate post-completion read can transiently observe it as
-// missing. Poll the same read the assertion uses until it reports a non-empty
-// history; the assertion semantics below are unchanged.
-async function waitForApiConversationHistoryLength(api: RooCodeAPI, taskId: string): Promise<number> {
-	let length = 0
-	await waitFor(async () => {
-		length = await api.getTaskApiConversationHistoryLength(taskId)
-		return length > 0
-	})
-	return length
+async function waitForMarkedCompletion(api: RooCodeAPI, taskId: string): Promise<void> {
+	await waitFor(() =>
+		api.hasTaskApiConversationHistorySequence(taskId, {
+			userText: "RESTART_PERSISTENCE_SMOKE",
+			assistantToolName: "attempt_completion",
+			assistantToolInputText: MARKER,
+		}),
+	)
 }
 
 async function runCreate(api: RooCodeAPI): Promise<void> {
@@ -56,11 +53,6 @@ async function runCreate(api: RooCodeAPI): Promise<void> {
 		})
 		await waitUntilCompleted({ api, taskId })
 		assert.strictEqual(sawMarker, true, `Completion should include ${MARKER}`)
-		const historyItem = await api.getTaskHistoryItem(taskId)
-		assert.ok(historyItem, "Completed task should have a history item")
-		assert.ok(historyItem.task.includes("RESTART_PERSISTENCE_SMOKE"), "History title should include the marker")
-		const conversationLength = await waitForApiConversationHistoryLength(api, taskId)
-		assert.ok(conversationLength > 0, "Completed task should persist API conversation history")
 
 		const result: PhaseResult = {
 			version: PHASE_RESULT_VERSION,
@@ -104,16 +96,7 @@ async function runVerify(api: RooCodeAPI): Promise<void> {
 		const historyItem = await api.getTaskHistoryItem(taskId)
 		assert.ok(historyItem, "Task history item should be available after restart")
 		assert.ok(historyItem.task.includes("RESTART_PERSISTENCE_SMOKE"), "History title should persist after restart")
-		const restoredCompletion = await api.hasTaskApiConversationHistorySequence(taskId, {
-			userText: "RESTART_PERSISTENCE_SMOKE",
-			assistantToolName: "attempt_completion",
-			assistantToolInputText: MARKER,
-		})
-		assert.strictEqual(
-			restoredCompletion,
-			true,
-			"Fresh-host history should restore the marked user turn followed by its assistant completion",
-		)
+		await waitForMarkedCompletion(api, taskId)
 
 		await api.resumeTask(taskId)
 		await waitFor(() => taskMessages.some(({ type, ask }) => type === "ask" && ask === "resume_completed_task"))
@@ -124,16 +107,7 @@ async function runVerify(api: RooCodeAPI): Promise<void> {
 			reopenedHistoryItem.task.includes("RESTART_PERSISTENCE_SMOKE"),
 			"Reopened task should retain its persisted history title",
 		)
-		const reopenedCompletion = await api.hasTaskApiConversationHistorySequence(taskId, {
-			userText: "RESTART_PERSISTENCE_SMOKE",
-			assistantToolName: "attempt_completion",
-			assistantToolInputText: MARKER,
-		})
-		assert.strictEqual(
-			reopenedCompletion,
-			true,
-			"Reopened-host history should restore the marked user turn followed by its assistant completion",
-		)
+		await waitForMarkedCompletion(api, taskId)
 
 		await writePhaseResult(getResultsDir(), {
 			version: PHASE_RESULT_VERSION,

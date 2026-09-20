@@ -7,11 +7,10 @@ import { getToolUseGuidelinesSection } from "../sections/tool-use-guidelines"
 import { getSkillsSection } from "../sections/skills"
 import type { EffectiveToolPolicy } from "../tools/effective-tool-policy"
 import { resolveEffectiveToolPolicy } from "../tools/effective-tool-policy"
-import type { EffectiveToolPolicyInput } from "../tools/effective-tool-policy"
 import type { GroupEntry, ModelInfo } from "@roo-code/types"
-import { McpHub } from "../../../services/mcp/McpHub"
 import type { CodeIndexManager } from "../../../services/code-index/manager"
 import type { SkillsManager } from "../../../services/skills/SkillsManager"
+import type { SkillMetadata } from "../../../shared/skills"
 import * as shellUtils from "../../../utils/shell"
 
 // Mock os-name so getSystemInfoSection never spawns PowerShell on Windows (cold
@@ -30,7 +29,7 @@ vi.mock("os-name", () => ({
 function policyFor(
 	groups: GroupEntry[],
 	extra: Partial<{
-		mcpHub: McpHub
+		mcpHub: ReturnType<typeof makeMcpHub>
 		disabledTools: string[]
 		modelInfo: ModelInfo
 		experiments: Record<string, boolean>
@@ -47,20 +46,30 @@ function policyFor(
 }
 
 /** Minimal McpHub stub. `tools`/`resources` mirror the McpServer shape the resolver reads. */
-function makeMcpHub(servers: Array<{ name: string; tools?: unknown[]; resources?: unknown[] }>): McpHub {
-	return { getServers: () => servers } as unknown as McpHub
+function makeMcpHub(
+	servers: Array<{
+		name: string
+		tools?: Array<{ name: string; description?: string; enabledForPrompt?: boolean }>
+		resources?: Array<{ uri: string; name?: string }>
+	}>,
+) {
+	return { getServers: () => servers }
 }
 
 /** Minimal SkillsManager stub returning a fixed skill list. */
-function makeSkillsManager(n: number): SkillsManager {
+function makeSkillsManager(n: number): Pick<SkillsManager, "getSkillsForMode"> {
 	return {
 		getSkillsForMode: () =>
-			Array.from({ length: n }, (_, i) => ({
-				name: `skill-${i}`,
-				description: `Skill ${i}`,
-				path: `./skills/${i}`,
-			})),
-	} as unknown as SkillsManager
+			Array.from(
+				{ length: n },
+				(_, i): SkillMetadata => ({
+					name: `skill-${i}`,
+					description: `Skill ${i}`,
+					path: `./skills/${i}`,
+					source: "global",
+				}),
+			),
+	}
 }
 
 describe("addCustomInstructions", () => {
@@ -137,11 +146,38 @@ describe("getCapabilitiesSection", () => {
 		expect(result).toContain("MCP servers")
 		expect(result).not.toContain("accomplish tasks more effectively. (in this mode")
 		expect(result).toContain("write and edit files. (in this mode only files matching")
+		// This is the only fixture whose restriction carries no description, so the
+		// empty description-suffix branch must render nothing. "Stryker was here"
+		// (no trailing !) covers both the StringLiteral and ArrayDeclaration
+		// sentinel replacements Stryker injects.
+		expect(result).not.toContain("Stryker was here")
 	})
 
 	it("omits the edit-restriction suffix without a fileRegex", () => {
 		const result = getCapabilitiesSection(policyFor(["read", "edit"]))
 		expect(result).not.toContain("only files matching")
+	})
+
+	it("omits the edit-restriction suffix when no edit tool is available", () => {
+		const result = getCapabilitiesSection(
+			policyFor([["edit", { fileRegex: "\\.md$" }]], { disabledTools: ["write_to_file", "apply_diff"] }),
+		)
+		expect(result).not.toContain("only files matching")
+	})
+
+	it("keeps the capability clause and restriction for a model-included standalone edit tool", () => {
+		// The restricted edit group's default edit tools are disabled, but the
+		// model catalog re-adds the standalone `edit` tool: it is still an edit
+		// capability, so the clause and the file restriction both render.
+		const result = getCapabilitiesSection(
+			policyFor([["edit", { fileRegex: "\\.md$", description: "Markdown files only" }]], {
+				disabledTools: ["write_to_file", "apply_diff"],
+				modelInfo: { contextWindow: 128_000, supportsPromptCache: true, includedTools: ["edit"] },
+			}),
+		)
+
+		expect(result).toContain("write and edit files")
+		expect(result).toContain("(in this mode only files matching '\\.md$' can be edited — Markdown files only)")
 	})
 
 	it("lists files guidance only when list_files is available", () => {
@@ -280,13 +316,6 @@ describe("getRulesSection", () => {
 		expect(result).toContain("Actively Running Terminals")
 	})
 
-	it("does not contain the removed hardcoded architect example line", () => {
-		const result = getRulesSection(cwd, settings, policyFor(["read", "edit", "command"]))
-
-		expect(result).not.toContain("in architect mode")
-		expect(result).not.toContain("trying to edit app.js")
-	})
-
 	it("uses ask_followup_question when the tool is available", () => {
 		const result = getRulesSection(cwd, settings, policyFor(["read"]))
 		expect(result).toContain("ask the user questions using the ask_followup_question tool")
@@ -326,6 +355,7 @@ describe("getRulesSection", () => {
 			policyFor(["command"], { disabledTools: ["ask_followup_question"] }),
 		)
 		expect(withoutAsk).toContain("When executing commands")
+		expect(withoutAsk).toContain("note what you expected and proceed with the task, stating your assumptions")
 		expect(withoutAsk).not.toContain("ask_followup_question")
 
 		const withAsk = getRulesSection(cwd, settings, policyFor(["command"]))
@@ -350,11 +380,7 @@ describe("getRulesSection", () => {
 		expect(result).toContain("RULES")
 	})
 
-	it("states the attempt_completion protocol rule unconditionally", () => {
-		// The completion sentence is protocol wording — emitted even when the policy
-		// does not advertise attempt_completion. A raw literal is required: the
-		// resolver-backed policyFor cannot express this (protocol guarantee re-adds the
-		// tool in resolveEffectiveToolPolicy step 11).
+	it("uses tool-neutral completion guidance when attempt_completion is unavailable", () => {
 		const rawPolicy: EffectiveToolPolicy = {
 			tools: new Set<string>(["read_file"]),
 			hasMcpGroup: false,
@@ -363,9 +389,28 @@ describe("getRulesSection", () => {
 		}
 
 		expect(rawPolicy.tools.has("attempt_completion")).toBe(false)
-		expect(getRulesSection(cwd, settings, rawPolicy)).toContain(
-			"you must use the attempt_completion tool to present the result to the user",
-		)
+		const result = getRulesSection(cwd, settings, rawPolicy)
+		expect(result).not.toContain("attempt_completion")
+		expect(result).toContain("present the result to the user")
+	})
+
+	it("only emits file-restriction guidance for an effective restricted edit tool", () => {
+		const restricted = policyFor([["edit", { fileRegex: "\\.md$" }]])
+		expect(getRulesSection(cwd, settings, restricted)).toContain("FileRestrictionError")
+
+		const disabled = policyFor([["edit", { fileRegex: "\\.md$" }]], {
+			disabledTools: ["write_to_file", "apply_diff"],
+		})
+		expect(getRulesSection(cwd, settings, disabled)).not.toContain("FileRestrictionError")
+	})
+
+	it.each([
+		["tools", makeMcpHub([{ name: "s", tools: [{ name: "t" }] }]), true],
+		["resources", makeMcpHub([{ name: "s", resources: [{ uri: "r", name: "r" }] }]), true],
+		["neither", makeMcpHub([{ name: "s" }]), false],
+	] as const)("gates MCP rules for a hub with %s", (_case, mcpHub, expected) => {
+		const result = getRulesSection(cwd, settings, policyFor(["mcp"], { mcpHub }))
+		expect(result.includes("MCP operations should be used one at a time")).toBe(expected)
 	})
 })
 

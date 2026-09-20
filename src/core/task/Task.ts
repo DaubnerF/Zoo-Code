@@ -156,8 +156,8 @@ const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 // getModel().info metadata — the same degradation a rejected fetch produces.
 // Kept in sync with PREVIEW_MODEL_FETCH_TIMEOUT_MS in the preview path
 // (src/core/webview/generateSystemPrompt.ts). Deliberately duplicated, not
-// shared: importing from the webview layer would close the
-// Task -> generateSystemPrompt -> ClineProvider -> Task import cycle.
+// shared: importing from the webview layer would close a
+// Task -> generateSystemPrompt -> ClineProvider -> Task circular import.
 export const MODEL_FETCH_TIMEOUT_MS = 5_000
 const QUEUED_FEEDBACK_SAVE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const
 
@@ -189,13 +189,6 @@ function queuedResponseForAsk(type: ClineAsk, text?: string): QueuedAskResolutio
 
 const FORCED_CONTEXT_REDUCTION_PERCENT = 75 // Keep 75% of context (remove 25%) on context window errors
 const MAX_CONTEXT_WINDOW_RETRIES = 3 // Maximum retries for context window errors
-
-/**
- * Provider state snapshot threaded from request entry points (attemptApiRequest,
- * condenseContext, handleContextWindowExceededError) into `getSystemPrompt` so the
- * prompt and the runtime tool array resolve from one consistent set of values.
- */
-type SystemPromptRequestState = Awaited<ReturnType<ClineProvider["getState"]>>
 
 export interface TaskOptions extends CreateTaskOptions {
 	provider: ClineProvider
@@ -1943,7 +1936,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const state = await this.providerRef.deref()?.getState()
 		const requestModelInfo = await this.safeEnsureModelFetched()
 
+		// A cancellation landing during the bounded metadata wait must stop
+		// manual condensation before any prompt build or summarization request.
+		if (this.abort || this.abandoned) {
+			return
+		}
+
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
+
+		// A cancellation landing during the prompt build's bounded MCP wait must
+		// stop manual condensation before any summarization request is issued.
+		if (this.abort || this.abandoned) {
+			return
+		}
 
 		// Get condensing configuration
 		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
@@ -1993,6 +1998,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		const filesReadByRoo = await this.getFilesReadByRooSafely("condenseContext")
 
+		// A cancellation landing while the summarization inputs are gathered must
+		// stop manual condensation before any summarization request is issued.
+		if (this.abort || this.abandoned) {
+			return
+		}
+
 		const {
 			messages,
 			summary,
@@ -2014,6 +2025,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			cwd: this.cwd,
 			rooIgnoreController: this.rooIgnoreController,
 		})
+		// A cancellation landing during the summarization request must stop
+		// manual condensation before it replaces and persists the history.
+		if (this.abort || this.abandoned) {
+			return
+		}
 		if (error) {
 			await this.say(
 				"condense_context_error",
@@ -2803,6 +2819,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		} catch (error) {
 			console.error("Error flushing shutdown telemetry:", error)
 		}
+
+		// A task being disposed is no longer serving requests: set the same
+		// cancellation state `abortTask()` sets, synchronously before the aborts
+		// below, so the request-construction guard (`abort || abandoned` in
+		// attemptApiRequest) and the outer loop's `abort` checks observe disposal
+		// even when it lands before any explicit cancel. Without this, only the
+		// signals below are cancelled and a request already past those checks
+		// could still build tools and call `createMessage()`.
+		this.abort = true
 
 		// Cancel any in-progress HTTP request
 		try {
@@ -4262,17 +4287,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/**
 	 * Builds the SYSTEM_PROMPT from the caller's provider-state snapshot. This
 	 * method never reads provider state itself: callers that also construct
-	 * runtime tools for the same request must thread the very snapshot they build
-	 * those tools from, or a settings change during the MCP wait can make the
-	 * prompt advertise a tool the runtime rejects, or hide a callable tool. An
-	 * `undefined` snapshot declares that the caller's own read came back empty
-	 * because the provider was already gone; the prompt then resolves from
-	 * defaults. Pass `requestModelInfo` (captured via safeEnsureModelFetched) in
-	 * the same situation so the prompt's tool guidance and the request's tool
-	 * arrays resolve from one model-metadata snapshot.
+	 * runtime tools for the same request (attemptApiRequest, condenseContext,
+	 * handleContextWindowExceededError) must thread the very snapshot they build
+	 * those tools from, so the prompt and the runtime tool array resolve from one
+	 * consistent set of values — otherwise a settings change during the MCP wait
+	 * can make the prompt advertise a tool the runtime rejects, or hide a
+	 * callable tool. An `undefined` snapshot declares that the caller's own read
+	 * came back empty because the provider was already gone; the prompt then
+	 * resolves from defaults. Pass `requestModelInfo` (captured via
+	 * safeEnsureModelFetched) in the same situation so the prompt's tool
+	 * guidance and the request's tool arrays resolve from one model-metadata
+	 * snapshot.
 	 */
 	private async getSystemPrompt(
-		requestState: SystemPromptRequestState | undefined,
+		requestState: Awaited<ReturnType<ClineProvider["getState"]>> | undefined,
 		requestModelInfo?: ModelInfo,
 	): Promise<string> {
 		const { mcpEnabled } = requestState ?? {}
@@ -4365,17 +4393,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * leaving a handler-side promise waiting on it indefinitely.
 	 *
 	 * The return value is the settled post-wait read of getModel().info: request
-	 * entry points (attemptApiRequest, condenseContext,
-	 * handleContextWindowExceededError) await this once before prompt generation
-	 * and share the returned snapshot between getSystemPrompt and every tool-array
-	 * build of the same request, so a fetch that resolves after the bounded wait
-	 * was abandoned cannot move model-specific tool policy between prompt time and
-	 * request time. Callers that do not thread a snapshot keep awaiting this
-	 * immediately before their own getModel() read; that per-site guard remains the
-	 * standalone/fallback read path, and repeat awaits stay cheap once a fetch has
-	 * succeeded because the provider caches successes. RouterProvider already
-	 * negative-caches catalog misses with a TTL (missingModelRefreshAt); recording
-	 * rejected fetches remains future work if the failure-path latency ever matters.
+	 * entry points (attemptApiRequest, condenseContext) await this once before
+	 * prompt generation and share the returned snapshot between getSystemPrompt
+	 * and every tool-array build of the same request, so a fetch that resolves after
+	 * the bounded wait was abandoned cannot move model-specific tool policy between
+	 * prompt time and request time. Callers that do not thread a snapshot keep
+	 * awaiting this immediately before their own getModel() read; that per-site guard
+	 * remains the standalone/fallback read path, and repeat awaits stay cheap once a
+	 * fetch has succeeded because the provider caches successes. RouterProvider
+	 * already negative-caches catalog misses with a TTL (`missingModelRefreshAt`).
 	 */
 	private async safeEnsureModelFetched(): Promise<ModelInfo> {
 		// Per-call controller: its signal makes ensureModelFetched() settle on
@@ -4421,7 +4447,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return this.api.getModel().info
 	}
 
-	private async handleContextWindowExceededError(): Promise<void> {
+	private async handleContextWindowExceededError(requestModelInfo: ModelInfo): Promise<void> {
 		const state = await this.providerRef.deref()?.getState()
 		const { profileThresholds = {} } = state ?? {}
 		// Use task-local values, not provider state, to prevent cross-task configuration leaks.
@@ -4429,7 +4455,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const apiConfiguration = this.apiConfiguration
 
 		const { contextTokens } = this.getTokenUsage()
-		const modelInfo = await this.safeEnsureModelFetched()
+		// Truncation permanently rewrites apiConversationHistory, and the retry
+		// hop that consumes the result builds from the caller's snapshot; sizing
+		// against a fresh read here could discard history the retry would still
+		// have fit, so recovery shares the caller's snapshot instead of re-fetching.
+		const modelInfo = requestModelInfo
 
 		const maxTokens = getModelMaxOutputTokens({
 			modelId: this.api.getModel().id,
@@ -4631,6 +4661,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// prompt and every tool array built below; prefer the caller's snapshot
 		// when one was threaded.
 		const requestModelInfo = options.requestModelInfo ?? (await this.safeEnsureModelFetched())
+		// Retry recursions must reuse this snapshot instead of re-deriving it: a
+		// metadata fetch landing between attempts would otherwise move
+		// model-specific tool policy or `preserveReasoning` mid-request. When the
+		// caller threaded a snapshot its options object is forwarded unchanged —
+		// same reference, and never mutated.
+		const retryOptions = options.requestModelInfo === undefined ? { ...options, requestModelInfo } : options
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
 
 		// A cancellation landing during the rate-limit countdown, the bounded metadata
@@ -4972,9 +5008,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						`Retry attempt ${retryAttempt + 1}/${MAX_CONTEXT_WINDOW_RETRIES}. ` +
 						`Attempting automatic truncation...`,
 				)
-				await this.handleContextWindowExceededError()
+				await this.handleContextWindowExceededError(requestModelInfo)
 				// Retry the request after handling the context window error
-				yield* this.attemptApiRequest(retryAttempt + 1)
+				yield* this.attemptApiRequest(retryAttempt + 1, retryOptions)
 				return
 			}
 
@@ -4994,7 +5030,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 				// Delegate generator output from the recursive call with
 				// incremented retry count.
-				yield* this.attemptApiRequest(retryAttempt + 1)
+				yield* this.attemptApiRequest(retryAttempt + 1, retryOptions)
 
 				return
 			} else {
@@ -5012,7 +5048,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				await this.say("api_req_retried")
 
 				// Delegate generator output from the recursive call.
-				yield* this.attemptApiRequest()
+				yield* this.attemptApiRequest(0, retryOptions)
 				return
 			}
 		}

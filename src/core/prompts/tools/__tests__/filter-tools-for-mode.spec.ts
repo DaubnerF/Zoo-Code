@@ -281,6 +281,39 @@ describe("filterMcpToolsForMode", () => {
 	it("accepts experiment flags without affecting the result", () => {
 		expect(filterMcpToolsForMode(mcpTools, "code", undefined, { imageGeneration: true })).toBe(mcpTools)
 	})
+
+	it("returns an empty array when disabledTools disables use_mcp_tool even though the mode allows it", () => {
+		// The matching entry sits among unrelated ones: suppression is a
+		// membership test, not a demand that the whole list match.
+		expect(
+			filterMcpToolsForMode(mcpTools, "code", undefined, undefined, {
+				disabledTools: ["web_fetch", "use_mcp_tool"],
+			}),
+		).toEqual([])
+	})
+
+	it("returns an empty array when modelInfo.excludedTools excludes use_mcp_tool", () => {
+		const modelInfo = {
+			contextWindow: 128_000,
+			supportsPromptCache: false,
+			excludedTools: ["edit", "use_mcp_tool"],
+		}
+		expect(filterMcpToolsForMode(mcpTools, "code", undefined, undefined, { modelInfo })).toEqual([])
+	})
+
+	it("returns the MCP tools when disabledTools lists an unrelated tool", () => {
+		expect(filterMcpToolsForMode(mcpTools, "code", undefined, undefined, { disabledTools: ["web_fetch"] })).toBe(
+			mcpTools,
+		)
+	})
+
+	it("returns the MCP tools when both policy lists are set but neither names use_mcp_tool", () => {
+		const settings = {
+			disabledTools: ["web_fetch"],
+			modelInfo: { contextWindow: 128_000, supportsPromptCache: false, excludedTools: ["edit"] },
+		}
+		expect(filterMcpToolsForMode(mcpTools, "code", undefined, undefined, settings)).toBe(mcpTools)
+	})
 })
 
 describe("filterNativeToolsForMode - access_mcp_resource allowlist", () => {

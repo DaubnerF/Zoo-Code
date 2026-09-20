@@ -82,6 +82,7 @@ interface MockTask {
 	say: ReturnType<typeof vi.fn>
 	ask: ReturnType<typeof vi.fn>
 	pushToolResultToUserContent: ReturnType<typeof vi.fn>
+	getTaskMode: ReturnType<typeof vi.fn>
 }
 
 function buildMockTask(): MockTask {
@@ -119,6 +120,7 @@ function buildMockTask(): MockTask {
 		say: vi.fn().mockResolvedValue(undefined),
 		ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
 		pushToolResultToUserContent: vi.fn(),
+		getTaskMode: vi.fn().mockResolvedValue("code"),
 	}
 
 	// Mirror the real Task: collect tool results into userMessageContent, one per

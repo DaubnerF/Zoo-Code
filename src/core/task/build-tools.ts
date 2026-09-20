@@ -99,8 +99,8 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 	const mcpHub = provider.getMcpHub()
 
 	// Get CodeIndexManager for feature checking.
-	const { CodeIndexManager } = await import("../../services/code-index/manager")
-	const codeIndexManager = CodeIndexManager.getInstance(provider.context, cwd)
+	const { CodeIndexManagerRegistry } = await import("../../services/code-index/code-index-manager-registry")
+	const codeIndexManager = CodeIndexManagerRegistry.getOrCreate(provider.context, cwd)
 
 	// Build settings object for tool filtering.
 	const filterSettings = {
@@ -135,9 +135,14 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 		allowedMcpServers,
 	)
 
-	// Filter MCP tools based on mode restrictions.
+	// Filter MCP tools based on mode restrictions and the effective tool policy:
+	// the same disabledTools/modelInfo the native filter consumes also gate the
+	// dynamic mcp--* declarations, which all represent use_mcp_tool.
 	const mcpTools = getMcpServerTools(mcpHub, allowedMcpServers)
-	const filteredMcpTools = filterMcpToolsForMode(mcpTools, mode, customModes, experiments)
+	const filteredMcpTools = filterMcpToolsForMode(mcpTools, mode, customModes, experiments, {
+		disabledTools,
+		modelInfo,
+	})
 
 	// Add custom tools if they are available and the experiment is enabled.
 	let nativeCustomTools: OpenAI.Chat.ChatCompletionFunctionTool[] = []

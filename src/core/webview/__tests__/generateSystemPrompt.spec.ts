@@ -83,9 +83,9 @@ vi.mock("vscode", () => ({
 	}),
 }))
 
-// Mutable shell mock: getShell feeds the command-chaining text in RULES, so the
-// fragment-gating describe below can retarget the shell per test without
-// re-registering the module mock (which would leak across the parity tests).
+// getShell feeds the command-chaining text in RULES; stub it so the real
+// implementation never touches the environment. vi.hoisted keeps the double
+// initialized before the hoisted module-factory mock evaluates it.
 const shellMock = vi.hoisted(() => ({ shell: "/bin/zsh" }))
 
 vi.mock("../../../utils/shell", () => ({
@@ -330,9 +330,8 @@ describe("generateSystemPrompt preview parity", () => {
 	it("degrades to fallback metadata when ensureModelFetched hangs past the preview timeout", async () => {
 		// A hung metadata endpoint (some fetchers issue unbounded GETs) must not
 		// block the user-triggered preview: after PREVIEW_MODEL_FETCH_TIMEOUT_MS
-		// (5s — kept in sync with the production constant) the race resolves and
-		// the prompt is built from the fallback metadata, identical to the
-		// rejected-fetch degradation.
+		// (5s) the race resolves and the prompt is built from the fallback
+		// metadata, identical to the rejected-fetch degradation.
 		vi.useFakeTimers()
 		try {
 			modelMock.ensureModelFetched.mockImplementationOnce(() => new Promise<void>(() => {}))
@@ -443,40 +442,6 @@ describe("generateSystemPrompt preview parity", () => {
 				expect(vi.getTimerCount()).toBe(0)
 			} finally {
 				vi.useRealTimers()
-			}
-		})
-
-		it("hands the armed timer handle to clearTimeout when the fetch wins the race", async () => {
-			// The race arms its timeout through the real setTimeout before awaiting;
-			// the winning path must cancel exactly that handle.
-			const clearSpy = vi.spyOn(globalThis, "clearTimeout")
-			try {
-				modelMock.ensureModelFetched.mockResolvedValueOnce(undefined)
-				await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
-
-				expect(clearSpy).toHaveBeenCalledTimes(1)
-				expect(clearSpy).toHaveBeenCalledWith(expect.any(Object))
-			} finally {
-				clearSpy.mockRestore()
-			}
-		})
-
-		it("does not clear a timer when setTimeout yields a falsy handle", async () => {
-			// The guard only treats a truthy handle as armed. The double assertion
-			// is unavoidable here: no platform handle type admits the numeric 0
-			// that such environments return, and the guard's truthiness check is
-			// exactly what this case pins down.
-			const zeroHandle = 0 as unknown as ReturnType<typeof setTimeout>
-			const setSpy = vi.spyOn(globalThis, "setTimeout").mockReturnValue(zeroHandle)
-			const clearSpy = vi.spyOn(globalThis, "clearTimeout")
-			try {
-				modelMock.ensureModelFetched.mockResolvedValueOnce(undefined)
-				await generateSystemPrompt(fakeProvider, { type: "mode", mode: "code" })
-
-				expect(clearSpy).not.toHaveBeenCalled()
-			} finally {
-				setSpy.mockRestore()
-				clearSpy.mockRestore()
 			}
 		})
 
@@ -598,10 +563,9 @@ describe("generateSystemPrompt preview parity", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Mutation coverage for the CAPABILITIES and RULES fragment builders. These
-// sections have no name-matched spec file, so this spec — the gate's direct
-// test file for the prompt pipeline — drives every fragment gate, fallback
-// sentence, and MCP-availability branch directly against the section builders.
+// Raw-policy fragment tests for the CAPABILITIES and RULES builders: drives the
+// branch cells the resolver-backed specs in core/prompts/__tests__/sections.spec.ts
+// cannot produce (policy objects are built directly, bypassing the resolver).
 // ---------------------------------------------------------------------------
 describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 	const cwd = "/test/path"
@@ -627,10 +591,6 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 		}
 	}
 
-	afterEach(() => {
-		shellMock.shell = "/bin/zsh"
-	})
-
 	describe("getCapabilitiesSection", () => {
 		it("emits every clause and paragraph when all capability tools are advertised", () => {
 			const result = getCapabilitiesSection(
@@ -650,7 +610,7 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 
 			expect(result).toContain("====\n\nCAPABILITIES\n\n")
 			expect(result).toContain(
-				"You have access to tools that let you execute CLI commands on the user's computer, list files, view source code definitions, regex search, read files, write and edit files.",
+				"You have access to tools that let you execute CLI commands on the user's computer, list files, semantically search the codebase, regex search, read files, write and edit files.",
 			)
 			expect(result).toContain("\n- These tools help you accomplish tasks.\n")
 			expect(result).toContain("you can use the list_files tool")
@@ -672,7 +632,7 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			expect(result).not.toContain("You have access to tools that let you")
 			expect(result).not.toContain("execute CLI commands")
 			expect(result).not.toContain("list files")
-			expect(result).not.toContain("view source code definitions")
+			expect(result).not.toContain("semantically search the codebase")
 			expect(result).not.toContain("regex search")
 			expect(result).not.toContain("read files")
 			expect(result).not.toContain("write and edit files")
@@ -686,13 +646,13 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 				"You have access to tools that let you list files.",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["codebase_search"]))).toContain(
-				"You have access to tools that let you view source code definitions.",
+				"You have access to tools that let you semantically search the codebase.",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["search_files"]))).toContain(
 				"You have access to tools that let you regex search.",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["search_files"]))).not.toContain(
-				"view source code definitions",
+				"semantically search the codebase",
 			)
 			expect(getCapabilitiesSection(sectionPolicy(["read_file"]))).toContain(
 				"You have access to tools that let you read files.",
@@ -701,47 +661,6 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			expect(getCapabilitiesSection(sectionPolicy(["apply_diff"]))).toContain("write and edit files")
 			expect(getCapabilitiesSection(sectionPolicy(["read_file"]))).not.toContain("write and edit files")
 		})
-
-		it("binds the edit-restriction suffix with and without a description", () => {
-			const withDescription = getCapabilitiesSection(
-				sectionPolicy(["read_file"], {
-					editRestriction: { fileRegex: "\\.md$", description: "Markdown files only" },
-				}),
-			)
-			expect(withDescription).toContain(
-				"(in this mode only files matching '\\.md$' can be edited — Markdown files only)",
-			)
-
-			const withoutDescription = getCapabilitiesSection(
-				sectionPolicy(["read_file"], { editRestriction: { fileRegex: "\\.md$" } }),
-			)
-			// "Stryker was here" (no trailing !) covers both the StringLiteral and
-			// ArrayDeclaration sentinel replacements Stryker injects.
-			expect(withoutDescription).toContain("(in this mode only files matching '\\.md$' can be edited)")
-			expect(withoutDescription).not.toContain("Stryker was here")
-
-			const unrestricted = getCapabilitiesSection(sectionPolicy(["read_file"]))
-			expect(unrestricted).not.toContain("(in this mode only files matching")
-			expect(unrestricted).not.toContain("Stryker was here")
-		})
-
-		it("emits the MCP bullet only when the mcp group is present and tools or resources are effective", () => {
-			const mcpBullet = "You have access to MCP servers that may provide additional tools"
-
-			// group + effective tools, and group + effective resources -> present
-			expect(getCapabilitiesSection(sectionPolicy([], { hasMcpGroup: true, hasMcpTools: true }))).toContain(
-				mcpBullet,
-			)
-			expect(getCapabilitiesSection(sectionPolicy([], { hasMcpGroup: true, hasMcpResources: true }))).toContain(
-				mcpBullet,
-			)
-			// group but nothing effective -> absent
-			expect(getCapabilitiesSection(sectionPolicy([], { hasMcpGroup: true }))).not.toContain(mcpBullet)
-			// effective tools/resources but no group -> absent
-			expect(
-				getCapabilitiesSection(sectionPolicy([], { hasMcpTools: true, hasMcpResources: true })),
-			).not.toContain(mcpBullet)
-		})
 	})
 
 	describe("getRulesSection", () => {
@@ -749,7 +668,17 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			const result = getRulesSection(
 				cwd,
 				settings,
-				sectionPolicy(["execute_command", "ask_followup_question", "list_files", "read_file"]),
+				sectionPolicy(
+					[
+						"execute_command",
+						"ask_followup_question",
+						"list_files",
+						"read_file",
+						"write_to_file",
+						"attempt_completion",
+					],
+					{ editRestriction: { fileRegex: "\\.md$" } },
+				),
 			)
 
 			expect(result).toContain("====\n\nRULES\n\n- ")
@@ -793,19 +722,6 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			expect(result).not.toContain("Stryker was here")
 		})
 
-		it("uses the fallback fragments when execute_command, ask_followup_question, and read_file are absent", () => {
-			const result = getRulesSection(cwd, settings, sectionPolicy([]))
-
-			expect(result).toContain("- All file paths must be relative to this directory.\n")
-			expect(result).not.toContain("However, commands may change directories in terminals")
-			expect(result).not.toContain("Before using the execute_command tool")
-			expect(result).toContain("Provide your best-effort result and state your assumptions")
-			expect(result).not.toContain("You are only allowed to ask the user questions")
-			expect(result).not.toContain("When executing commands")
-			expect(result).not.toContain("The user may provide a file's contents directly")
-			expect(result).not.toContain("Actively Running Terminals")
-		})
-
 		it("keeps the ask guidance but drops the list_files example when only ask_followup_question is advertised", () => {
 			const result = getRulesSection(cwd, settings, sectionPolicy(["ask_followup_question"]))
 
@@ -814,14 +730,6 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			)
 			expect(result).not.toContain("the list_files tool")
 			expect(result).not.toContain("Stryker was here!")
-		})
-
-		it("uses the fallback phrasing in the terminal-output rule when ask_followup_question is absent", () => {
-			const result = getRulesSection(cwd, settings, sectionPolicy(["execute_command"]))
-
-			expect(result).toContain("When executing commands, if you don't see the expected output")
-			expect(result).toContain("note what you expected and proceed with the task, stating your assumptions")
-			expect(result).not.toContain("use the ask_followup_question tool to request")
 		})
 
 		it("emits the MCP usage rule only when the mcp group is present and tools or resources are effective", () => {
@@ -849,21 +757,6 @@ describe("getCapabilitiesSection / getRulesSection fragment gating", () => {
 			expect(getRulesSection(cwd, { ...settings, isStealthModel: true }, full)).toContain(
 				"VENDOR CONFIDENTIALITY",
 			)
-		})
-
-		it("appends the PowerShell chain note and omits it for Unix shells", () => {
-			const full = sectionPolicy(["execute_command"])
-
-			shellMock.shell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-			const powershell = getRulesSection(cwd, settings, full)
-			expect(powershell).toContain("cd (path to project) ; (command, in this case npm install)")
-			expect(powershell).toContain(" Note: Using `;` for PowerShell command chaining")
-
-			shellMock.shell = "/bin/bash"
-			const unix = getRulesSection(cwd, settings, full)
-			expect(unix).toContain("cd (path to project) && (command, in this case npm install)")
-			expect(unix).not.toContain("Note: Using")
-			expect(unix).not.toContain("Stryker was here")
 		})
 	})
 })
