@@ -248,9 +248,9 @@ async function readModels(cacheKey: string): Promise<ModelRecord | undefined> {
  * Extracted to avoid duplication between getModels() and refreshModels().
  *
  * @param options - Provider options for fetching models
- * @param signal - Cancellation signal for this fetch: the shared flight's internal controller
- * signal when routed through dedupedFetch(), or the caller's own signal on the auth-scoped
- * direct path (which never enters the single-flight).
+ * @param signal - Cancellation signal forwarded to the dispatched fetcher. The single-flight
+ * (dedupedFetch) passes its internal controller's signal; the auth-scoped direct path passes
+ * none, so those fetchers keep their own bounds.
  * @returns Fresh models from the provider API
  */
 async function fetchModelsFromProvider(options: GetModelsOptions, signal?: AbortSignal): Promise<ModelRecord> {
@@ -305,13 +305,10 @@ async function fetchModelsFromProvider(options: GetModelsOptions, signal?: Abort
 			models = await getMoonshotModels(options.baseUrl, options.apiKey, ...fetchOpts)
 			break
 		case providerIdentifiers.zooGateway:
-			models = await getZooGatewayModels(
-				{ zooSessionToken: options.apiKey, zooGatewayBaseUrl: options.baseUrl },
-				...fetchOpts,
-			)
+			models = await getZooGatewayModels({ zooSessionToken: options.apiKey, zooGatewayBaseUrl: options.baseUrl })
 			break
 		case providerIdentifiers.kimiCode:
-			models = await getKimiCodeModels(options.apiKey, ...fetchOpts)
+			models = await getKimiCodeModels(options.apiKey)
 			break
 		default: {
 			// Ensures router is exhaustively checked if RouterName is a strict union.
@@ -359,9 +356,10 @@ export const getModels = async (options: GetModelsOptions): Promise<ModelRecord>
 	// getModels(), and a fetch failure joined from refreshModels() still re-throws for
 	// getModels() callers.
 	try {
-		const sharedFetch = shouldSkipCache
-			? fetchModelsFromProvider(options, options.signal)
-			: dedupedFetch(cacheKey, options)
+		// The auth-scoped fetch bypasses the single-flight entirely, so options.signal is
+		// deliberately not forwarded there: there is no shared entry to release on abort, and
+		// these fetchers bound their own requests.
+		const sharedFetch = shouldSkipCache ? fetchModelsFromProvider(options) : dedupedFetch(cacheKey, options)
 
 		const fetched = await sharedFetch
 		const modelCount = Object.keys(fetched).length
@@ -559,9 +557,10 @@ export const refreshModels = async (options: GetModelsOptions): Promise<ModelRec
 	// The fetch call is created inside the try: a pre-aborted caller signal makes dedupedFetch()
 	// throw synchronously, and refreshModels() must still degrade to cache/{} rather than reject.
 	try {
-		const sharedFetch = shouldSkipCache
-			? fetchModelsFromProvider(options, options.signal)
-			: dedupedFetch(cacheKey, options)
+		// The auth-scoped fetch bypasses the single-flight entirely, so options.signal is
+		// deliberately not forwarded there: there is no shared entry to release on abort, and
+		// these fetchers bound their own requests.
+		const sharedFetch = shouldSkipCache ? fetchModelsFromProvider(options) : dedupedFetch(cacheKey, options)
 
 		// Force fresh API fetch - skip getModelsFromCache() check
 		const models = await sharedFetch
