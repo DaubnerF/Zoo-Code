@@ -491,6 +491,137 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 			expect(mockTask.userMessageContent).toHaveLength(0)
 			expect(mockTask.consecutiveMistakeCount).toBe(0)
 		})
+
+		it("rejects through the state ?? {} fallback when the provider is unavailable", async () => {
+			// With no provider state the validator must still receive the task-local
+			// mode plus empty policy inputs: customModes [] and an empty requirements
+			// map, rather than the dispatch crashing.
+			mockTask.providerRef = { deref: () => undefined }
+			vi.mocked(validateToolUse).mockImplementationOnce(() => {
+				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
+			})
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					id: "call_native_mcp_no_provider",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task)
+
+			// The validator throws so the handler is never reached — the assertions
+			// pin the arguments the call site passed under the empty-state fallback.
+			const calls = vi.mocked(validateToolUse).mock.calls
+			expect(calls.length).toBeGreaterThan(0)
+			expect(calls[calls.length - 1][0]).toBe("use_mcp_tool")
+			expect(calls[calls.length - 1][1]).toBe("code")
+			expect(calls[calls.length - 1][2]).toEqual([])
+			expect(calls[calls.length - 1][3]).toEqual({})
+			// The default model info carries no includedTools.
+			expect(calls[calls.length - 1][6]).toBeUndefined()
+
+			expect(mockTask.userMessageContent).toHaveLength(1)
+			expect(mockTask.userMessageContent).toContainEqual(
+				expect.objectContaining({
+					type: "tool_result",
+					tool_use_id: "call_native_mcp_no_provider",
+					is_error: true,
+					content: expect.stringContaining("not allowed in code mode"),
+				}),
+			)
+
+			expect(mockTask.recordToolUsage).not.toHaveBeenCalled()
+			expect(TelemetryService.instance.captureToolUsage).not.toHaveBeenCalled()
+			expect(mockTask.recordToolError).toHaveBeenCalledWith("use_mcp_tool", expect.any(String))
+			expect(mockTask.consecutiveMistakeCount).toBe(1)
+			expect(mockTask.didAlreadyUseTool).toBe(false)
+		})
+
+		it("resolves aliases in the model's includedTools before passing them to the shared layer", async () => {
+			// A model may advertise tools under alias names; the shared layer compares
+			// canonical names, so "write_file" must arrive as "write_to_file".
+			mockTask.api = {
+				getModel: () => ({ id: "test-model", info: { includedTools: ["write_file"] } }),
+			}
+			mockTask.providerRef = {
+				deref: () => ({
+					getState: vi.fn().mockResolvedValue({
+						mode: "code",
+						customModes: [],
+					}),
+					getMcpHub: () => ({
+						findServerNameBySanitizedName: () => "my_server",
+					}),
+				}),
+			}
+			vi.mocked(validateToolUse).mockImplementationOnce(() => {
+				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
+			})
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					id: "call_native_mcp_alias",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task)
+
+			const calls = vi.mocked(validateToolUse).mock.calls
+			expect(calls.length).toBeGreaterThan(0)
+			expect(calls[calls.length - 1][0]).toBe("use_mcp_tool")
+			expect(calls[calls.length - 1][6]).toEqual(["write_to_file"])
+		})
+
+		it("pushes no tool_result when the native block omits its id, but still records the rejection", async () => {
+			// McpToolUse.id is optional; with no tool_use_id there is nothing to
+			// answer, so the error tool_result is skipped while the rejection is
+			// still recorded.
+			mockTask.providerRef = {
+				deref: () => ({
+					getState: vi.fn().mockResolvedValue({
+						mode: "code",
+						customModes: [],
+					}),
+					getMcpHub: () => ({
+						findServerNameBySanitizedName: () => "my_server",
+					}),
+				}),
+			}
+			vi.mocked(validateToolUse).mockImplementationOnce(() => {
+				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
+			})
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task)
+
+			expect(mockTask.pushToolResultToUserContent).not.toHaveBeenCalled()
+			expect(mockTask.userMessageContent).toHaveLength(0)
+			expect(mockTask.recordToolError).toHaveBeenCalledWith("use_mcp_tool", expect.any(String))
+			expect(mockTask.consecutiveMistakeCount).toBe(1)
+			expect(mockTask.didAlreadyUseTool).toBe(false)
+		})
 	})
 
 	describe("undefined provider state", () => {

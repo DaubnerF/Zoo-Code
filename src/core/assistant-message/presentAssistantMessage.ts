@@ -304,7 +304,7 @@ export async function presentAssistantMessage(cline: Task) {
 				const modelInfo = cline.api.getModel()
 				// Resolve aliases in includedTools before validation
 				// e.g., "write_file" should resolve to "write_to_file"
-				const rawIncludedTools = modelInfo?.info?.includedTools
+				const rawIncludedTools = modelInfo.info.includedTools
 				const { resolveToolAlias } = await import("../prompts/tools/filter-tools-for-mode")
 				const includedTools = rawIncludedTools?.map((tool) => resolveToolAlias(tool))
 
@@ -316,7 +316,7 @@ export async function presentAssistantMessage(cline: Task) {
 					// entry reaches the validator, which checks them before the
 					// always-available class. See `buildToolRequirements` in
 					// effective-tool-policy.ts.
-					const toolRequirements = buildToolRequirements(disabledTools, modelInfo?.info)
+					const toolRequirements = buildToolRequirements(disabledTools, modelInfo.info)
 
 					validateToolUse(
 						"use_mcp_tool",
@@ -338,7 +338,7 @@ export async function presentAssistantMessage(cline: Task) {
 						cline.pushToolResultToUserContent({
 							type: "tool_result",
 							tool_use_id: sanitizeToolUseId(toolCallId),
-							content: typeof errorContent === "string" ? errorContent : "(validation error)",
+							content: errorContent,
 							is_error: true,
 						})
 					}
