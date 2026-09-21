@@ -2,7 +2,8 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest"
 import { presentAssistantMessage } from "../presentAssistantMessage"
-import { isValidToolName } from "../../tools/validateToolUse"
+import { isValidToolName, validateToolUse } from "../../tools/validateToolUse"
+import type { RequestPolicySnapshot } from "../../prompts/tools/effective-tool-policy"
 
 const mockNewTaskHandle = vi.hoisted(() => vi.fn())
 
@@ -23,6 +24,13 @@ vi.mock("@roo-code/telemetry", () => ({
 		},
 	},
 }))
+
+// The snapshot the presenter consumes; the getState double below deliberately
+// disagrees with it so any surviving live-read re-entry is caught by assertions.
+const baseSnapshot: RequestPolicySnapshot = {
+	disabledTools: [],
+	customModes: [],
+}
 
 describe("presentAssistantMessage - Unknown Tool Handling", () => {
 	let mockTask: any
@@ -57,7 +65,11 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 				deref: () => ({
 					getState: vi.fn().mockResolvedValue({
 						mode: "code",
-						customModes: [],
+						// Poisoned: disagrees with baseSnapshot, so a live
+						// read here changes validation behavior and fails tests.
+						customModes: [{ slug: "poison", name: "Poison", roleDefinition: "", groups: [] }],
+						disabledTools: ["new_task"],
+						experiments: { customTools: true },
 					}),
 				}),
 			},
@@ -92,7 +104,14 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 		]
 
 		// Execute presentAssistantMessage
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
+
+		// Frozen-snapshot proof: a live read of the poisoned getState double
+		// would have produced { new_task: false } requirements and a
+		// non-empty customModes list here.
+		const validateCalls = vi.mocked(validateToolUse).mock.calls
+		expect(validateCalls[0][2]).toEqual([])
+		expect(validateCalls[0][3]).toEqual({})
 
 		// Verify that a tool_result with error was pushed
 		const toolResult = mockTask.userMessageContent.find(
@@ -132,7 +151,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 		]
 
 		// Execute presentAssistantMessage
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		// Should not execute tool; should surface a clear error message.
 		const textBlocks = mockTask.userMessageContent.filter((item: any) => item.type === "text")
@@ -170,7 +189,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			setTimeout(() => reject(new Error("Test timed out - extension likely froze")), 5000)
 		})
 
-		const resultPromise = presentAssistantMessage(mockTask).then(() => true)
+		const resultPromise = presentAssistantMessage(mockTask, baseSnapshot).then(() => true)
 
 		// Race between the function completing and the timeout
 		const completed = await Promise.race([resultPromise, timeoutPromise])
@@ -198,7 +217,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 
 		expect(mockTask.consecutiveMistakeCount).toBe(0)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.consecutiveMistakeCount).toBe(1)
 	})
@@ -218,7 +237,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 		mockTask.didCompleteReadingStream = true
 		mockTask.userMessageContentReady = false
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		// userMessageContentReady should be set after processing
 		expect(mockTask.userMessageContentReady).toBe(true)
@@ -238,7 +257,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 
 		mockTask.didRejectTool = true
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		// When didRejectTool is true, should send error tool_result
 		const toolResult = mockTask.userMessageContent.find(
@@ -280,7 +299,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.persistQueuedFeedbackAndAcknowledge).toHaveBeenCalledWith(
 			"queued-message-1",
@@ -319,7 +338,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.persistQueuedFeedbackAndAcknowledge).toHaveBeenCalledWith(
 			"queued-empty-denial",
@@ -358,7 +377,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.say).toHaveBeenCalledWith("user_feedback", "Approved context", undefined)
 		expect(mockTask.userMessageContent).toContainEqual(
@@ -400,7 +419,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.say).toHaveBeenCalledWith("user_feedback", "", ["data:image/png;base64,denied"])
 		expect(continueTool).not.toHaveBeenCalled()
@@ -445,7 +464,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await expect(presentAssistantMessage(mockTask)).rejects.toThrow(
+		await expect(presentAssistantMessage(mockTask, baseSnapshot)).rejects.toThrow(
 			"Failed to persist queued approval feedback queued-failed-denial",
 		)
 
@@ -492,7 +511,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.persistQueuedFeedbackAndAcknowledge).toHaveBeenCalledWith("queued-image-approval", undefined, [
 			"data:image/png;base64,approved",
@@ -539,7 +558,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await expect(presentAssistantMessage(mockTask)).rejects.toThrow(
+		await expect(presentAssistantMessage(mockTask, baseSnapshot)).rejects.toThrow(
 			"Failed to persist queued approval feedback queued-failed-approval",
 		)
 
@@ -573,7 +592,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.say).not.toHaveBeenCalledWith("user_feedback", expect.anything(), expect.anything())
 		expect(mockTask.didRejectTool).toBe(true)
@@ -617,7 +636,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 		)
 
-		await presentAssistantMessage(mockTask)
+		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.say).toHaveBeenCalledWith("user_feedback", "", ["data:image/png;base64,ordinary-approved"])
 		expect(
