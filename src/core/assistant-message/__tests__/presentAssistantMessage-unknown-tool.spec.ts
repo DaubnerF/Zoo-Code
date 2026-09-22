@@ -202,6 +202,45 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 		expect(toolResult).toBeDefined()
 	})
 
+	it("should drain a completed non-final block by recursing into the next block", async () => {
+		mockTask.assistantMessageContent = [
+			{ type: "text", content: "first", partial: false },
+			{ type: "text", content: "second", partial: false },
+		]
+
+		await presentAssistantMessage(mockTask, baseSnapshot)
+
+		// A completed non-final block must present the following block through
+		// the same call via the self-recursion, so the message drains without
+		// waiting for another read-stream tick.
+		expect(mockTask.say).toHaveBeenNthCalledWith(1, "text", "first", undefined, false)
+		expect(mockTask.say).toHaveBeenNthCalledWith(2, "text", "second", undefined, false)
+		expect(mockTask.currentStreamingContentIndex).toBe(2)
+		expect(mockTask.userMessageContentReady).toBe(true)
+	})
+
+	it("should re-present the current block when an update lands mid-presentation", async () => {
+		mockTask.assistantMessageContent = [{ type: "text", content: "streaming", partial: true }]
+
+		// Model the read stream racing the presenter: a chunk arrives while the
+		// first presentation awaits say(). The re-entrant call finds the
+		// presenter locked and flags pending updates, so the in-flight call
+		// must loop once more to bring the still-partial block up to date.
+		let streamChunkArrived = false
+		mockTask.say = vi.fn().mockImplementation(async () => {
+			if (!streamChunkArrived) {
+				streamChunkArrived = true
+				await presentAssistantMessage(mockTask, baseSnapshot)
+			}
+		})
+
+		await presentAssistantMessage(mockTask, baseSnapshot)
+
+		expect(mockTask.say).toHaveBeenCalledTimes(2)
+		expect(mockTask.presentAssistantMessageHasPendingUpdates).toBe(false)
+		expect(mockTask.currentStreamingContentIndex).toBe(0)
+	})
+
 	it("should increment consecutiveMistakeCount for unknown tools", async () => {
 		// Test with multiple unknown tools to ensure mistake count increments
 		const toolCallId = "tool_call_mistake_test"
