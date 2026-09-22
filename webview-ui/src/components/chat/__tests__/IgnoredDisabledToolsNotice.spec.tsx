@@ -57,4 +57,31 @@ describe("ChatRow - ignored disabled-tools notice", () => {
 			screen.getByText("The following tools cannot be disabled and will remain available: attempt_completion."),
 		).toBeInTheDocument()
 	})
+
+	it("renders nothing when the notice message text is missing", () => {
+		const message: ClineMessage = {
+			type: "say",
+			say: "ignored_disabled_tools_warning",
+			ts: Date.now(),
+		}
+
+		const { container } = renderChatRow(message)
+
+		expect(container.firstChild).toBeNull()
+		expect(screen.queryByText("Disabled tool ignored")).not.toBeInTheDocument()
+	})
+
+	it("renders nothing when the notice payload is not valid JSON", () => {
+		const message: ClineMessage = {
+			type: "say",
+			say: "ignored_disabled_tools_warning",
+			ts: Date.now(),
+			text: "{not valid json",
+		}
+
+		const { container } = renderChatRow(message)
+
+		expect(container.firstChild).toBeNull()
+		expect(screen.queryByText("Disabled tool ignored")).not.toBeInTheDocument()
+	})
 })
