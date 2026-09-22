@@ -2,11 +2,12 @@
 
 import * as vscode from "vscode"
 
-import type { ModelInfo, ProviderSettings } from "@roo-code/types"
+import type { ClineMessage, HistoryItem, ModelInfo, ProviderSettings } from "@roo-code/types"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 import { Task } from "../Task"
 import { ClineProvider } from "../../webview/ClineProvider"
+import type { ApiMessage } from "../../task-persistence"
 
 vi.mock("@roo-code/telemetry", () => ({
 	TelemetryService: {
@@ -105,7 +106,10 @@ vi.mock("delay", () => ({
 
 type StartTaskAccess = {
 	startTask: (task?: string, images?: string[]) => Promise<void>
+	resumeTaskFromHistory: () => Promise<void>
 	getEnabledMcpToolsCount: () => Promise<{ enabledToolCount: number; enabledServerCount: number }>
+	getSavedClineMessages: () => Promise<ClineMessage[]>
+	getSavedApiConversationHistory: () => Promise<ApiMessage[]>
 	initiateTaskLoop: (userContent: unknown[]) => Promise<void>
 }
 
@@ -120,9 +124,9 @@ type ProviderStateShaped = Partial<Awaited<ReturnType<ClineProvider["getState"]>
 	disabledTools?: string[]
 }
 
-async function startTaskWithDisabledTools(disabledTools: string[] | undefined, profileExcludedTools?: string[]) {
+function createMockProvider(disabledTools: string[] | undefined): ClineProvider {
 	const providerState = { disabledTools } as ProviderStateShaped
-	const mockProvider = {
+	return {
 		context: {
 			globalStorageUri: { fsPath: "/test/storage" },
 		},
@@ -135,6 +139,10 @@ async function startTaskWithDisabledTools(disabledTools: string[] | undefined, p
 		updateTaskHistory: vi.fn().mockResolvedValue(undefined),
 		// ClineProvider's surface is too broad to type this fixture fully; double assertion is the last resort (AGENTS.md) — only task-scoped fields are read.
 	} as unknown as ClineProvider
+}
+
+async function startTaskWithDisabledTools(disabledTools: string[] | undefined, profileExcludedTools?: string[]) {
+	const mockProvider = createMockProvider(disabledTools)
 
 	const apiConfiguration: ProviderSettings = {
 		apiProvider: providerIdentifiers.anthropic,
@@ -174,6 +182,57 @@ async function startTaskWithDisabledTools(disabledTools: string[] | undefined, p
 	return saySpy.mock.calls.filter(([type]) => type === "ignored_disabled_tools_warning")
 }
 
+async function resumeTaskWithDisabledTools(disabledTools: string[] | undefined) {
+	const mockProvider = createMockProvider(disabledTools)
+
+	const apiConfiguration: ProviderSettings = {
+		apiProvider: providerIdentifiers.anthropic,
+		apiModelId: "claude-3-5-sonnet-20241022",
+		apiKey: "test-api-key",
+	}
+
+	const historyItem: HistoryItem = {
+		id: "resume-notice-task",
+		number: 7,
+		task: "historical task",
+		ts: Date.now() - 60_000,
+		tokensIn: 10,
+		tokensOut: 5,
+		totalCost: 0.01,
+	}
+
+	const task = new Task({
+		provider: mockProvider,
+		apiConfiguration,
+		historyItem,
+		startTask: false,
+	})
+
+	const saySpy = vi.spyOn(task, "say").mockResolvedValue(undefined)
+	const askSpy = vi.spyOn(task, "ask").mockResolvedValue({ response: "yesButtonClicked" })
+	// Persisted-history reads are stubbed so the resume path drives entirely in
+	// memory; the saved API history ends on an assistant turn, the ordinary
+	// interrupted-task shape that reaches the resume ask and loop start.
+	const taskAccess = getStartTaskAccess(task)
+	vi.spyOn(taskAccess, "getSavedClineMessages").mockResolvedValue([
+		{ ts: historyItem.ts, type: "say", say: "text", text: "historical task" },
+	])
+	vi.spyOn(taskAccess, "getSavedApiConversationHistory").mockResolvedValue([
+		{ role: "user", content: [{ type: "text", text: "historical task" }], ts: historyItem.ts },
+		{ role: "assistant", content: [{ type: "text", text: "Working on it." }], ts: historyItem.ts + 1 },
+	])
+	vi.spyOn(task, "overwriteApiConversationHistory").mockResolvedValue(undefined)
+	const initiateLoopSpy = vi.spyOn(taskAccess, "initiateTaskLoop").mockResolvedValue(undefined)
+
+	await taskAccess.resumeTaskFromHistory()
+
+	return {
+		noticeCalls: saySpy.mock.calls.filter(([type]) => type === "ignored_disabled_tools_warning"),
+		askSpy,
+		initiateLoopSpy,
+	}
+}
+
 describe("Task - ignored disabled-tools notice", () => {
 	it("notifies exactly once when disabledTools lists a tool that cannot be disabled", async () => {
 		const noticeCalls = await startTaskWithDisabledTools(["execute_command", "attempt_completion"])
@@ -202,5 +261,16 @@ describe("Task - ignored disabled-tools notice", () => {
 
 		expect(noticeCalls).toHaveLength(1)
 		expect(JSON.parse(noticeCalls[0][1] as string)).toEqual({ ignoredTools: ["attempt_completion"] })
+	})
+
+	it("stays silent when a task carrying the same disabledTools entry resumes from history", async () => {
+		const { noticeCalls, askSpy, initiateLoopSpy } = await resumeTaskWithDisabledTools(["attempt_completion"])
+
+		// Liveness: without these, the zero below could pass on a resume path
+		// that returned early instead of reaching the point a notice could occur.
+		expect(askSpy).toHaveBeenCalledWith("resume_task")
+		expect(initiateLoopSpy).toHaveBeenCalledTimes(1)
+
+		expect(noticeCalls).toHaveLength(0)
 	})
 })
