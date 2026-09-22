@@ -223,13 +223,16 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 		mockTask.assistantMessageContent = [{ type: "text", content: "streaming", partial: true }]
 
 		// Model the read stream racing the presenter: a chunk arrives while the
-		// first presentation awaits say(). The re-entrant call finds the
-		// presenter locked and flags pending updates, so the in-flight call
-		// must loop once more to bring the still-partial block up to date.
+		// first presentation awaits say(), updating the block in place before the
+		// re-entrant call. The re-entrant call finds the presenter locked and
+		// flags pending updates, so the in-flight call must loop once more — and
+		// the loop must present the block's updated content, not the copy that
+		// the superseded presentation had already rendered.
 		let streamChunkArrived = false
 		mockTask.say = vi.fn().mockImplementation(async () => {
 			if (!streamChunkArrived) {
 				streamChunkArrived = true
+				mockTask.assistantMessageContent[0].content = "updated"
 				await presentAssistantMessage(mockTask, baseSnapshot)
 			}
 		})
@@ -237,6 +240,8 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 		await presentAssistantMessage(mockTask, baseSnapshot)
 
 		expect(mockTask.say).toHaveBeenCalledTimes(2)
+		expect(mockTask.say).toHaveBeenNthCalledWith(1, "text", "streaming", undefined, true)
+		expect(mockTask.say).toHaveBeenNthCalledWith(2, "text", "updated", undefined, true)
 		expect(mockTask.presentAssistantMessageHasPendingUpdates).toBe(false)
 		expect(mockTask.currentStreamingContentIndex).toBe(0)
 	})

@@ -1540,10 +1540,14 @@ describe("Cline", () => {
 			// The retry re-executed the generator-body capture and picked up the
 			// settings that landed between attempts.
 			expect(retrySnapshot.disabledTools).toEqual(["execute_command"])
+			expect(retrySnapshot.experiments).toEqual(retryAttemptState.experiments)
+			expect(retrySnapshot.customModes).toEqual(retryAttemptState.customModes)
 			// Re-capture replaces the snapshot object; it never mutates the one
 			// the first attempt's in-flight validation already consumed.
 			expect(retrySnapshot).not.toBe(attemptOne)
 			expect(attemptOne.disabledTools).toEqual(["read_file"])
+			expect(attemptOne.experiments).toEqual(firstAttemptState.experiments)
+			expect(attemptOne.customModes).toEqual(firstAttemptState.customModes)
 			// modelInfo carries the request-scoped resolution on every attempt:
 			// retries forward the once-resolved metadata instead of re-resolving,
 			// so model-specific tool policy cannot move mid-request.

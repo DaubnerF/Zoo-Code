@@ -738,6 +738,71 @@ describe("presentAssistantMessage - Custom Tool Recording", () => {
 			expect(mockTask.consecutiveMistakeCount).toBe(1)
 		})
 
+		it("validates against the snapshot's modelInfo.includedTools when the live model metadata disagrees", async () => {
+			// The presenter derives the validator's includedTools argument from
+			// policySnapshot.modelInfo, alias-resolving each entry. A live read of
+			// the model metadata would pick up the poisoned getModel() double below
+			// and forward a different list; the mirrored includedTools gate makes
+			// that difference observable as an execution outcome, not only as a
+			// differing call argument.
+			mockTask.assistantMessageContent = [
+				{
+					type: "tool_use",
+					id: "tool_call_snapshot_included_123",
+					name: "attempt_completion",
+					params: {},
+					nativeArgs: {},
+					partial: false,
+				},
+			]
+
+			// attempt_completion is not a custom tool (registry lookups leak
+			// between tests, so pin the answer here as elsewhere in this file).
+			vi.mocked(customToolRegistry.has).mockReturnValue(false)
+
+			// Poisoned: the live model metadata's inclusion list omits the tool the
+			// snapshot advertises, so a live read would forward ["apply_patch"].
+			mockTask.api.getModel = () => ({ id: "test-model", info: { includedTools: ["apply_patch"] } })
+
+			// Mirror the file's validateToolUse-gate idiom: a provided includedTools
+			// list that does not contain the tool rejects with the real validator's
+			// not-allowed message, turning a diverging list into an execution outcome.
+			vi.mocked(validateToolUse).mockImplementationOnce(
+				(toolName, mode, _customModes, _requirements, _params, _experiments, includedTools) => {
+					if (includedTools && !includedTools.includes(toolName)) {
+						throw new Error(`Tool "${toolName}" is not allowed in ${mode} mode.`)
+					}
+				},
+			)
+
+			await presentAssistantMessage(mockTask, {
+				...baseSnapshot,
+				modelInfo: {
+					contextWindow: 200000,
+					supportsPromptCache: false,
+					includedTools: ["search_and_replace", "attempt_completion"],
+				},
+			})
+
+			const validateToolUseMock = vi.mocked(validateToolUse)
+			expect(validateToolUseMock).toHaveBeenCalled()
+			// Snapshot-derived and alias-resolved: "search_and_replace" arrived as
+			// its canonical "edit", and the live metadata's list never entered the
+			// call (a live read would give ["apply_patch"] here).
+			expect(validateToolUseMock.mock.calls[0][6]).toEqual(["edit", "attempt_completion"])
+
+			// Execution followed the snapshot's list: the tool validated, was
+			// recorded, and dispatched instead of drawing a rejection tool_result.
+			expect(mockTask.recordToolUsage).toHaveBeenCalledWith("attempt_completion")
+			const { attemptCompletionTool } = await import("../../tools/AttemptCompletionTool")
+			expect(attemptCompletionTool.handle).toHaveBeenCalledOnce()
+			const allowedErrors = mockTask.userMessageContent.filter((block: unknown) => {
+				const b = block as { type?: string; is_error?: boolean }
+				return b.type === "tool_result" && b.is_error
+			})
+			expect(allowedErrors).toHaveLength(0)
+		})
+
 		it("fails fast with a missing-snapshot error instead of re-reading live settings", async () => {
 			// The required chain parameter makes an omitted snapshot a compile
 			// error; this widened function type reproduces a caller that supplies
