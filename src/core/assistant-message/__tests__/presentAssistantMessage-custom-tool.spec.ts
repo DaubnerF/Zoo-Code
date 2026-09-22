@@ -462,7 +462,23 @@ describe("presentAssistantMessage - Custom Tool Recording", () => {
 			expect(mockTask.consecutiveMistakeCount).toBe(0)
 
 			const { attemptCompletionTool } = await import("../../tools/AttemptCompletionTool")
-			expect(attemptCompletionTool.handle).toHaveBeenCalled()
+			expect(attemptCompletionTool.handle).toHaveBeenCalledWith(
+				mockTask,
+				expect.objectContaining({
+					type: "tool_use",
+					id: "tool_call_protocol_123",
+					name: "attempt_completion",
+					partial: false,
+				}),
+				expect.objectContaining({
+					askApproval: expect.any(Function),
+					handleError: expect.any(Function),
+					pushToolResult: expect.any(Function),
+					askFinishSubTaskApproval: expect.any(Function),
+					toolDescription: expect.any(Function),
+					toolCallId: "tool_call_protocol_123",
+				}),
+			)
 		})
 
 		it("treats a model-excluded attempt_completion as blocked and answers it with an error tool_result", async () => {

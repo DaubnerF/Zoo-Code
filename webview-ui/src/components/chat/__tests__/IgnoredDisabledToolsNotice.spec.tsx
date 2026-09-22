@@ -7,7 +7,7 @@ import { ChatRowContent } from "../ChatRow"
 
 vi.mock("react-i18next", () => ({
 	useTranslation: () => ({
-		t: (key: string, options?: Record<string, any>) => {
+		t: (key: string, options?: Record<string, unknown>) => {
 			const map: Record<string, string> = {
 				"chat:ignoredDisabledTools.title": "Disabled tool ignored",
 				"chat:ignoredDisabledTools.messageTemplate":
@@ -77,6 +77,48 @@ describe("ChatRow - ignored disabled-tools notice", () => {
 			say: "ignored_disabled_tools_warning",
 			ts: Date.now(),
 			text: "{not valid json",
+		}
+
+		const { container } = renderChatRow(message)
+
+		expect(container.firstChild).toBeNull()
+		expect(screen.queryByText("Disabled tool ignored")).not.toBeInTheDocument()
+	})
+
+	it("renders nothing when ignoredTools is a non-array string", () => {
+		const message: ClineMessage = {
+			type: "say",
+			say: "ignored_disabled_tools_warning",
+			ts: Date.now(),
+			text: JSON.stringify({ ignoredTools: "attempt_completion" }),
+		}
+
+		const { container } = renderChatRow(message)
+
+		expect(container.firstChild).toBeNull()
+		expect(screen.queryByText("Disabled tool ignored")).not.toBeInTheDocument()
+	})
+
+	it("renders nothing when ignoredTools is an empty array", () => {
+		const message: ClineMessage = {
+			type: "say",
+			say: "ignored_disabled_tools_warning",
+			ts: Date.now(),
+			text: JSON.stringify({ ignoredTools: [] }),
+		}
+
+		const { container } = renderChatRow(message)
+
+		expect(container.firstChild).toBeNull()
+		expect(screen.queryByText("Disabled tool ignored")).not.toBeInTheDocument()
+	})
+
+	it("renders nothing when ignoredTools contains a non-string entry", () => {
+		const message: ClineMessage = {
+			type: "say",
+			say: "ignored_disabled_tools_warning",
+			ts: Date.now(),
+			text: JSON.stringify({ ignoredTools: ["attempt_completion", 42] }),
 		}
 
 		const { container } = renderChatRow(message)
