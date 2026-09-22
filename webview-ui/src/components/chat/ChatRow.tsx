@@ -1590,6 +1590,18 @@ export const ChatRowContent = ({
 						/>
 					)
 				}
+				case "ignored_disabled_tools_warning": {
+					const ignoredData = safeJsonParse<{ ignoredTools: string[] }>(message.text || "{}")
+					if (!ignoredData?.ignoredTools) return null
+					return (
+						<WarningRow
+							title={t("chat:ignoredDisabledTools.title")}
+							message={t("chat:ignoredDisabledTools.messageTemplate", {
+								tools: ignoredData.ignoredTools.join(", "),
+							})}
+						/>
+					)
+				}
 				default:
 					return (
 						<>
