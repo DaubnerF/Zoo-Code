@@ -161,6 +161,8 @@ const listFilesBlock = {
 const NOT_ALLOWLISTED_DETAIL = {
 	kind: "not_allowlisted" as const,
 	command: "rm x && npm test",
+	// The askApproval copies forward dcgRuleId into the payload's rule_id for any detail kind.
+	dcgRuleId: "R-1",
 }
 
 const DCG_ALLOW = { decision: "allow" } as const
@@ -226,6 +228,7 @@ describe("presentAssistantMessage - automatic (policy) denials", () => {
 		expect(denialPayload.type).toBe("auto_deny")
 		expect(denialPayload.reason).toContain("not on the command allowlist")
 		expect(denialPayload.offending_command).toBe("rm x && npm test")
+		expect(denialPayload.rule_id).toBe("R-1")
 
 		// An automatic denial is scoped to its own tool call: it must NOT abort the
 		// turn the way a user rejection does.
@@ -276,7 +279,8 @@ describe("presentAssistantMessage - automatic (policy) denials", () => {
 
 		mockTask.ask.mockResolvedValueOnce({
 			response: "noButtonClicked",
-			autoDenyDetail: { kind: "denylist", command: "rm x", pattern: "rm" },
+			// dcgRuleId is forwarded into the payload's rule_id on this copy too, for any detail kind.
+			autoDenyDetail: { kind: "denylist", command: "rm x", pattern: "rm", dcgRuleId: "R-1" },
 		})
 
 		await presentAssistantMessage(mockTask as unknown as Task)
@@ -286,6 +290,7 @@ describe("presentAssistantMessage - automatic (policy) denials", () => {
 		expect(payload.type).toBe("auto_deny")
 		expect(payload.reason).toContain("matches denied prefix `rm`")
 		expect(payload.offending_command).toBe("rm x")
+		expect(payload.rule_id).toBe("R-1")
 		expect(mockTask.didRejectTool).toBe(false)
 		expect(mockTask.say).not.toHaveBeenCalledWith("user_feedback", expect.anything(), expect.anything())
 	})
@@ -390,5 +395,46 @@ describe("presentAssistantMessage - automatic (policy) denials", () => {
 			false,
 			AUTO_APPROVAL_CONTEXT,
 		)
+	})
+
+	it("keeps the user-rejection payload on the MCP copy when the denial carries no autoDenyDetail", async () => {
+		mockTask.assistantMessageContent = [
+			{
+				type: "mcp_tool_use",
+				id: "call_mcp",
+				name: "mcp_my_server_do_thing",
+				serverName: "my_server",
+				toolName: "do_thing",
+				arguments: {},
+				partial: false,
+			},
+		]
+
+		mockTask.providerRef = {
+			deref: () => ({
+				getState: vi.fn().mockResolvedValue({ mode: "code", customModes: [] }),
+				getMcpHub: () => ({ findServerNameBySanitizedName: () => undefined }),
+			}),
+		}
+
+		useMcpToolHandle.mockImplementation(
+			async (_task: unknown, _block: unknown, { askApproval }: { askApproval: AskApproval }) => {
+				await askApproval("use_mcp_server", "{}")
+			},
+		)
+
+		// A rejection without structured detail is a real user click: legacy
+		// wording, and the rest of the turn aborts.
+		mockTask.ask.mockResolvedValueOnce({ response: "noButtonClicked" })
+
+		// Structural double — the mock Task implements only the fields this path reads; no typed alternative exists.
+		await presentAssistantMessage(mockTask as unknown as Task)
+
+		expect(mockTask.userMessageContent).toHaveLength(1)
+		const payload = JSON.parse(mockTask.userMessageContent[0].content as string)
+		expect(payload.message).toBe("The user denied this operation.")
+		expect(payload.type).toBeUndefined()
+		expect(mockTask.didRejectTool).toBe(true)
+		expect(mockTask.say).not.toHaveBeenCalledWith("user_feedback", expect.anything(), expect.anything())
 	})
 })

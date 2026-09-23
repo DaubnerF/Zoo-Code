@@ -415,6 +415,33 @@ describe("executeCommandTool", () => {
 			expect(mockAskApproval).toHaveBeenCalledWith("command", "echo test", undefined, true)
 		})
 
+		it("keeps the protected prompt when blanket auto-deny is on but execute auto-approval is off", async () => {
+			const provider = await mockCline.providerRef.deref()
+			provider.context = { globalStorageUri: { fsPath: "/test/storage" } }
+			provider.contextProxy.getValue.mockReturnValue(true)
+			provider.getState.mockResolvedValue({
+				destructiveCommandGuardEnabled: true,
+				terminalShellIntegrationDisabled: true,
+				alwaysDenyUnapprovedCommands: true,
+				autoApprovalEnabled: true,
+				alwaysAllowExecute: false,
+			})
+			mockRunDcg.mockResolvedValue({ decision: "deny", reason: "matches a destructive pattern" })
+			mockAskApproval.mockResolvedValue(false)
+
+			// Structural harness double — mockCline carries only the fields the handler reads; a typed Task is impractical.
+			await executeCommandTool.handle(mockCline as unknown as Task, mockToolUse, {
+				// vi.fn stands in for the AskApproval signature; every test in this block uses this identical cast.
+				askApproval: mockAskApproval as unknown as AskApproval,
+				// vi.fn stands in for the HandleError signature; every test in this block uses this identical cast.
+				handleError: mockHandleError as unknown as HandleError,
+				// vi.fn stands in for the PushToolResult signature; every test in this block uses this identical cast.
+				pushToolResult: mockPushToolResult as unknown as PushToolResult,
+			})
+
+			expect(mockAskApproval).toHaveBeenCalledWith("command", "echo test", undefined, true)
+		})
+
 		it("installs or updates DCG before evaluating an enabled command", async () => {
 			const provider = await mockCline.providerRef.deref()
 			provider.context = { globalStorageUri: { fsPath: "/test/storage" } }
