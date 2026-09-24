@@ -143,10 +143,11 @@ export type CheckAutoApprovalResult =
 	/**
 	 * Automatic denial. `autoDeny` carries the structured reason and the
 	 * offending sub-command when the denial came from command policy (denylist
-	 * match, blanket auto-deny, or a DCG block under blanket mode). It marks
-	 * the denial as policy-scoped — the model receives an explanatory
-	 * `auto_deny` result, and unlike a user rejection the denial does not
-	 * abort the remaining tool calls of the turn.
+	 * match, blanket auto-deny, or a DCG block under blanket mode) or from the
+	 * guard-state inconsistency the command branch denies as
+	 * `guard_unavailable`. It marks the denial as policy-scoped — the model
+	 * receives an explanatory `auto_deny` result, and unlike a user rejection
+	 * the denial does not abort the remaining tool calls of the turn.
 	 */
 	| { decision: "deny"; autoDeny?: AutoDenyDetail }
 	| { decision: "ask" }
@@ -284,10 +285,22 @@ export async function checkAutoApproval({
 						: { decision: "ask" }
 				}
 
-				// DCG allowed the command (verdict provided), or no verdict was
-				// supplied for a DCG-enabled ask (partial asks never reach an
-				// auto-approval decision). DCG remains the authoritative policy:
-				// approve.
+				// A verdictless ask under an enabled guard is an inconsistent
+				// guard state, not a guard decision: ExecuteCommandTool computes
+				// and forwards its verdict on one straight-line path, so an ask
+				// arriving without one means the setting flipped on mid-flight or
+				// the caller never ran the guard. Deny with an explicitly
+				// retryable detail — the command did not run, the turn is not
+				// aborted, and a re-issue re-reads the setting.
+				if (dcgDecision === undefined) {
+					return {
+						decision: "deny",
+						autoDeny: { kind: "guard_unavailable", command: text },
+					}
+				}
+
+				// The guard returned an explicit allow verdict: DCG is the
+				// authoritative policy — approve.
 				return { decision: "approve" }
 			}
 
@@ -326,9 +339,12 @@ export async function checkAutoApproval({
 				}
 
 				if (containsDangerousSubstitution(text)) {
+					// The substitution check runs chain-wide, so the full command
+					// is the offending one; the list classifier reports no single
+					// offending sub-command when it defers to this branch.
 					return {
 						decision: "deny",
-						autoDeny: { kind: "dangerous_substitution", command: offendingCommand },
+						autoDeny: { kind: "dangerous_substitution", command: offendingCommand ?? text },
 					}
 				}
 

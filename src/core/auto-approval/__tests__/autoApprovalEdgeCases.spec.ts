@@ -30,14 +30,14 @@ describe("command auto-approval edge cases", () => {
 		).toEqual({ decision: "deny", autoDeny: { kind: "not_allowlisted", command: "some-tool" } })
 	})
 
-	it("approves a DCG-enabled command ask that carries no verdict", async () => {
+	it("denies a DCG-enabled command ask that carries no verdict with a retryable guard-state detail", async () => {
 		expect(
 			await checkAutoApproval({
 				state: { ...stateWithoutCommandLists, destructiveCommandGuardEnabled: true },
 				ask: "command",
 				text: "rm file",
 			}),
-		).toEqual({ decision: "approve" })
+		).toEqual({ decision: "deny", autoDeny: { kind: "guard_unavailable", command: "rm file" } })
 	})
 
 	it("reports the denied prefix in its original casing", () => {

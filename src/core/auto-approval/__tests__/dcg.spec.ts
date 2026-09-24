@@ -20,9 +20,10 @@ describe("Destructive Command Guard auto-approval precedence", () => {
 		mcpServers: [],
 	}
 
-	it("auto-approves commands allowed by DCG without consulting Zoo's deny list", async () => {
+	it("denies with the retryable guard-state detail when no verdict is supplied", async () => {
 		expect(await checkAutoApproval({ state: baseState, ask: "command", text: "rm file" })).toEqual({
-			decision: "approve",
+			decision: "deny",
+			autoDeny: { kind: "guard_unavailable", command: "rm file" },
 		})
 	})
 
@@ -38,9 +39,10 @@ describe("Destructive Command Guard auto-approval precedence", () => {
 		).toEqual({ decision: "ask" })
 	})
 
-	it("auto-approves DCG-allowed commands without consulting Zoo's allowlist", async () => {
+	it("denies with the retryable guard-state detail without consulting Zoo's allowlist when no verdict is supplied", async () => {
 		expect(await checkAutoApproval({ state: baseState, ask: "command", text: "unlisted-command" })).toEqual({
-			decision: "approve",
+			decision: "deny",
+			autoDeny: { kind: "guard_unavailable", command: "unlisted-command" },
 		})
 	})
 

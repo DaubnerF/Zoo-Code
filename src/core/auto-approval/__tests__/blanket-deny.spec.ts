@@ -1,4 +1,5 @@
 import { checkAutoApproval } from ".."
+import { baseState as sharedBaseState, type State } from "./fixtures"
 
 // Matrix over the blanket auto-deny feature (`alwaysDenyUnapprovedCommands`):
 // DCG on/off × blanket on/off × command shapes. The blanket setting only
@@ -7,24 +8,13 @@ import { checkAutoApproval } from ".."
 // disengagement cases turn them off to prove the setting is inert.
 describe("blanket auto-deny for unapproved commands", () => {
 	const baseState = {
-		autoApprovalEnabled: true,
-		alwaysAllowReadOnly: false,
-		alwaysAllowReadOnlyOutsideWorkspace: false,
-		alwaysAllowWrite: false,
-		alwaysAllowWriteOutsideWorkspace: false,
-		alwaysAllowWriteProtected: false,
-		alwaysAllowMcp: false,
-		alwaysAllowModeSwitch: false,
-		alwaysAllowSubtasks: false,
-		alwaysAllowFollowupQuestions: false,
+		...sharedBaseState,
 		alwaysAllowExecute: true,
 		allowedCommands: ["git"],
 		deniedCommands: ["rm"],
-		destructiveCommandGuardEnabled: false,
-		alwaysDenyUnapprovedCommands: false,
 	}
 
-	const commandCase = (text: string, overrides: Partial<typeof baseState> = {}, extra: object = {}) =>
+	const commandCase = (text: string, overrides: Partial<State> = {}, extra: object = {}) =>
 		checkAutoApproval({ state: { ...baseState, ...overrides }, ask: "command", text, ...extra })
 
 	describe("DCG disabled", () => {
@@ -80,7 +70,7 @@ describe("blanket auto-deny for unapproved commands", () => {
 				}),
 			).toEqual({
 				decision: "deny",
-				autoDeny: { kind: "dangerous_substitution", command: undefined },
+				autoDeny: { kind: "dangerous_substitution", command: 'echo "${var@P}"' },
 			})
 		})
 
@@ -169,6 +159,19 @@ describe("blanket auto-deny for unapproved commands", () => {
 					},
 				),
 			).toEqual({ decision: "approve" })
+		})
+
+		it("auto-denies a verdictless command ask with the retryable guard-state detail in both blanket modes", async () => {
+			// Verdictless + guard-on is an inconsistent guard state, not a guard
+			// decision, so the denial is the same in both blanket modes.
+			expect(await commandCase("rm file", { ...dcgState })).toEqual({
+				decision: "deny",
+				autoDeny: { kind: "guard_unavailable", command: "rm file" },
+			})
+			expect(await commandCase("rm file", { ...dcgState, alwaysDenyUnapprovedCommands: true })).toEqual({
+				decision: "deny",
+				autoDeny: { kind: "guard_unavailable", command: "rm file" },
+			})
 		})
 
 		it("auto-denies with the DCG reason when blanket is on", async () => {

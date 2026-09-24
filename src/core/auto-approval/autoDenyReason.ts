@@ -1,17 +1,18 @@
 /**
  * Structured detail attached to automatic command denials.
  *
- * An automatic denial is a denial produced by policy (denylist, blanket
- * auto-deny, DCG block) rather than by a user clicking "reject". The detail
- * travels from `checkAutoApproval` through `Task.ask` to
- * `presentAssistantMessage`, where it selects the structured
+ * An automatic denial is one produced by the system rather than by a user
+ * clicking "reject": from policy (denylist, blanket auto-deny, DCG block) or
+ * from a guard-state inconsistency (`guard_unavailable`), which is not itself
+ * a policy denial. The detail travels from `checkAutoApproval` through
+ * `Task.ask` to `presentAssistantMessage`, where it selects the structured
  * `formatResponse.toolAutoDenied` payload instead of the user-rejection
  * wording — and marks the denial as scoped to its own tool call, so it never
  * aborts the rest of the turn.
  */
 export type AutoDenyDetail = {
-	kind: "dcg" | "denylist" | "not_allowlisted" | "dangerous_substitution" | "malformed_command"
-	/** Offending sub-command text (or the full command, for DCG denials). */
+	kind: "dcg" | "denylist" | "not_allowlisted" | "dangerous_substitution" | "malformed_command" | "guard_unavailable"
+	/** Offending sub-command text (or the full command when no single offending sub-command applies). */
 	command?: string
 	/** Matched denied prefix, for `denylist` denials. */
 	pattern?: string
@@ -38,12 +39,14 @@ export function buildAutoDenyReason(detail: AutoDenyDetail): string {
 		case "not_allowlisted":
 			return `Command \`${detail.command ?? "(unknown)"}\` is not on the command allowlist.`
 		case "dangerous_substitution":
-			return "Command contains shell expansions (${...} forms, process substitution, and similar) that require explicit approval."
+			return "Command contains shell expansions (${...} forms, process substitution, and similar) that are never auto-approved. Choose an approved command without shell expansions."
 		case "malformed_command":
 			return detail.parseError ?? "Command contains a shell syntax error."
 		case "dcg": {
 			const base = `Destructive Command Guard denied the command: ${detail.dcgReason ?? "no reason provided"}`
 			return detail.dcgRuleId ? `${base} (Rule: ${detail.dcgRuleId})` : base
 		}
+		case "guard_unavailable":
+			return `Command \`${detail.command ?? "(unknown)"}\` was not executed: the Destructive Command Guard is enabled but supplied no verdict, which is an internal guard-state inconsistency, not a policy denial. You may retry the same command.`
 	}
 }

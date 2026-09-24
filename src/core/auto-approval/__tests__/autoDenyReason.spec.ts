@@ -28,7 +28,20 @@ describe("buildAutoDenyReason", () => {
 
 	it("returns the fixed shell-expansion warning for dangerous_substitution", () => {
 		expect(buildAutoDenyReason({ kind: "dangerous_substitution", command: 'echo "${var@P}"' })).toBe(
-			"Command contains shell expansions (${...} forms, process substitution, and similar) that require explicit approval.",
+			"Command contains shell expansions (${...} forms, process substitution, and similar) that are never auto-approved. Choose an approved command without shell expansions.",
+		)
+	})
+
+	it("returns the honest retryable detail for guard_unavailable", () => {
+		const reason = buildAutoDenyReason({ kind: "guard_unavailable", command: "npm test" })
+		expect(reason).toBe(
+			"Command `npm test` was not executed: the Destructive Command Guard is enabled but supplied no verdict, which is an internal guard-state inconsistency, not a policy denial. You may retry the same command.",
+		)
+		// The never-ask posture: the reason must name the state and invite a
+		// retry without ever pointing at user approval.
+		expect(reason).not.toMatch(/approv|ask the user/i)
+		expect(buildAutoDenyReason({ kind: "guard_unavailable" })).toBe(
+			"Command `(unknown)` was not executed: the Destructive Command Guard is enabled but supplied no verdict, which is an internal guard-state inconsistency, not a policy denial. You may retry the same command.",
 		)
 	})
 

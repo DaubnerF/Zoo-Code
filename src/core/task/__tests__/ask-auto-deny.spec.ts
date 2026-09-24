@@ -154,6 +154,39 @@ describe("Task.ask resolves blanket command denials with structured detail", () 
 		expect(result.autoDenyDetail?.command).toBe("rm x")
 		expect(result.autoDenyDetail?.dcgReason).toBe("matches a destructive pattern")
 	})
+
+	it("flips to the retryable guard-state deny mid-session and heals once the retried ask carries a verdict", async () => {
+		// Simulates the guard setting flipping on between consecutive asks at
+		// the decision-bearing boundary (Task.ask reads provider state per ask,
+		// then checkAutoApproval sees no verdict for the newly-enabled guard).
+		// The sub-microsecond tool-vs-setting window itself is only reachable
+		// end-to-end; what is provable here is that the verdictless arrival
+		// denies with the retryable detail and that a re-issue carrying a
+		// verdict is approved again.
+		const task = buildTask(provider, TASK_CWD)
+		await attachQueue(task)
+
+		// ask 1: guard off — the ordinary blanket path.
+		const before = await task.ask("command", "echo hi", false)
+		expect(before.response).toBe("noButtonClicked")
+		expect(before.autoDenyDetail?.kind).toBe("not_allowlisted")
+
+		// The flip: the guard setting turns on, but this ask arrives without a
+		// verdict — an inconsistent guard state, denied retryably, not approved.
+		state.destructiveCommandGuardEnabled = true
+		const flipped = await task.ask("command", "rm x", false)
+		expect(flipped.response).toBe("noButtonClicked")
+		expect(flipped.autoDenyDetail?.kind).toBe("guard_unavailable")
+		expect(flipped.autoDenyDetail?.command).toBe("rm x")
+
+		// The retry heals: the re-issued ask carries the guard's allow verdict
+		// and approves.
+		const healed = await task.ask("command", "rm x", false, undefined, false, {
+			dcgDecision: { decision: "allow" },
+		})
+		expect(healed.response).toBe("yesButtonClicked")
+		expect(healed.autoDenyDetail).toBeUndefined()
+	})
 })
 
 describe("Task.ask queue path cannot bypass blanket deny", () => {
