@@ -232,13 +232,21 @@ export async function presentAssistantMessage(cline: Task) {
 					// `didRejectTool` (remaining tool calls in the turn proceed)
 					// and no `user_feedback` say (the reason is system-generated).
 					if (autoDenyDetail) {
-						pushToolResult(
-							formatResponse.toolAutoDenied({
-								reason: buildAutoDenyReason(autoDenyDetail),
-								offendingCommand: autoDenyDetail.command,
-								ruleId: autoDenyDetail.dcgRuleId,
-							}),
-						)
+						// `guard_unavailable` marks a guard-state inconsistency, not a
+						// policy denial: the command never ran and a re-issue re-reads
+						// the guard setting, so the payload must stay a retryable error
+						// instead of carrying policy-denial advice.
+						if (autoDenyDetail.kind === "guard_unavailable") {
+							pushToolResult(formatResponse.toolError(buildAutoDenyReason(autoDenyDetail)))
+						} else {
+							pushToolResult(
+								formatResponse.toolAutoDenied({
+									reason: buildAutoDenyReason(autoDenyDetail),
+									offendingCommand: autoDenyDetail.command,
+									ruleId: autoDenyDetail.dcgRuleId,
+								}),
+							)
+						}
 						return false
 					}
 
@@ -558,13 +566,21 @@ export async function presentAssistantMessage(cline: Task) {
 					// Automatic denials never carry queued feedback — a queued
 					// message forces a real ask.
 					if (autoDenyDetail) {
-						pushToolResult(
-							formatResponse.toolAutoDenied({
-								reason: buildAutoDenyReason(autoDenyDetail),
-								offendingCommand: autoDenyDetail.command,
-								ruleId: autoDenyDetail.dcgRuleId,
-							}),
-						)
+						// `guard_unavailable` marks a guard-state inconsistency, not a
+						// policy denial: the command never ran and a re-issue re-reads
+						// the guard setting, so the payload must stay a retryable error
+						// instead of carrying policy-denial advice.
+						if (autoDenyDetail.kind === "guard_unavailable") {
+							pushToolResult(formatResponse.toolError(buildAutoDenyReason(autoDenyDetail)))
+						} else {
+							pushToolResult(
+								formatResponse.toolAutoDenied({
+									reason: buildAutoDenyReason(autoDenyDetail),
+									offendingCommand: autoDenyDetail.command,
+									ruleId: autoDenyDetail.dcgRuleId,
+								}),
+							)
+						}
 						return false
 					}
 

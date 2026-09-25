@@ -2,7 +2,15 @@
 
 import type { ExtensionState } from "@roo-code/types"
 
+import { createRateLimitClock } from "../RateLimitClock"
 import { Task } from "../Task"
+
+// The streaming-loop drive below never asserts on environment details; the
+// real collector reaches into the VS Code window API, which this file's
+// lightweight task stub does not model.
+vi.mock("../../environment/getEnvironmentDetails", () => ({
+	getEnvironmentDetails: vi.fn().mockResolvedValue(""),
+}))
 
 // Blanket auto-deny (`alwaysDenyUnapprovedCommands`) at the Task level: a
 // command ask that policy denies must resolve immediately with the structured
@@ -11,10 +19,12 @@ import { Task } from "../Task"
 // (`autoApprovalDecision: "deny"` + `isAnswered`). A subsequent ask must never
 // see a stale detail from a previous denial.
 
-/** The parts of the provider that `Task.ask` reaches for. */
+/** The parts of the provider that `Task.ask` and the streaming-loop drive reach for. */
 type ProviderStub = {
 	getState: () => Promise<Partial<ExtensionState>>
 	postMessageToWebview: ReturnType<typeof vi.fn>
+	postStateToWebviewWithoutTaskHistory: ReturnType<typeof vi.fn>
+	getSkillsManager: () => undefined
 	cwd: string
 }
 
@@ -49,6 +59,37 @@ async function attachQueue(task: Task) {
 	return queue
 }
 
+/**
+ * Adds the fields `recursivelyMakeClineRequests` touches before its per-turn
+ * reset, so a test can drive one assistant turn without the full provider
+ * harness. The stubbed `attemptApiRequest` streams a single text chunk;
+ * `abandoned` ends the loop right after the stream via the loop's
+ * abort/abandoned exit, so the drive stops before any post-stream tool
+ * presentation and never reaches the retry/backoff paths.
+ */
+function attachTurnHarness(task: Task) {
+	task.messageCounts = { user: 0, assistant: 0 }
+	task.apiConversationHistory = []
+	task["abandoned"] = true
+	Object.defineProperty(task, "api", {
+		value: { getModel: () => ({ id: "gpt-4.1", info: {} }) },
+	})
+	Object.defineProperty(task, "apiConfiguration", { value: { apiProvider: undefined } })
+	Object.defineProperty(task, "rateLimitClock", { value: createRateLimitClock() })
+	Object.defineProperty(task, "diffViewProvider", { value: { isEditing: false, reset: async () => {} } })
+	Object.defineProperty(task, "streamingToolCallIndices", { value: new Map() })
+	task["saveApiConversationHistory"] = vi.fn(async () => true)
+	task["say"] = vi.fn(async () => undefined)
+	// The loop rewrites the newest api_req_started row with cost data; the
+	// no-op `say` stub above never adds one itself.
+	task["clineMessages"].push({ type: "say", say: "api_req_started", text: "{}", ts: Date.now() })
+	task["attemptApiRequest"] = vi.fn().mockImplementation(() =>
+		(async function* () {
+			yield { type: "text" as const, text: "next turn reply" }
+		})(),
+	)
+}
+
 const TASK_CWD = "/path/to/task-workspace"
 
 describe("Task.ask resolves blanket command denials with structured detail", () => {
@@ -68,6 +109,8 @@ describe("Task.ask resolves blanket command denials with structured detail", () 
 		}
 		provider = {
 			postMessageToWebview: vi.fn().mockResolvedValue(undefined),
+			postStateToWebviewWithoutTaskHistory: vi.fn().mockResolvedValue(undefined),
+			getSkillsManager: () => undefined,
 			cwd: TASK_CWD,
 			getState: async () => state,
 		}
@@ -204,6 +247,8 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		}
 		provider = {
 			postMessageToWebview: vi.fn().mockResolvedValue(undefined),
+			postStateToWebviewWithoutTaskHistory: vi.fn().mockResolvedValue(undefined),
+			getSkillsManager: () => undefined,
 			cwd: TASK_CWD,
 			getState: async () => state,
 		}
@@ -244,6 +289,222 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		expect(result.response).toBe("yesButtonClicked")
 		expect(result.autoDenyDetail).toBeUndefined()
 		// Non-durable resolution consumed the queued message.
+		expect(queue.messages).toHaveLength(0)
+	})
+
+	it("keeps the queue gate open (queued message answers the command ask) while autoApprovalEnabled is false", async () => {
+		// The blanket gate is a conjunction of three settings; each false member
+		// alone must disengage it, so the queued shortcut stays live.
+		state.autoApprovalEnabled = false
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		queue.addMessage("queued feedback with the conjunction incomplete")
+
+		const result = await task.ask("command", "rm x", false)
+
+		expect(result.response).toBe("yesButtonClicked")
+		expect(result.text).toBe("queued feedback with the conjunction incomplete")
+		expect(queue.messages).toHaveLength(0)
+	})
+
+	it("keeps the queue gate open (queued message answers the command ask) while alwaysAllowExecute is false", async () => {
+		state.alwaysAllowExecute = false
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		queue.addMessage("queued feedback with the conjunction incomplete")
+
+		const result = await task.ask("command", "rm x", false)
+
+		expect(result.response).toBe("yesButtonClicked")
+		expect(result.text).toBe("queued feedback with the conjunction incomplete")
+		expect(queue.messages).toHaveLength(0)
+	})
+
+	it("denies the command ask when blanket deny engages between the snapshot and the immediate queued consume", async () => {
+		// The ask-time snapshot must not be the last word: the queued shortcut
+		// skips checkAutoApproval, so a blanket-deny engagement landing after the
+		// snapshot is invisible to it and would auto-approve an unallowlisted
+		// command. Interleaving here: first getState = snapshot (deny OFF, so the
+		// message is claimed); second getState = the consume-site re-check, at
+		// which the settings save has landed (deny ON).
+		state.alwaysDenyUnapprovedCommands = false
+		let getStateCalls = 0
+		provider.getState = async () => {
+			getStateCalls++
+			if (getStateCalls >= 2) {
+				state.alwaysDenyUnapprovedCommands = true
+			}
+			return state
+		}
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		queue.addMessage("queued feedback arriving during the flip window")
+
+		const result = await task.ask("command", "rm x", false)
+
+		expect(result.response).toBe("noButtonClicked")
+		expect(result.autoDenyDetail?.kind).toBe("not_allowlisted")
+		// The claimed message was released, not consumed as a fake approval.
+		expect(result.queuedMessageId).toBeUndefined()
+		expect(queue.messages).toHaveLength(1)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
+	it("the user's Deny during the immediate re-check await is not overwritten", async () => {
+		// The Deny lands while the fresh policy read is pending (queued behind
+		// the backlog). The re-check itself still resolves `consume` — applying
+		// that outcome would answer the ask with the queued message's
+		// yesButtonClicked over the user's decision.
+		state.alwaysDenyUnapprovedCommands = false
+		const task = buildTask(provider, TASK_CWD)
+		let getStateCalls = 0
+		provider.getState = async () => {
+			getStateCalls++
+			if (getStateCalls === 2) {
+				task.handleWebviewAskResponse("noButtonClicked")
+			}
+			return state
+		}
+		const queue = await attachQueue(task)
+		queue.addMessage("queued feedback arriving behind the user's Deny")
+
+		const result = await task.ask("command", "rm x", false)
+
+		expect(result.response).toBe("noButtonClicked")
+		expect(result.text).toBeUndefined()
+		expect(result.queuedMessageId).toBeUndefined()
+		// The claim was released, not consumed: the message survives for the
+		// next consumer.
+		expect(queue.messages).toHaveLength(1)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
+	it("a throwing re-check at the immediate site releases the claim and leaves the prompt pending", async () => {
+		// A rejected policy read must neither reject ask() nor strand the claim:
+		// the prompt stays pending for the user and the message survives for a
+		// later consumer.
+		state.alwaysDenyUnapprovedCommands = false
+		let getStateCalls = 0
+		// Sticky: every read after the snapshot fails, so the drain site's
+		// re-check also fails and the released claim survives for the assertion
+		// poll instead of being re-claimed and legitimately consumed.
+		provider.getState = async () => {
+			getStateCalls++
+			if (getStateCalls >= 2) {
+				throw new Error("policy read failed")
+			}
+			return state
+		}
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		queue.addMessage("queued feedback with a failing policy read")
+		const addToClineMessages = task["addToClineMessages"] as ReturnType<typeof vi.fn>
+
+		const askPromise = task.ask("command", "rm x", false)
+		// Past the prompt post, into the re-check await; then poll for the
+		// catch-arm's claim release (no fixed sleep).
+		await vi.waitFor(() => expect(addToClineMessages).toHaveBeenCalledTimes(1))
+		await vi.waitFor(() => expect(queue.hasUnclaimed()).toBe(true))
+
+		task.approveAsk()
+		const result = await askPromise
+		expect(result.response).toBe("yesButtonClicked")
+		expect(result.text).toBeUndefined()
+		expect(result.queuedMessageId).toBeUndefined()
+		expect(queue.messages).toHaveLength(1)
+	})
+
+	it("denies the command ask when blanket deny engages during the prompt dwell and the drain claims a message", async () => {
+		// The seconds-wide fail-open window: the flip and the queue arrival both
+		// land during the pWaitFor dwell, after the frozen snapshot gate opened.
+		state.alwaysDenyUnapprovedCommands = false
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		const addToClineMessages = task["addToClineMessages"] as ReturnType<typeof vi.fn>
+
+		const askPromise = task.ask("command", "rm x", false)
+		// Past the snapshot read, into the prompt dwell.
+		await vi.waitFor(() => expect(addToClineMessages).toHaveBeenCalledTimes(1))
+		state.alwaysDenyUnapprovedCommands = true
+		queue.addMessage("queued during the dwell")
+
+		const result = await askPromise
+
+		expect(result.response).toBe("noButtonClicked")
+		expect(result.autoDenyDetail?.kind).toBe("not_allowlisted")
+		expect(result.queuedMessageId).toBeUndefined()
+		expect(queue.messages).toHaveLength(1)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
+	it("a tool ask after a blanket-denied command leaves both queued messages for the user instead of self-approving", async () => {
+		// A message left in the queue by a blanket denial answers that denial, not
+		// whatever ask runs next in the same turn; consuming it as
+		// yesButtonClicked would silently approve (and suppress the prompt for)
+		// the next ask.
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		const addToClineMessages = task["addToClineMessages"] as ReturnType<typeof vi.fn>
+		queue.addMessage("feedback on the denied command")
+
+		const denied = await task.ask("command", "rm x", false)
+		expect(denied.response).toBe("noButtonClicked")
+		expect(task["blanketDeniedCommandThisTurn"]).toBe(true)
+
+		// Same turn: a non-command ask may claim the surviving message; the latch
+		// must stop it from being consumed as approval.
+		let settled: Awaited<ReturnType<Task["ask"]>> | undefined
+		const toolAsk = task
+			.ask("tool", JSON.stringify({ tool: "write_to_file", path: "a.txt" }), false)
+			.then((result) => {
+				settled = result
+				return result
+			})
+		await vi.waitFor(() => expect(addToClineMessages).toHaveBeenCalledTimes(2))
+		// A second message arriving during the dwell exercises the drain site's
+		// latch guard, not just the immediate-consume guard.
+		queue.addMessage("second message during the tool-ask dwell")
+		// Poll with a deadline for the failure mode (ask self-resolving via the
+		// queue); a correctly latched ask stays pending for the user.
+		await vi.waitFor(() => expect(settled).toBeDefined(), { timeout: 350, interval: 25 }).catch(() => undefined)
+		expect(settled).toBeUndefined()
+		expect(queue.messages).toHaveLength(2)
+
+		// The user answers the prompt themselves; neither queued message rides along.
+		task.approveAsk()
+		const result = await toolAsk
+		expect(result.response).toBe("yesButtonClicked")
+		expect(result.text).toBeUndefined()
+		expect(result.queuedMessageId).toBeUndefined()
+		expect(queue.messages).toHaveLength(2)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
+	it("the next turn's tool ask consumes the queued message once the latch reset clears it", async () => {
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		attachTurnHarness(task)
+		queue.addMessage("queued feedback")
+
+		const denied = await task.ask("command", "rm x", false)
+		expect(denied.response).toBe("noButtonClicked")
+		expect(task["blanketDeniedCommandThisTurn"]).toBe(true)
+
+		// The only production clear is the per-turn reset inside the streaming
+		// loop (beside didToolFailInCurrentTurn), so the latch is released by
+		// driving a real assistant turn — a hand-set flag would not pin it.
+		await task.recursivelyMakeClineRequests([{ type: "text", text: "next turn" }], false)
+		expect(task["blanketDeniedCommandThisTurn"]).toBe(false)
+
+		const result = await task.ask("tool", JSON.stringify({ tool: "readFile", path: "a.txt" }), false)
+
+		expect(result.response).toBe("yesButtonClicked")
+		expect(result.text).toBe("queued feedback")
 		expect(queue.messages).toHaveLength(0)
 	})
 })

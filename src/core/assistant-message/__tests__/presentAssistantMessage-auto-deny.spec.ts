@@ -177,6 +177,14 @@ const DCG_DENY_DETAIL = {
 	dcgRuleId: "R-1",
 }
 
+// Mirrors checkAutoApproval's guard-state branch: a verdictless ask under an
+// enabled Destructive Command Guard denies with kind "guard_unavailable", a
+// guard-state inconsistency that must reach the model as a retryable error.
+const GUARD_UNAVAILABLE_DETAIL = {
+	kind: "guard_unavailable" as const,
+	command: "npm test",
+}
+
 // Captures the boolean a tool receives back from askApproval; vi.clearAllMocks()
 // does not reset closures, so beforeEach must clear this explicitly.
 let execApproval: boolean | undefined
@@ -267,6 +275,113 @@ describe("presentAssistantMessage - automatic (policy) denials", () => {
 		expect(secondResult.tool_use_id).toBe("call_ls")
 		expect(secondResult.content).toBe("second tool executed")
 		expect(secondResult.is_error).toBeUndefined()
+	})
+
+	it("routes guard_unavailable to a retryable toolError while a policy kind keeps toolAutoDenied (command askApproval copy)", async () => {
+		mockTask.assistantMessageContent = [executeCommandBlock, listFilesBlock]
+
+		// First ask: guard-state denial (retryable). Second ask: policy denial
+		// (sibling kind through the same harness) — must stay toolAutoDenied.
+		mockTask.ask
+			.mockResolvedValueOnce({ response: "noButtonClicked", autoDenyDetail: GUARD_UNAVAILABLE_DETAIL })
+			.mockResolvedValueOnce({ response: "noButtonClicked", autoDenyDetail: NOT_ALLOWLISTED_DETAIL })
+
+		await presentAssistantMessage(asTask(mockTask))
+
+		expect(mockTask.userMessageContent).toHaveLength(2)
+
+		// guard_unavailable is a guard-state inconsistency, not a policy denial:
+		// the model must receive the retryable toolError payload, not the
+		// auto_deny denial that advises switching to approved commands.
+		const guardPayload = JSON.parse(mockTask.userMessageContent[0].content as string)
+		expect(guardPayload.status).toBe("error")
+		expect(guardPayload.message).toBe("The tool execution failed")
+		expect(guardPayload.error).toContain("Command `npm test` was not executed")
+		expect(guardPayload.error).toContain("internal guard-state inconsistency")
+		expect(guardPayload.error).toContain("You may retry the same command")
+		expect(guardPayload).not.toHaveProperty("type")
+		expect(guardPayload).not.toHaveProperty("note")
+		expect(guardPayload).not.toHaveProperty("suggestion")
+
+		// The tool treats it as a refusal (return false) without aborting the turn.
+		expect(execApproval).toBe(false)
+		expect(mockTask.didRejectTool).toBe(false)
+
+		// Sibling policy kind is unchanged: structured auto_deny with the
+		// denial advice.
+		const policyPayload = JSON.parse(mockTask.userMessageContent[1].content as string)
+		expect(policyPayload.status).toBe("denied")
+		expect(policyPayload.type).toBe("auto_deny")
+		expect(policyPayload.reason).toContain("not on the command allowlist")
+	})
+
+	it("routes guard_unavailable to a retryable toolError while a policy kind keeps toolAutoDenied (MCP askApproval copy)", async () => {
+		mockTask.assistantMessageContent = [
+			{
+				type: "mcp_tool_use",
+				id: "call_mcp_a",
+				name: "mcp_my_server_do_thing",
+				serverName: "my_server",
+				toolName: "do_thing",
+				arguments: {},
+				partial: false,
+			},
+			{
+				type: "mcp_tool_use",
+				id: "call_mcp_b",
+				name: "mcp_my_server_other_thing",
+				serverName: "my_server",
+				toolName: "other_thing",
+				arguments: {},
+				partial: false,
+			},
+		]
+
+		mockTask.providerRef = {
+			deref: () => ({
+				getState: vi.fn().mockResolvedValue({ mode: "code", customModes: [] }),
+				getMcpHub: () => ({ findServerNameBySanitizedName: () => undefined }),
+			}),
+		}
+
+		const approvals: boolean[] = []
+		useMcpToolHandle.mockImplementation(
+			async (
+				_task: unknown,
+				_block: unknown,
+				{ askApproval }: { askApproval: (t: string, m?: string) => Promise<boolean> },
+			) => {
+				approvals.push(await askApproval("use_mcp_server", "{}"))
+			},
+		)
+
+		// Same split on the MCP closure: guard-state first (retryable error),
+		// denylist second (policy auto_deny).
+		mockTask.ask
+			.mockResolvedValueOnce({ response: "noButtonClicked", autoDenyDetail: GUARD_UNAVAILABLE_DETAIL })
+			.mockResolvedValueOnce({
+				response: "noButtonClicked",
+				autoDenyDetail: { kind: "denylist", command: "rm x", pattern: "rm" },
+			})
+
+		await presentAssistantMessage(asTask(mockTask))
+
+		expect(mockTask.userMessageContent).toHaveLength(2)
+
+		const guardPayload = JSON.parse(mockTask.userMessageContent[0].content as string)
+		expect(guardPayload.status).toBe("error")
+		expect(guardPayload.error).toContain("internal guard-state inconsistency")
+		expect(guardPayload.error).toContain("You may retry the same command")
+		expect(guardPayload).not.toHaveProperty("type")
+		expect(guardPayload).not.toHaveProperty("suggestion")
+
+		const policyPayload = JSON.parse(mockTask.userMessageContent[1].content as string)
+		expect(policyPayload.status).toBe("denied")
+		expect(policyPayload.type).toBe("auto_deny")
+		expect(policyPayload.reason).toContain("matches denied prefix `rm`")
+
+		expect(approvals).toEqual([false, false])
+		expect(mockTask.didRejectTool).toBe(false)
 	})
 
 	it("routes an auto-deny through the MCP askApproval copy without aborting the turn", async () => {
