@@ -442,6 +442,98 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		expect(queue.hasUnclaimed()).toBe(true)
 	})
 
+	it("the user's Deny landing while the drain-site re-check awaits is not overwritten", async () => {
+		// Distinct from the immediate-site supersede case: the message arrives
+		// during the prompt dwell, so the claim and the policy re-check run
+		// inside the pWaitFor predicate's drain closure. The Deny lands while
+		// that re-check awaits; without the closure's bail-out guard the drained
+		// message would answer the ask over the user's decision.
+		state.alwaysDenyUnapprovedCommands = false
+		const task = buildTask(provider, TASK_CWD)
+		let getStateCalls = 0
+		provider.getState = async () => {
+			getStateCalls++
+			if (getStateCalls === 2) {
+				// The Deny lands while the drain closure's fresh policy read is
+				// pending (first call is the ask's snapshot).
+				task.handleWebviewAskResponse("noButtonClicked")
+			}
+			return state
+		}
+		const queue = await attachQueue(task)
+		const addToClineMessages = task["addToClineMessages"] as ReturnType<typeof vi.fn>
+
+		const askPromise = task.ask("command", "rm x", false)
+		// Past the snapshot read, into the dwell; the message arriving now
+		// forces the drain site rather than the immediate consume path.
+		await vi.waitFor(() => expect(addToClineMessages).toHaveBeenCalledTimes(1))
+		queue.addMessage("queued during the dwell, superseded by the user's Deny")
+
+		const result = await askPromise
+
+		expect(result.response).toBe("noButtonClicked")
+		expect(result.text).toBeUndefined()
+		expect(result.queuedMessageId).toBeUndefined()
+		// The provisional claim was released, not consumed: the message
+		// survives for the next consumer.
+		expect(queue.messages).toHaveLength(1)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
+	it("latches the turn when the denial fires at the drain site and the latch blocks the follow-up ask", async () => {
+		// The drain-site denial takes the same latch path as the immediate site
+		// (the deny branch of `applyQueuedCommandPolicyAction`); the follow-up
+		// ask proves the latch — not just this ask's denial result — keeps
+		// queue messages from standing in as approval for the rest of the turn.
+		state.alwaysDenyUnapprovedCommands = false
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		const addToClineMessages = task["addToClineMessages"] as ReturnType<typeof vi.fn>
+
+		const askPromise = task.ask("command", "rm x", false)
+		// Past the snapshot read, into the prompt dwell: the flip and the
+		// message arrival both land during the dwell, so the denial is produced
+		// by the drain site's re-check rather than the frozen snapshot gate.
+		await vi.waitFor(() => expect(addToClineMessages).toHaveBeenCalledTimes(1))
+		state.alwaysDenyUnapprovedCommands = true
+		queue.addMessage("queued during the dwell")
+
+		const denied = await askPromise
+		expect(denied.response).toBe("noButtonClicked")
+		expect(denied.autoDenyDetail?.kind).toBe("not_allowlisted")
+		// The latch set is the drain-site path's, not the main ask path's: the
+		// snapshot saw the blanket setting off, so `checkAutoApproval` asked.
+		expect(task["blanketDeniedCommandThisTurn"]).toBe(true)
+
+		// Same turn: with the latch set, `mayDrainQueuedMessageForAsk` gates the
+		// claim itself at both consume sites, so the follow-up ask never claims
+		// either queued message — no message may answer it as approval.
+		let settled: Awaited<ReturnType<Task["ask"]>> | undefined
+		const toolAsk = task
+			.ask("tool", JSON.stringify({ tool: "write_to_file", path: "a.txt" }), false)
+			.then((result) => {
+				settled = result
+				return result
+			})
+		await vi.waitFor(() => expect(addToClineMessages).toHaveBeenCalledTimes(2))
+		queue.addMessage("second message during the tool-ask dwell")
+		// Poll with a deadline for the failure mode (ask self-resolving via the
+		// queue); a correctly latched ask stays pending for the user.
+		await vi.waitFor(() => expect(settled).toBeDefined(), { timeout: 350, interval: 25 }).catch(() => undefined)
+		expect(settled).toBeUndefined()
+		expect(queue.messages).toHaveLength(2)
+
+		// The user answers the prompt themselves; neither queued message rides along.
+		task.approveAsk()
+		const result = await toolAsk
+		expect(result.response).toBe("yesButtonClicked")
+		expect(result.text).toBeUndefined()
+		expect(result.queuedMessageId).toBeUndefined()
+		expect(queue.messages).toHaveLength(2)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
 	it("a tool ask after a blanket-denied command leaves both queued messages for the user instead of self-approving", async () => {
 		// A message left in the queue by a blanket denial answers that denial, not
 		// whatever ask runs next in the same turn; consuming it as

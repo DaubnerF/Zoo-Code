@@ -26,6 +26,11 @@ vitest.mock("vscode", () => ({
 	workspace: {
 		getConfiguration: vitest.fn(),
 	},
+	// The Task module's real blanket-policy helpers load the editor decoration
+	// controller, which builds a decoration type at import time.
+	window: {
+		createTextEditorDecorationType: vitest.fn().mockReturnValue({ dispose: vitest.fn() }),
+	},
 }))
 
 vitest.mock("../../../integrations/terminal/TerminalRegistry", () => ({
@@ -43,7 +48,13 @@ vitest.mock("../../../integrations/terminal/TerminalRegistry", () => ({
 	},
 }))
 
-vitest.mock("../../task/Task")
+// The handler calls `isBlanketDenyEngaged` and reads
+// `BLANKET_DENY_AUTO_DENY_KINDS` from the Task module, so the blanket-policy
+// helpers must stay real while the Task class itself stays a stub.
+vitest.mock("../../task/Task", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../task/Task")>()
+	return { ...actual, Task: vitest.fn() }
+})
 vitest.mock("../../prompts/responses")
 
 const mockRunDcg = vitest.fn()
@@ -88,6 +99,7 @@ describe("executeCommandTool", () => {
 			recordToolUsage: vitest.fn().mockReturnValue({} as ToolUsage),
 			recordToolError: vitest.fn(),
 			supersedePendingAsk: vitest.fn(),
+			recordBlanketCommandDenial: vitest.fn(),
 			providerRef: {
 				deref: vitest.fn().mockResolvedValue({
 					contextProxy: {
@@ -440,6 +452,102 @@ describe("executeCommandTool", () => {
 			})
 
 			expect(mockAskApproval).toHaveBeenCalledWith("command", "echo test", undefined, true)
+		})
+
+		it("denies an approved command at execute time when blanket deny engages during the approval dwell", async () => {
+			// The seconds-wide window: the approval rode on the pre-ask snapshot
+			// taken with blanket deny off, and the engagement save lands before
+			// the command reaches the terminal. The execute-time re-check must
+			// deny instead of executing, and the blanket-kind denial must latch
+			// the turn so the queue message this denial leaves cannot stand in
+			// as approval for a later ask.
+			const provider = await mockCline.providerRef.deref()
+			provider.getState
+				.mockResolvedValueOnce({
+					alwaysDenyUnapprovedCommands: false,
+					autoApprovalEnabled: true,
+					alwaysAllowExecute: true,
+					allowedCommands: [],
+					deniedCommands: [],
+					destructiveCommandGuardEnabled: false,
+					terminalShellIntegrationDisabled: true,
+				})
+				.mockResolvedValue({
+					alwaysDenyUnapprovedCommands: true,
+					autoApprovalEnabled: true,
+					alwaysAllowExecute: true,
+					allowedCommands: [],
+					deniedCommands: [],
+					destructiveCommandGuardEnabled: false,
+					terminalShellIntegrationDisabled: true,
+				})
+			mockAskApproval.mockResolvedValue(true)
+
+			// The `as Task` cast is documentary — the harness double is `any`-typed,
+			// so it and the `vi.fn` callbacks already satisfy the parameter types.
+			await executeCommandTool.handle(mockCline as Task, mockToolUse, {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+			})
+
+			// Position pin: the denial must arrive after an ask actually happened —
+			// a pre-approval gate would deny without ever asking.
+			expect(mockAskApproval).toHaveBeenCalledTimes(1)
+
+			// Denied, not executed: the command never reaches the terminal.
+			expect(executeCommandModule.executeCommandInTerminal).not.toHaveBeenCalled()
+			expect(mockCline.recordBlanketCommandDenial).toHaveBeenCalledTimes(1)
+			expect(formatResponse.toolAutoDenied).toHaveBeenCalledWith({
+				reason: expect.stringContaining("not on the command allowlist"),
+				offendingCommand: "echo test",
+				ruleId: undefined,
+			})
+			expect(formatResponse.toolError).not.toHaveBeenCalled()
+			expect(mockPushToolResult).toHaveBeenCalledTimes(1)
+		})
+
+		it("routes a guard flip during the approval dwell to a retryable error without latching", async () => {
+			// The DCG setting flips on between approval and execution: the tool
+			// holds no verdict for this command, so the fresh read denies with the
+			// guard-state inconsistency. That is not a policy denial: the payload
+			// stays a retryable tool error, and nothing latches — a re-issue
+			// carrying a verdict may still execute.
+			const provider = await mockCline.providerRef.deref()
+			provider.getState
+				.mockResolvedValueOnce({
+					alwaysDenyUnapprovedCommands: true,
+					autoApprovalEnabled: true,
+					alwaysAllowExecute: true,
+					allowedCommands: [],
+					deniedCommands: [],
+					destructiveCommandGuardEnabled: false,
+					terminalShellIntegrationDisabled: true,
+				})
+				.mockResolvedValue({
+					alwaysDenyUnapprovedCommands: true,
+					autoApprovalEnabled: true,
+					alwaysAllowExecute: true,
+					allowedCommands: [],
+					deniedCommands: [],
+					destructiveCommandGuardEnabled: true,
+					terminalShellIntegrationDisabled: true,
+				})
+			mockAskApproval.mockResolvedValue(true)
+
+			await executeCommandTool.handle(mockCline as Task, mockToolUse, {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+			})
+
+			// Same position pin as the sibling test: asked first, denied by the re-check.
+			expect(mockAskApproval).toHaveBeenCalledTimes(1)
+			expect(executeCommandModule.executeCommandInTerminal).not.toHaveBeenCalled()
+			expect(mockCline.recordBlanketCommandDenial).not.toHaveBeenCalled()
+			expect(formatResponse.toolAutoDenied).not.toHaveBeenCalled()
+			expect(formatResponse.toolError).toHaveBeenCalledWith(expect.stringContaining("not a policy denial"))
+			expect(mockPushToolResult).toHaveBeenCalledTimes(1)
 		})
 
 		it("installs or updates DCG before evaluating an enabled command", async () => {

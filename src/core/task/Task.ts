@@ -172,7 +172,7 @@ type QueuedAskResolution = { response: ClineAskResponse; requiresDurableAck: boo
  * of these kinds is blanket-caused. `denylist` and `guard_unavailable` are
  * excluded: they deny independently of the blanket setting.
  */
-const BLANKET_DENY_AUTO_DENY_KINDS: ReadonlySet<AutoDenyDetail["kind"]> = new Set([
+export const BLANKET_DENY_AUTO_DENY_KINDS: ReadonlySet<AutoDenyDetail["kind"]> = new Set([
 	"dcg",
 	"not_allowlisted",
 	"dangerous_substitution",
@@ -195,11 +195,12 @@ type QueuedCommandPolicyAction =
  * command auto-approval is on — without those two an unapproved command is
  * prompted rather than auto-approved, so there is nothing to deny.
  *
- * Single source of truth for the derivation: the ask-time snapshot and the
- * consume-site re-reads must not drift apart, or a flip landing between the
- * two decides consumption on stale policy.
+ * Single source of truth for the derivation: the ask-time snapshot, the
+ * consume-site re-reads, and the tool-level execute-time re-check must not
+ * drift apart, or a flip landing between two of them decides execution or
+ * consumption on stale policy.
  */
-function isBlanketDenyEngaged(
+export function isBlanketDenyEngaged(
 	state?: Pick<ExtensionState, "alwaysDenyUnapprovedCommands" | "autoApprovalEnabled" | "alwaysAllowExecute">,
 ): boolean {
 	return (
@@ -1165,6 +1166,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 */
 	private mayDrainQueuedMessageForAsk(): boolean {
 		return !this.blanketDeniedCommandThisTurn && this.messageQueueService.hasUnclaimed()
+	}
+
+	/**
+	 * Latch the turn after a blanket-caused command denial detected outside
+	 * the ask path (the tool's execute-time policy re-check). A message left
+	 * in the queue by that denial answers the denial, not the next ask, so
+	 * without the latch a later non-command ask would consume it as an
+	 * approval. Deliberately not cleared mid-turn: the per-turn reset owns
+	 * clearing.
+	 */
+	public recordBlanketCommandDenial(): void {
+		this.blanketDeniedCommandThisTurn = true
 	}
 
 	static create(options: TaskOptions): [Task, Promise<void>] {

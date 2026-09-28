@@ -7,7 +7,8 @@ import delay from "delay"
 import { CommandExecutionStatus, DEFAULT_TERMINAL_OUTPUT_PREVIEW_SIZE, PersistedCommandOutput } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 
-import { Task } from "../task/Task"
+import { buildAutoDenyReason, checkAutoApproval } from "../auto-approval"
+import { BLANKET_DENY_AUTO_DENY_KINDS, isBlanketDenyEngaged, Task } from "../task/Task"
 import type { ClineProvider } from "../webview/ClineProvider"
 
 import type { DcgDecision } from "../../services/destructive-command-guard"
@@ -154,17 +155,22 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 
 			// The blanket auto-deny setting only engages while command auto-approval
 			// is on. A DCG block keeps its protected user prompt unless the blanket
-			// setting is fully engaged, in which case it is auto-denied. The blanket
-			// decision is frozen to this pre-ask snapshot, while terminal behavior is
-			// re-read after approval so a settings flip during a pending prompt takes
-			// effect. A blanket off-flip landing between this snapshot and Task.ask's
-			// own re-read routes a DCG block to the normal prompt instead of the
-			// protected one; a user still decides either way, so the snapshot stays.
+			// setting is fully engaged, in which case it is auto-denied. This
+			// snapshot governs only how the ask is presented; after approval, the
+			// engagement, the command policy, and terminal behavior are re-derived
+			// from a fresh read (below), so a settings flip during a pending prompt
+			// takes effect — engaging blanket deny denies the command instead of
+			// executing it. A blanket off-flip landing between this snapshot and
+			// Task.ask's own re-read routes a DCG block to the normal prompt instead
+			// of the protected one; a user still decides either way, so the snapshot
+			// stays.
 			const providerState = await provider?.getState()
-			const blanketAutoDeny =
-				providerState?.alwaysDenyUnapprovedCommands === true &&
-				providerState?.autoApprovalEnabled === true &&
-				providerState?.alwaysAllowExecute === true
+			const blanketAutoDeny = isBlanketDenyEngaged(providerState)
+
+			// Outside blanket mode a DCG block is presented as the protected
+			// prompt. The execute-time re-check forwards the same flag so the fresh
+			// decision is computed against the ask the user actually answered.
+			const isProtectedAsk = dcgDecision !== undefined && dcgDecision.decision === "deny" && !blanketAutoDeny
 
 			// DCG-approved commands are auto-approved by checkAutoApproval (from the
 			// passed verdict). A DCG block is either auto-denied with the guard's
@@ -179,7 +185,7 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 			} else if (blanketAutoDeny) {
 				didApprove = await askApproval("command", canonicalCommand, undefined, false, { dcgDecision })
 			} else {
-				didApprove = await askApproval("command", canonicalCommand, undefined, true)
+				didApprove = await askApproval("command", canonicalCommand, undefined, isProtectedAsk)
 			}
 
 			if (!didApprove) {
@@ -188,8 +194,61 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 
 			const executionId = task.lastMessageTs?.toString() ?? Date.now().toString()
 			// Re-read after approval so a settings flip while the approval prompt
-			// was pending is honored for terminal behavior.
-			const { terminalShellIntegrationDisabled = true } = (await provider?.getState()) ?? {}
+			// was pending is honored for terminal behavior and policy.
+			const freshState = await provider?.getState()
+			const { terminalShellIntegrationDisabled = true } = freshState ?? {}
+
+			if (isBlanketDenyEngaged(freshState)) {
+				// Execute-time re-validate: the approval rode on the pre-ask
+				// snapshot, so a blanket-deny engagement that landed between the
+				// approval and this point would otherwise execute a command the
+				// fresh policy denies. Parity call with the drain-site re-check,
+				// forwarding the verdict already computed above — re-running the
+				// guard would respawn the process for no new information. A fresh
+				// policy that still approves executes normally. Routing keeps the
+				// ask-path distinction: `guard_unavailable` marks a guard-state
+				// inconsistency (retryable error, not a policy denial, and no
+				// latch); blanket kinds latch the turn so a queue message left by
+				// this denial cannot be consumed as approval by a later ask.
+				// Consulting the latch instead of the policy would deny commands
+				// whose own approval was legal, inverting approval semantics.
+				const recheck = await checkAutoApproval({
+					state: freshState,
+					cwd: task.cwd,
+					ask: "command",
+					text: canonicalCommand,
+					isProtected: isProtectedAsk,
+					dcgDecision,
+				})
+				if (recheck.decision === "deny") {
+					const detail = recheck.autoDeny
+					// Fail closed: a deny without structured detail (permitted by the
+					// result type, produced by no command-policy branch today) must
+					// still block execution — it rides the retryable-error channel
+					// like `guard_unavailable` instead of falling through to the terminal.
+					if (!detail || detail.kind === "guard_unavailable") {
+						pushToolResult(
+							formatResponse.toolError(
+								detail
+									? buildAutoDenyReason(detail)
+									: `Command \`${canonicalCommand}\` was not executed: the command policy denied it without a reason. You may retry the same command.`,
+							),
+						)
+						return
+					}
+					if (BLANKET_DENY_AUTO_DENY_KINDS.has(detail.kind)) {
+						task.recordBlanketCommandDenial()
+					}
+					pushToolResult(
+						formatResponse.toolAutoDenied({
+							reason: buildAutoDenyReason(detail),
+							offendingCommand: detail.command,
+							ruleId: detail.dcgRuleId,
+						}),
+					)
+					return
+				}
+			}
 
 			// Get command execution timeout from VSCode configuration (in seconds)
 			const commandExecutionTimeoutSeconds = vscode.workspace
