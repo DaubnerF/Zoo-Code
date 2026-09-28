@@ -185,6 +185,22 @@ const GUARD_UNAVAILABLE_DETAIL = {
 	command: "npm test",
 }
 
+// Mirrors checkAutoApproval's dangerous-substitution branch: under blanket deny
+// a command with shell expansions is never auto-approved; the detail carries a
+// kind-fixed reason and no rule id or parse error.
+const DANGEROUS_SUBSTITUTION_DETAIL = {
+	kind: "dangerous_substitution" as const,
+	command: 'echo "${var@P}"',
+}
+
+// Mirrors checkAutoApproval's malformed_command branch: an unterminated quote
+// denies with the parser's syntax error forwarded verbatim.
+const MALFORMED_COMMAND_DETAIL = {
+	kind: "malformed_command" as const,
+	command: "sh -c 'echo a",
+	parseError: "unexpected EOF while looking for matching quote",
+}
+
 // Captures the boolean a tool receives back from askApproval; vi.clearAllMocks()
 // does not reset closures, so beforeEach must clear this explicitly.
 let execApproval: boolean | undefined
@@ -638,5 +654,66 @@ describe("presentAssistantMessage - automatic (policy) denials", () => {
 		expect(payload.rule_id).toBe("R-1")
 		expect(mcpApproval).toBe(false)
 		expect(mockTask.didRejectTool).toBe(false)
+	})
+
+	it("denies dangerous_substitution with the fixed shell-expansion reason without aborting the turn", async () => {
+		mockTask.assistantMessageContent = [executeCommandBlock, listFilesBlock]
+
+		// First ask: blanket denial of a shell-expansion command. Second ask:
+		// approval — the denial must stay scoped to its own tool call.
+		mockTask.ask
+			.mockResolvedValueOnce({ response: "noButtonClicked", autoDenyDetail: DANGEROUS_SUBSTITUTION_DETAIL })
+			.mockResolvedValueOnce({ response: "yesButtonClicked" })
+
+		await presentAssistantMessage(asTask(mockTask))
+
+		expect(mockTask.userMessageContent).toHaveLength(2)
+
+		const denialPayload = JSON.parse(mockTask.userMessageContent[0].content as string)
+		expect(denialPayload.status).toBe("denied")
+		expect(denialPayload.type).toBe("auto_deny")
+		// The reason is kind-fixed and carries no rule id: expansion forms are
+		// never auto-approved under blanket deny.
+		expect(denialPayload.reason).toContain("shell expansions")
+		expect(denialPayload.reason).toContain("never auto-approved")
+		expect(denialPayload.offending_command).toBe('echo "${var@P}"')
+		expect(denialPayload).not.toHaveProperty("rule_id")
+
+		// The boundary assertions of the dcg/not_allowlisted pins: the tool sees a
+		// refusal — it must not execute the command — and the denial does not
+		// abort the turn the way a user rejection does.
+		expect(execApproval).toBe(false)
+		expect(mockTask.didRejectTool).toBe(false)
+
+		// The reason is system-generated: it must not surface as user feedback.
+		expect(mockTask.say).not.toHaveBeenCalledWith("user_feedback", expect.anything(), expect.anything())
+
+		// The denial is scoped to its own tool call: the next tool still executes.
+		expect(listFilesHandle).toHaveBeenCalledTimes(1)
+		expect(mockTask.userMessageContent[1].content).toBe("second tool executed")
+	})
+
+	it("denies malformed_command with the forwarded parse error without aborting the turn", async () => {
+		mockTask.assistantMessageContent = [executeCommandBlock]
+
+		mockTask.ask.mockResolvedValueOnce({ response: "noButtonClicked", autoDenyDetail: MALFORMED_COMMAND_DETAIL })
+
+		await presentAssistantMessage(asTask(mockTask))
+
+		expect(mockTask.userMessageContent).toHaveLength(1)
+		const denialPayload = JSON.parse(mockTask.userMessageContent[0].content as string)
+		expect(denialPayload.status).toBe("denied")
+		expect(denialPayload.type).toBe("auto_deny")
+		// A malformed_command denial carries its parse error through to the payload
+		// verbatim — the boundary must not flatten it to the generic reason.
+		expect(denialPayload.reason).toBe("unexpected EOF while looking for matching quote")
+		expect(denialPayload.offending_command).toBe("sh -c 'echo a")
+		expect(denialPayload).not.toHaveProperty("rule_id")
+
+		// Same boundary assertions as the dcg/not_allowlisted pins: refusal
+		// without execution, no turn abort, no user_feedback row.
+		expect(execApproval).toBe(false)
+		expect(mockTask.didRejectTool).toBe(false)
+		expect(mockTask.say).not.toHaveBeenCalledWith("user_feedback", expect.anything(), expect.anything())
 	})
 })
