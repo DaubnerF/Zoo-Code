@@ -1,6 +1,6 @@
 // npx vitest run core/task/__tests__/ask-auto-deny.spec.ts
 
-import type { ExtensionState } from "@roo-code/types"
+import { type ClineMessage, type ExtensionState, RooCodeEventName } from "@roo-code/types"
 
 import { createRateLimitClock } from "../RateLimitClock"
 import { Task } from "../Task"
@@ -91,6 +91,29 @@ function attachTurnHarness(task: Task) {
 }
 
 const TASK_CWD = "/path/to/task-workspace"
+
+/**
+ * Swaps the no-op `addToClineMessages` stub for a recording one, so the 2 s
+ * status timers' `findMessageByTimestamp(askTs)` lookup finds the pending ask
+ * row and the interactive emit can actually run.
+ */
+function recordClineMessages(task: Task) {
+	const addToClineMessages = vi.fn(async (message: ClineMessage) => {
+		task["clineMessages"].push(message)
+	})
+	task["addToClineMessages"] = addToClineMessages
+	return addToClineMessages
+}
+
+/**
+ * Installs a fresh `emit` recorder (replacing `buildTask`'s no-op stub) and
+ * returns a counter of this task's `TaskInteractive` emissions.
+ */
+function installInteractiveEmitRecorder(task: Task) {
+	const emit = vi.fn()
+	task["emit"] = emit
+	return () => emit.mock.calls.filter(([event]) => event === RooCodeEventName.TaskInteractive).length
+}
 
 describe("Task.ask resolves blanket command denials with structured detail", () => {
 	// Mutable state so a test can flip the policy between consecutive asks on
@@ -577,6 +600,174 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		expect(queue.hasUnclaimed()).toBe(true)
 	})
 
+	it("arms the interactive status timer when the latch release leaves the ask pending", async () => {
+		// A released claim keeps the queue non-empty, so `isStatusMutable` is
+		// false for the whole dwell and the 2 s interactive arm is skipped
+		// unless the release branch re-arms it: without that, hands-free/API
+		// consumers see `Running` with no `TaskInteractive` for a prompt that
+		// is waiting on the user.
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		recordClineMessages(task)
+		const interactive = installInteractiveEmitRecorder(task)
+		queue.addMessage("feedback on the denied command")
+
+		const denied = await task.ask("command", "rm x", false)
+		expect(denied.response).toBe("noButtonClicked")
+		// The denial resolved on its own: no interactive state was ever entered.
+		expect(interactive()).toBe(0)
+
+		const toolAsk = task.ask("tool", JSON.stringify({ tool: "write_to_file", path: "a.txt" }), false)
+		await vi.waitFor(() => expect(interactive()).toBe(1), { timeout: 6_000 })
+		expect(provider.postMessageToWebview).toHaveBeenCalledWith({ type: "interactionRequired" })
+
+		task.approveAsk()
+		const result = await toolAsk
+		expect(result.response).toBe("yesButtonClicked")
+		expect(queue.messages).toHaveLength(1)
+	})
+
+	it("arms the interactive status timer when a throwing re-check releases the prompt pending", async () => {
+		// A rejected policy read leaves the prompt pending for the user, so the
+		// catch's claim release must arm the 2 s interactive timer: with the
+		// queue non-empty, `isStatusMutable` — computed once, before the claim — never armed.
+		state.alwaysDenyUnapprovedCommands = false
+		let getStateCalls = 0
+		provider.getState = async () => {
+			getStateCalls++
+			if (getStateCalls >= 2) {
+				throw new Error("policy read failed")
+			}
+			return state
+		}
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		recordClineMessages(task)
+		const interactive = installInteractiveEmitRecorder(task)
+		queue.addMessage("queued feedback with a failing policy read")
+
+		const askPromise = task.ask("command", "rm x", false)
+		await vi.waitFor(() => expect(queue.hasUnclaimed()).toBe(true))
+		await vi.waitFor(() => expect(interactive()).toBe(1), { timeout: 6_000 })
+
+		task.approveAsk()
+		const result = await askPromise
+		expect(result.response).toBe("yesButtonClicked")
+		expect(queue.messages).toHaveLength(1)
+	})
+
+	it("emits exactly one TaskInteractive when back-to-back policy releases leave the prompt pending", async () => {
+		// Two release branches run for one prompt: the immediate-site fresh
+		// read answers `release` (blanket engages at the re-read, and the
+		// protected prompt survives it), which arms the interactive timer even
+		// though the non-empty queue skipped the `isStatusMutable`-gated arm
+		// (computed once, before the claim); the predicate then re-claims the
+		// released message and the drain
+		// release re-arms. The idempotence guard must make that second (and
+		// every later) arm a no-op: without it, one prompt emits
+		// `TaskInteractive`/`interactionRequired` more than once.
+		state.alwaysDenyUnapprovedCommands = false
+		let getStateCalls = 0
+		provider.getState = async () => {
+			getStateCalls++
+			if (getStateCalls === 2) {
+				// The flip lands at the immediate-site fresh read: the frozen
+				// snapshot let the message be claimed, the fresh check must now
+				// neither consume it nor let it answer the ask.
+				state.alwaysDenyUnapprovedCommands = true
+			}
+			return state
+		}
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		recordClineMessages(task)
+		const interactive = installInteractiveEmitRecorder(task)
+		queue.addMessage("queued feedback facing the engaged blanket deny")
+
+		const askPromise = task.ask("command", "some-unknown-command", false, undefined, true)
+
+		const armedAt = Date.now()
+		await vi.waitFor(() => expect(interactive()).toBe(1), { timeout: 6_000 })
+		// Wait past the window in which a second (drain-site) arm would also
+		// fire, then assert the total: the first timer can show up alone
+		// briefly before a hypothetical second one, so the count is only
+		// meaningful after both would have expired.
+		await vi.waitFor(() => expect(Date.now() - armedAt).toBeGreaterThan(2_600), { timeout: 5_000 })
+		expect(interactive()).toBe(1)
+		expect(
+			provider.postMessageToWebview.mock.calls.filter(([message]) => message?.type === "interactionRequired"),
+		).toHaveLength(1)
+
+		task.approveAsk()
+		const result = await askPromise
+		expect(result.response).toBe("yesButtonClicked")
+		expect(queue.messages).toHaveLength(1)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
+	it("settles ask() and releases the claim when the task aborts while the drain re-check is pending", async () => {
+		// The drain's fresh policy read ends in an uncancellable
+		// `provider.getState()`. With that read pending, an abort must not
+		// leave `ask()` riding it: the abort race settles the re-check, the
+		// re-check's finally releases the claim, and `ask()` rejects at the
+		// post-abort throw.
+		state.alwaysDenyUnapprovedCommands = false
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		const addToClineMessages = recordClineMessages(task)
+
+		let getStateCalls = 0
+		provider.getState = () => {
+			getStateCalls++
+			if (getStateCalls >= 2) {
+				// The drain-site re-check never settles: nothing resolves it,
+				// only the abort race ends the ask's dependence on it.
+				return new Promise<Partial<ExtensionState>>(() => {})
+			}
+			return Promise.resolve(state)
+		}
+
+		const setIntervalSpy = vi.spyOn(globalThis, "setInterval")
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval")
+
+		const askPromise = task.ask("command", "rm x", false)
+		await vi.waitFor(() => expect(addToClineMessages).toHaveBeenCalledTimes(1))
+		// The message arriving during the dwell routes the re-check through the
+		// drain site, where the provisional claim and the pending read live.
+		queue.addMessage("queued during the dwell")
+		await vi.waitFor(() => expect(getStateCalls).toBe(2))
+		expect(queue.hasUnclaimed()).toBe(false)
+
+		task["abort"] = true
+
+		// `ask()` must reject on abort; racing a deadline distinguishes a wrong
+		// settle from a hang on the pending read.
+		const outcome = await Promise.race([
+			askPromise.then(
+				() => "resolved",
+				(error: unknown) => (error instanceof Error ? error.message : String(error)),
+			),
+			new Promise<string>((resolve) => setTimeout(() => resolve("deadline-exceeded"), 3_000)),
+		])
+		expect(outcome).toContain("aborted")
+
+		// The claim releases from the re-check's finally once the abort race
+		// settles it, so a later consumer can take the message.
+		await vi.waitFor(() => expect(queue.hasUnclaimed()).toBe(true))
+
+		// The abort watcher must not keep polling past the settle.
+		const intervals = setIntervalSpy.mock.results.map((result) => result.value)
+		expect(intervals.length).toBeGreaterThan(0)
+		for (const interval of intervals) {
+			expect(clearIntervalSpy.mock.calls.some(([cleared]) => cleared === interval)).toBe(true)
+		}
+		setIntervalSpy.mockRestore()
+		clearIntervalSpy.mockRestore()
+	})
+
 	it("the next turn's tool ask consumes the queued message once the latch reset clears it", async () => {
 		const task = buildTask(provider, TASK_CWD)
 		const queue = await attachQueue(task)
@@ -598,5 +789,79 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		expect(result.response).toBe("yesButtonClicked")
 		expect(result.text).toBe("queued feedback")
 		expect(queue.messages).toHaveLength(0)
+	})
+
+	it("does not emit TaskInteractive or retain the armed timer when the task aborts during the 2 s window", async () => {
+		// A status timer armed for 2 s can outlive an abort that lands inside
+		// its window: the ask then throws without ever reaching the response
+		// handling, and a live webview would still receive
+		// `interactionRequired` for a task that no longer runs. Two independent
+		// defenses are pinned: the callbacks' fire-time liveness check, exercised
+		// by invoking the captured callback after the rejection (the sub-tick
+		// race where an already-due timer fires before the teardown sweep cannot
+		// be interleaved deterministically on the real clock), and the
+		// `finally`-sweep, exercised by the clearTimeout handle inventory.
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		recordClineMessages(task)
+		const interactive = installInteractiveEmitRecorder(task)
+		queue.addMessage("feedback on the denied command")
+
+		const denied = await task.ask("command", "rm x", false)
+		expect(denied.response).toBe("noButtonClicked")
+
+		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout")
+		const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout")
+
+		const toolAsk = task.ask("tool", JSON.stringify({ tool: "write_to_file", path: "a.txt" }), false)
+		// The latch-release arm is the only >= 2 s timer this ask can create
+		// (the wait's own poller schedules 100 ms handles), so the exact-delay
+		// filter isolates the status-timer handle without fake timers.
+		const armedArms = () =>
+			setTimeoutSpy.mock.calls
+				.map(([callback, delay], i) => ({ callback, delay, handle: setTimeoutSpy.mock.results[i].value }))
+				.filter((entry) => entry.delay === 2_000)
+		await vi.waitFor(() => expect(armedArms().length).toBe(1), { timeout: 6_000 })
+		const armedAt = Date.now()
+
+		// Abort while the window is still open, shortly after the arm: the
+		// longer this wait runs, the less event-loop-stall slack is left before
+		// the 2 s timer could legitimately fire while the task is still live.
+		await vi.waitFor(() => expect(Date.now() - armedAt).toBeGreaterThanOrEqual(300), { timeout: 2_000 })
+		task["abort"] = true
+
+		const outcome = await toolAsk.then(
+			() => "resolved",
+			(error: unknown) => (error instanceof Error ? error.message : String(error)),
+		)
+		expect(outcome).toContain("aborted")
+
+		// Fire-time guard pin: the captured armed callback, invoked synchronously
+		// after the rejection, must decline on its own — clearing covers only
+		// timers that had not fired yet when the sweep ran.
+		const [armed] = armedArms()
+		armed.callback()
+		expect(interactive()).toBe(0)
+		expect(
+			provider.postMessageToWebview.mock.calls.filter(([message]) => message?.type === "interactionRequired"),
+		).toHaveLength(0)
+
+		// Behavior pin: past the window the timer would have needed, nothing
+		// fires on its own either.
+		await vi.waitFor(() => expect(Date.now() - armedAt).toBeGreaterThan(2_500), { timeout: 6_000 })
+		expect(interactive()).toBe(0)
+		expect(
+			provider.postMessageToWebview.mock.calls.filter(([message]) => message?.type === "interactionRequired"),
+		).toHaveLength(0)
+
+		// Ledger pin: every status-timer handle this ask armed was cleared, on
+		// the throw path included.
+		const clearedHandles = clearTimeoutSpy.mock.calls.map(([cleared]) => cleared)
+		for (const { handle } of armedArms()) {
+			expect(clearedHandles).toContain(handle)
+		}
+
+		setTimeoutSpy.mockRestore()
+		clearTimeoutSpy.mockRestore()
 	})
 })

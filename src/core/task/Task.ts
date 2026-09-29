@@ -1833,12 +1833,45 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const isStatusMutable = !partial && isBlocking && !isMessageQueued && approval.decision === "ask"
 
 		let queuedMessageId: string | undefined
-		if (isStatusMutable) {
+		// Arm the interactive/resumable/idle status timers for this ask: the
+		// single source of that arm, shared between the queue-free case and the
+		// queued-release paths below. A release keeps the message in the queue,
+		// so `isMessageQueued` stays true and `isStatusMutable` — which requires
+		// an empty queue — stays false while the ask waits for the user; arming
+		// only from `isStatusMutable` would leave hands-free/API consumers seeing
+		// `Running` with no `TaskInteractive`/`interactionRequired` for a prompt
+		// that is in fact pending. Idempotent: several arm sites can fire for one
+		// ask (e.g. the
+		// queue-free arm, then a drain-site release), and a second arm would
+		// double-emit the event. The `timeouts` array is the arm ledger, and a
+		// `finally` around the wait owns the `clearTimeout` teardown on every
+		// settle path, including the abort and supersession throws. The
+		// callbacks still re-check liveness at fire time: an already-due timer
+		// can outrun that teardown, and a status transition published after
+		// abort would describe a task that no longer runs.
+		const armAskStatusTimers = (): void => {
+			const askStillPending = this.askResponse === undefined && this.lastMessageTs === askTs
+			if (!askStillPending || this.abort || partial || approval.decision !== "ask" || timeouts.length > 0) {
+				return
+			}
+
 			const statusMutationTimeout = 2_000
+
+			// Fire-time liveness check for the timers armed below. Clearing a due
+			// timer does not retract it: when abort lands between the wait's last
+			// poll tick and the timer's due time, the callback runs before
+			// `ask()`'s continuation reaches the teardown sweep, so liveness has
+			// to be re-checked here. Read-only: the `timeouts` ledger is never
+			// touched from the callbacks.
+			const statusTimerStillLive = (): boolean =>
+				!this.abort && this.askResponse === undefined && this.lastMessageTs === askTs
 
 			if (isInteractiveAsk(type)) {
 				timeouts.push(
 					setTimeout(() => {
+						if (!statusTimerStillLive()) {
+							return
+						}
 						const message = this.findMessageByTimestamp(askTs)
 
 						if (message) {
@@ -1854,6 +1887,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			} else if (isResumableAsk(type)) {
 				timeouts.push(
 					setTimeout(() => {
+						if (!statusTimerStillLive()) {
+							return
+						}
 						const message = this.findMessageByTimestamp(askTs)
 
 						if (message) {
@@ -1865,6 +1901,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			} else if (isIdleAsk(type)) {
 				timeouts.push(
 					setTimeout(() => {
+						if (!statusTimerStillLive()) {
+							return
+						}
 						const message = this.findMessageByTimestamp(askTs)
 
 						if (message) {
@@ -1874,12 +1913,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					}, statusMutationTimeout),
 				)
 			}
+		}
+
+		if (isStatusMutable) {
+			armAskStatusTimers()
 		} else if (isMessageQueued && shouldDrainQueuedMessageForAsk && queuedMessage && queuedAskResolution) {
 			if (this.blanketDeniedCommandThisTurn) {
 				// A command this turn already blanket-denied left the message in the
 				// queue — it answers that denial, not this ask. Release the claim and
 				// let the user answer the prompt normally.
 				this.messageQueueService.releaseMessage(queuedMessage.id)
+				// The prompt stays pending with the queue still non-empty, so the
+				// `isStatusMutable` arm above was skipped and must run from here.
+				armAskStatusTimers()
 			} else if (type === "command") {
 				// The snapshot gate is frozen; blanket deny may have engaged since the
 				// ask began. Re-read policy before the message stands in for approval.
@@ -1901,12 +1947,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							queuedMessage,
 							queuedAskResolution,
 						)
+						// A "release" outcome leaves the ask pending; consume/deny/approve
+						// resolved it, and the helper's pending check declines to arm then.
+						armAskStatusTimers()
 					}
 				} catch (error) {
 					// Drain-site parity: a failed re-check must not reject ask() nor
 					// strand the claim; the prompt stays pending for the user.
 					console.error("[Task#ask] queued command policy re-check failed:", error)
 					this.messageQueueService.releaseMessage(queuedMessage.id)
+					armAskStatusTimers()
 				}
 			} else {
 				queuedMessageId = this.handleQueuedAskResponse(queuedMessage, queuedAskResolution)
@@ -1920,117 +1970,163 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			message: QueuedMessage,
 			resolution: QueuedAskResolution,
 		): Promise<void> => {
-			const action = await this.recheckQueuedCommandPolicy({
-				text,
-				isProtected,
-				dcgDecision: autoApprovalContext?.dcgDecision,
-			})
-			if (this.abort || this.askResponse !== undefined || this.lastMessageTs !== askTs) {
-				// The user answered, the ask was superseded, or the task aborted
-				// while the fresh read was pending: the message is none of this
-				// ask's business — leave it for the next consumer.
-				this.messageQueueService.releaseMessage(message.id)
-				return
+			// The fresh policy read ends in `provider.getState()`, which awaits
+			// custom-mode file work that cannot be cancelled from here. Racing it
+			// against an abort poller settles this re-check within one tick of an
+			// abort instead of leaving `ask()` blocked on the pending read. The race
+			// attaches handlers to both inputs, so the read rejecting after the
+			// watcher wins is already considered handled — no extra `.catch` needed.
+			let abortWatcher: ReturnType<typeof setInterval> | undefined
+			try {
+				const outcome = await Promise.race([
+					this.recheckQueuedCommandPolicy({
+						text,
+						isProtected,
+						dcgDecision: autoApprovalContext?.dcgDecision,
+					}).then((action) => ({ action })),
+					new Promise<{ aborted: true }>((resolve) => {
+						const checkAbort = () => {
+							if (this.abort) {
+								resolve({ aborted: true })
+							}
+						}
+						checkAbort()
+						abortWatcher = setInterval(checkAbort, 100)
+					}),
+				])
+				if (
+					!("aborted" in outcome) &&
+					!this.abort &&
+					this.askResponse === undefined &&
+					this.lastMessageTs === askTs
+				) {
+					queuedMessageId = this.applyQueuedCommandPolicyAction(outcome.action, message, resolution)
+					// A "release" outcome leaves the ask pending while the queue stays
+					// non-empty, so the arm that `isStatusMutable` gates — computed
+					// once, before the claim — must run here.
+					armAskStatusTimers()
+				}
+			} finally {
+				if (abortWatcher !== undefined) {
+					clearInterval(abortWatcher)
+				}
+				// One release path for abort, throw, supersession, and "release".
+				// `releaseMessage` is idempotent, so it stays safe beside the
+				// branch-local releases. The durable consume is the one outcome
+				// that must keep its claim until persistence removes the message —
+				// it is the only path that assigned `queuedMessageId`.
+				if (queuedMessageId !== message.id) {
+					this.messageQueueService.releaseMessage(message.id)
+				}
 			}
-			queuedMessageId = this.applyQueuedCommandPolicyAction(action, message, resolution)
 		}
 
 		// Wait for askResponse to be set
-		await pWaitFor(
-			() => {
-				if (this.abort || this.askResponse !== undefined || this.lastMessageTs !== askTs) {
-					return true
-				}
+		try {
+			await pWaitFor(
+				() => {
+					if (this.abort || this.askResponse !== undefined || this.lastMessageTs !== askTs) {
+						return true
+					}
 
-				// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
-				// suggestion click that was incorrectly queued due to UI state), consume it
-				// immediately so the task doesn't hang. Command asks under blanket deny are
-				// excluded (`queueMayAnswerThisAsk`): a queued message must never stand in
-				// for the explicit approval the policy withheld.
-				if (
-					queueMayAnswerThisAsk &&
-					shouldDrainQueuedMessageForAsk &&
-					!queuedCommandPolicyCheck &&
-					this.mayDrainQueuedMessageForAsk()
-				) {
-					const message = this.messageQueueService.claimNextMessage()
-					const resolution = message ? queuedResponseForAsk(type, text) : undefined
-					if (message && resolution) {
-						if (type === "command") {
-							// Claim first, then verify the policy off-predicate: a
-							// blanket-deny flip landing during the prompt dwell is
-							// invisible to the frozen snapshot gate, so the claim is
-							// provisional until the fresh check clears it.
-							queuedCommandPolicyCheck = verifyDrainedCommandMessage(message, resolution).catch(
-								(error) => {
-									// The background check must never reject unhandled;
-									// on failure the claim is released so the message
-									// stays available to a later consumer.
-									console.error("[Task#ask] queued command policy re-check failed:", error)
-									this.messageQueueService.releaseMessage(message.id)
-								},
-							)
-						} else {
-							queuedMessageId = this.handleQueuedAskResponse(message, resolution)
+					// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
+					// suggestion click that was incorrectly queued due to UI state), consume it
+					// immediately so the task doesn't hang. Command asks under blanket deny are
+					// excluded (`queueMayAnswerThisAsk`): a queued message must never stand in
+					// for the explicit approval the policy withheld.
+					if (
+						queueMayAnswerThisAsk &&
+						shouldDrainQueuedMessageForAsk &&
+						!queuedCommandPolicyCheck &&
+						this.mayDrainQueuedMessageForAsk()
+					) {
+						const message = this.messageQueueService.claimNextMessage()
+						const resolution = message ? queuedResponseForAsk(type, text) : undefined
+						if (message && resolution) {
+							if (type === "command") {
+								// Claim first, then verify the policy off-predicate: a
+								// blanket-deny flip landing during the prompt dwell is
+								// invisible to the frozen snapshot gate, so the claim is
+								// provisional until the fresh check clears it.
+								queuedCommandPolicyCheck = verifyDrainedCommandMessage(message, resolution).catch(
+									(error) => {
+										// The background check must never reject unhandled;
+										// on failure the claim is released so the message
+										// stays available to a later consumer.
+										console.error("[Task#ask] queued command policy re-check failed:", error)
+										this.messageQueueService.releaseMessage(message.id)
+										armAskStatusTimers()
+									},
+								)
+							} else {
+								queuedMessageId = this.handleQueuedAskResponse(message, resolution)
+							}
 						}
 					}
+
+					return false
+				},
+				{ interval: 100 },
+			)
+
+			// Let a policy re-check that was in flight when the wait resolved run to
+			// completion: its bail-out path releases the claim, and leaving it
+			// unresolved would let the consume race the result below. On abort, detach
+			// instead: the re-check races the abort and its `finally` releases the claim
+			// either way, while awaiting an uncancellable read past the abort would
+			// retain this task instead of letting the throw below settle it.
+			if (queuedCommandPolicyCheck && !this.abort) {
+				await queuedCommandPolicyCheck
+			}
+
+			/* v8 ignore next 3 -- abort-while-waiting path; covered by e2e standalone-resume test */
+			if (this.abort) {
+				if (queuedMessageId) {
+					this.messageQueueService.releaseMessage(queuedMessageId)
 				}
-
-				return false
-			},
-			{ interval: 100 },
-		)
-
-		// Let a policy re-check that was in flight when the wait resolved run to
-		// completion: its bail-out path releases the claim, and leaving it
-		// unresolved would let the consume race the result below.
-		if (queuedCommandPolicyCheck) {
-			await queuedCommandPolicyCheck
-		}
-
-		/* v8 ignore next 3 -- abort-while-waiting path; covered by e2e standalone-resume test */
-		if (this.abort) {
-			if (queuedMessageId) {
-				this.messageQueueService.releaseMessage(queuedMessageId)
+				throw new Error(`[ZooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
 			}
-			throw new Error(`[ZooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
-		}
 
-		if (this.lastMessageTs !== askTs) {
-			// Could happen if we send multiple asks in a row i.e. with
-			// command_output. It's important that when we know an ask could
-			// fail, it is handled gracefully.
-			if (queuedMessageId) {
-				this.messageQueueService.releaseMessage(queuedMessageId)
+			if (this.lastMessageTs !== askTs) {
+				// Could happen if we send multiple asks in a row i.e. with
+				// command_output. It's important that when we know an ask could
+				// fail, it is handled gracefully.
+				if (queuedMessageId) {
+					this.messageQueueService.releaseMessage(queuedMessageId)
+				}
+				throw new AskIgnoredError("superseded")
 			}
-			throw new AskIgnoredError("superseded")
+
+			const result = {
+				response: this.askResponse!,
+				text: this.askResponseText,
+				images: this.askResponseImages,
+				queuedMessageId,
+				autoDenyDetail: this.pendingAutoDenyDetail,
+			}
+			this.askResponse = undefined
+			this.askResponseText = undefined
+			this.askResponseImages = undefined
+			this.pendingAutoDenyDetail = undefined
+
+			// Switch back to an active state.
+			if (this.idleAsk || this.resumableAsk || this.interactiveAsk) {
+				this.idleAsk = undefined
+				this.resumableAsk = undefined
+				this.interactiveAsk = undefined
+				this.emit(RooCodeEventName.TaskActive, this.taskId)
+			}
+
+			this.emit(RooCodeEventName.TaskAskResponded)
+			return result
+		} finally {
+			// Teardown for every settle path: the normal resolve and the
+			// abort/supersession throws that never reach the result handling
+			// above. The fire-time guard in the armed callbacks covers the
+			// sub-tick window where an already-due timer fires before this
+			// sweep runs.
+			timeouts.forEach((timeout) => clearTimeout(timeout))
 		}
-
-		const result = {
-			response: this.askResponse!,
-			text: this.askResponseText,
-			images: this.askResponseImages,
-			queuedMessageId,
-			autoDenyDetail: this.pendingAutoDenyDetail,
-		}
-		this.askResponse = undefined
-		this.askResponseText = undefined
-		this.askResponseImages = undefined
-		this.pendingAutoDenyDetail = undefined
-
-		// Cancel the timeouts if they are still running.
-		timeouts.forEach((timeout) => clearTimeout(timeout))
-
-		// Switch back to an active state.
-		if (this.idleAsk || this.resumableAsk || this.interactiveAsk) {
-			this.idleAsk = undefined
-			this.resumableAsk = undefined
-			this.interactiveAsk = undefined
-			this.emit(RooCodeEventName.TaskActive, this.taskId)
-		}
-
-		this.emit(RooCodeEventName.TaskAskResponded)
-		return result
 	}
 
 	handleWebviewAskResponse(askResponse: ClineAskResponse, text?: string, images?: string[]) {

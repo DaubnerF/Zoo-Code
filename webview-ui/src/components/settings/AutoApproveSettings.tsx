@@ -1,4 +1,4 @@
-import { HTMLAttributes, useState } from "react"
+import { FormEvent, HTMLAttributes, useState } from "react"
 import { X } from "lucide-react"
 import { Trans } from "react-i18next"
 import { Package } from "@roo/package"
@@ -351,9 +351,13 @@ export const AutoApproveSettings = ({
 							label={t("settings:autoApprove.execute.autoDeny.label")}>
 							<VSCodeCheckbox
 								checked={alwaysDenyUnapprovedCommands}
-								onChange={(e: any) =>
-									setCachedStateField("alwaysDenyUnapprovedCommands", e.target.checked)
-								}
+								onChange={(e: Event | FormEvent<HTMLElement>) => {
+									const target = e.target instanceof HTMLInputElement ? e.target : null
+									if (!target) {
+										return
+									}
+									setCachedStateField("alwaysDenyUnapprovedCommands", target.checked)
+								}}
 								data-testid="auto-deny-unapproved-checkbox">
 								<span className="font-medium">{t("settings:autoApprove.execute.autoDeny.label")}</span>
 							</VSCodeCheckbox>
