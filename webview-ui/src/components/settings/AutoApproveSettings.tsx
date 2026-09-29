@@ -62,6 +62,13 @@ type AutoApproveSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	>
 }
 
+// The toolkit checkbox delivers change events retargeted to its custom-element host, which mirrors
+// `checked` without being an HTMLInputElement; a directly rendered input is one. Match on the
+// property so both target shapes update the setting, and decline targets that carry no boolean
+// `checked` rather than writing `undefined` through the guard.
+const isCheckboxTarget = (target: EventTarget | null): target is EventTarget & { checked: boolean } =>
+	target !== null && "checked" in target && typeof target.checked === "boolean"
+
 export const AutoApproveSettings = ({
 	alwaysAllowReadOnly,
 	alwaysAllowReadOnlyOutsideWorkspace,
@@ -352,11 +359,10 @@ export const AutoApproveSettings = ({
 							<VSCodeCheckbox
 								checked={alwaysDenyUnapprovedCommands}
 								onChange={(e: Event | FormEvent<HTMLElement>) => {
-									const target = e.target instanceof HTMLInputElement ? e.target : null
-									if (!target) {
+									if (!isCheckboxTarget(e.target)) {
 										return
 									}
-									setCachedStateField("alwaysDenyUnapprovedCommands", target.checked)
+									setCachedStateField("alwaysDenyUnapprovedCommands", e.target.checked)
 								}}
 								data-testid="auto-deny-unapproved-checkbox">
 								<span className="font-medium">{t("settings:autoApprove.execute.autoDeny.label")}</span>
