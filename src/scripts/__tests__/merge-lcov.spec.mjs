@@ -42,6 +42,24 @@ describe("mergeLcov", () => {
 		expect(merged).not.toContain("DA:3,1")
 	})
 
+	it("treats a negative v8 branch delta as uncovered instead of failing the merge", () => {
+		// The v8 provider emits negative BRDA counts for short-circuit conditions
+		// (e.g. `freshState === "aborted" || signal?.aborted`), which previously
+		// aborted the CI coverage merge with "Invalid BRDA ... -3".
+		const merged = mergeLcov([
+			["core", report(new Set([1])).replace("BRDA:2,0,0,-", "BRDA:2,0,0,-3")],
+			["api", report(new Set([1, 2]))],
+		])
+
+		// The negative-delta branch merges to uncovered, and the positive
+		// duplicate from the other lane still wins the union.
+		expect(merged).toContain("BRDA:2,0,0,1")
+
+		const solo = mergeLcov([["core", report(new Set([1])).replace("BRDA:2,0,0,-", "BRDA:2,0,0,-3")]])
+		expect(solo).toContain("BRDA:2,0,0,-")
+		expect(solo).not.toContain("-3")
+	})
+
 	it("merges disjoint source records without changing their paths", () => {
 		const merged = mergeLcov([
 			["api", report(new Set([1])).replaceAll("src/example.ts", "src/api.ts")],
