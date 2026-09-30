@@ -600,12 +600,12 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		expect(queue.hasUnclaimed()).toBe(true)
 	})
 
-	it("arms the interactive status timer when the latch release leaves the ask pending", async () => {
-		// A released claim keeps the queue non-empty, so `isStatusMutable` is
-		// false for the whole dwell and the 2 s interactive arm is skipped
-		// unless the release branch re-arms it: without that, hands-free/API
-		// consumers see `Running` with no `TaskInteractive` for a prompt that
-		// is waiting on the user.
+	it("arms the interactive status timer when the latch gate leaves the ask pending", async () => {
+		// A gated claim keeps the queue non-empty, so `isStatusMutable` is false
+		// for the whole dwell and the 2 s interactive arm is skipped unless the
+		// gate branch arms it: without that, hands-free/API consumers see
+		// `Running` with no `TaskInteractive` for a prompt that is waiting on
+		// the user.
 		const task = buildTask(provider, TASK_CWD)
 		const queue = await attachQueue(task)
 		recordClineMessages(task)
@@ -863,5 +863,96 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 
 		setTimeoutSpy.mockRestore()
 		clearTimeoutSpy.mockRestore()
+	})
+
+	it("auto-approves a policy-approved tool ask while the latch leaves the queue for later", async () => {
+		// The latch is a reason not to claim, not a reason to claim-and-release:
+		// a claim forces the `ask` decision before the policy runs, so a
+		// `read_file` that `alwaysAllowReadOnly` auto-approves would sit waiting
+		// for a user who has nothing to decide, stalling a hands-free session.
+		// The policy must decide as if the queue were empty, and the message the
+		// denial left behind must stay unclaimed for a later turn.
+		state.alwaysAllowReadOnly = true
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		queue.addMessage("feedback on the denied command")
+
+		const denied = await task.ask("command", "rm x", false)
+		expect(denied.response).toBe("noButtonClicked")
+		expect(task["blanketDeniedCommandThisTurn"]).toBe(true)
+
+		// Race a deadline against the ask: with a claim-forced prompt the ask
+		// stays pending forever, and a hang must read as a failure, not a pass.
+		const outcome = await Promise.race([
+			task.ask("tool", JSON.stringify({ tool: "readFile", path: "a.txt" }), false),
+			new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 1_500)),
+		])
+		expect(outcome).not.toBe("pending")
+		const result = outcome as Awaited<ReturnType<Task["ask"]>>
+		// Approved through policy, not through the queued message: the result
+		// carries no feedback text, and the message survives unclaimed.
+		expect(result.response).toBe("yesButtonClicked")
+		expect(result.text).toBeUndefined()
+		expect(result.queuedMessageId).toBeUndefined()
+		expect(queue.messages).toHaveLength(1)
+		expect(queue.hasUnclaimed()).toBe(true)
+	})
+
+	it("settles ask() and releases the claim when the task aborts while the immediate re-check is pending", async () => {
+		// The immediate site's fresh policy read ends in the same uncancellable
+		// `provider.getState()` as the drain site's. With the claim held and the
+		// read pending before the wait even starts, an abort must settle the
+		// re-check through the abort race, release the claim from its `finally`,
+		// tear the watcher down, and reject `ask()`.
+		state.alwaysDenyUnapprovedCommands = false
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		queue.addMessage("queued before the ask begins")
+
+		let getStateCalls = 0
+		provider.getState = () => {
+			getStateCalls++
+			if (getStateCalls >= 2) {
+				// The immediate-site re-check never settles: nothing resolves it,
+				// only the abort race ends the ask's dependence on it.
+				return new Promise<Partial<ExtensionState>>(() => {})
+			}
+			return Promise.resolve(state)
+		}
+
+		const setIntervalSpy = vi.spyOn(globalThis, "setInterval")
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval")
+
+		const askPromise = task.ask("command", "rm x", false)
+		await vi.waitFor(() => expect(getStateCalls).toBe(2))
+		expect(queue.hasUnclaimed()).toBe(false)
+
+		task["abort"] = true
+
+		// `ask()` must reject on abort; racing a deadline distinguishes a wrong
+		// settle from a hang on the pending read.
+		const outcome = await Promise.race([
+			askPromise.then(
+				() => "resolved",
+				(error: unknown) => (error instanceof Error ? error.message : String(error)),
+			),
+			new Promise<string>((resolve) => setTimeout(() => resolve("deadline-exceeded"), 3_000)),
+		])
+		expect(outcome).toContain("aborted")
+
+		// The claim releases from the re-check's finally once the abort race
+		// settles it, so a later consumer can take the message.
+		await vi.waitFor(() => expect(queue.hasUnclaimed()).toBe(true))
+
+		// The abort watcher must not keep polling past the settle.
+		const intervals = setIntervalSpy.mock.results.map((result) => result.value)
+		expect(intervals.length).toBeGreaterThan(0)
+		for (const interval of intervals) {
+			expect(clearIntervalSpy.mock.calls.some(([cleared]) => cleared === interval)).toBe(true)
+		}
+		setIntervalSpy.mockRestore()
+		clearIntervalSpy.mockRestore()
 	})
 })

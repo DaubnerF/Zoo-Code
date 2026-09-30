@@ -1655,10 +1655,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// means an unconditional auto-approve. That shortcut must never bypass
 		// blanket deny: while it is engaged, a command ask keeps its policy
 		// decision and the queued message is left in place for a later turn
-		// instead of being consumed as approval.
+		// instead of being consumed as approval. The shared claim gate adds the
+		// per-turn latch: a message a blanket denial left behind answers that
+		// denial, not this ask, and a claim would force the `ask` decision below
+		// while the policy would have auto-answered it — holding a prompt no user
+		// has to see and stalling a hands-free session. Leaving the message
+		// unclaimed lets the policy decision stand and keeps the message queued.
 		const queueMayAnswerThisAsk = !(blanketDenyEngaged && type === "command")
 		const queuedMessage =
-			partial === true || type === "command_output" || !queueMayAnswerThisAsk
+			partial === true ||
+			type === "command_output" ||
+			!queueMayAnswerThisAsk ||
+			!this.mayDrainQueuedMessageForAsk()
 				? undefined
 				: this.messageQueueService.claimNextMessage()
 		const queuedAskResolution = queuedMessage ? queuedResponseForAsk(type, text) : undefined
@@ -1835,13 +1843,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		let queuedMessageId: string | undefined
 		// Arm the interactive/resumable/idle status timers for this ask: the
 		// single source of that arm, shared between the queue-free case and the
-		// queued-release paths below. A release keeps the message in the queue,
-		// so `isMessageQueued` stays true and `isStatusMutable` — which requires
-		// an empty queue — stays false while the ask waits for the user; arming
-		// only from `isStatusMutable` would leave hands-free/API consumers seeing
-		// `Running` with no `TaskInteractive`/`interactionRequired` for a prompt
-		// that is in fact pending. Idempotent: several arm sites can fire for one
-		// ask (e.g. the
+		// claim-gated and queued-release paths below. A gated or released claim
+		// keeps the message in the queue, so `isMessageQueued` stays true and
+		// `isStatusMutable` — which requires an empty queue — stays false while
+		// the ask waits for the user; arming only from `isStatusMutable` would
+		// leave hands-free/API consumers seeing `Running` with no
+		// `TaskInteractive`/`interactionRequired` for a prompt that is in fact
+		// pending. Idempotent: several arm sites can fire for one ask (e.g. the
 		// queue-free arm, then a drain-site release), and a second arm would
 		// double-emit the event. The `timeouts` array is the arm ledger, and a
 		// `finally` around the wait owns the `clearTimeout` teardown on every
@@ -1917,50 +1925,79 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		if (isStatusMutable) {
 			armAskStatusTimers()
-		} else if (isMessageQueued && shouldDrainQueuedMessageForAsk && queuedMessage && queuedAskResolution) {
-			if (this.blanketDeniedCommandThisTurn) {
-				// A command this turn already blanket-denied left the message in the
-				// queue — it answers that denial, not this ask. Release the claim and
-				// let the user answer the prompt normally.
-				this.messageQueueService.releaseMessage(queuedMessage.id)
-				// The prompt stays pending with the queue still non-empty, so the
-				// `isStatusMutable` arm above was skipped and must run from here.
-				armAskStatusTimers()
-			} else if (type === "command") {
+		} else if (queuedMessage && queuedAskResolution) {
+			if (type === "command") {
 				// The snapshot gate is frozen; blanket deny may have engaged since the
 				// ask began. Re-read policy before the message stands in for approval.
+				// Drain-site parity for cancellation and cleanup: the fresh policy
+				// read ends in an uncancellable provider read, so an abort poller
+				// races it and one `finally` releases the claim on the abort, throw,
+				// supersession, and "release" outcomes alike.
+				let abortWatcher: ReturnType<typeof setInterval> | undefined
 				try {
-					const action = await this.recheckQueuedCommandPolicy({
-						text,
-						isProtected,
-						dcgDecision: autoApprovalContext?.dcgDecision,
-					})
-					if (this.abort || this.askResponse !== undefined || this.lastMessageTs !== askTs) {
-						// The user answered, the ask was superseded, or the task aborted
-						// while the fresh read was pending: the message is none of this
-						// ask's business — leave it for the next consumer. The ask
-						// resolves with the user's own response via the pWaitFor below.
-						this.messageQueueService.releaseMessage(queuedMessage.id)
-					} else {
+					const outcome = await Promise.race([
+						this.recheckQueuedCommandPolicy({
+							text,
+							isProtected,
+							dcgDecision: autoApprovalContext?.dcgDecision,
+						}).then((action) => ({ action })),
+						new Promise<{ aborted: true }>((resolve) => {
+							const checkAbort = () => {
+								if (this.abort) {
+									resolve({ aborted: true })
+								}
+							}
+							checkAbort()
+							abortWatcher = setInterval(checkAbort, 100)
+						}),
+					])
+					if (
+						!("aborted" in outcome) &&
+						!this.abort &&
+						this.askResponse === undefined &&
+						this.lastMessageTs === askTs
+					) {
+						// Any other outcome — the user answered, the ask was
+						// superseded, the task aborted — leaves the message for the
+						// next consumer; the `finally` below releases the claim and the
+						// ask resolves with the user's own response via the pWaitFor.
 						queuedMessageId = this.applyQueuedCommandPolicyAction(
-							action,
+							outcome.action,
 							queuedMessage,
 							queuedAskResolution,
 						)
 						// A "release" outcome leaves the ask pending; consume/deny/approve
-						// resolved it, and the helper's pending check declines to arm then.
+						// resolved it, and the arm's pending check declines to arm then.
 						armAskStatusTimers()
 					}
 				} catch (error) {
 					// Drain-site parity: a failed re-check must not reject ask() nor
 					// strand the claim; the prompt stays pending for the user.
 					console.error("[Task#ask] queued command policy re-check failed:", error)
-					this.messageQueueService.releaseMessage(queuedMessage.id)
 					armAskStatusTimers()
+				} finally {
+					if (abortWatcher !== undefined) {
+						clearInterval(abortWatcher)
+					}
+					// One release path for abort, throw, supersession, and "release".
+					// `releaseMessage` is idempotent, so it stays safe beside the
+					// helper-internal release. The durable consume is the one outcome
+					// that must keep its claim until persistence removes the message —
+					// it is the only path that assigned `queuedMessageId` here.
+					if (queuedMessageId !== queuedMessage.id) {
+						this.messageQueueService.releaseMessage(queuedMessage.id)
+					}
 				}
 			} else {
 				queuedMessageId = this.handleQueuedAskResponse(queuedMessage, queuedAskResolution)
 			}
+		} else if (shouldDrainQueuedMessageForAsk && isMessageQueued) {
+			// The claim gate (per-turn latch, or blanket deny engaged for a command
+			// ask) left the queued message untouched. If the policy still leaves the
+			// prompt pending, the non-empty queue keeps `isStatusMutable` false, so
+			// the interactive arm must run from here — the same reason a release
+			// re-arms. For an auto-answered ask the arm's pending check declines.
+			armAskStatusTimers()
 		}
 
 		// At most one drain-site policy re-check is in flight per ask; the

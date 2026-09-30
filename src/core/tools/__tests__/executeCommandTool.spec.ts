@@ -4,6 +4,7 @@ import type { ToolUsage } from "@roo-code/types"
 import * as vscode from "vscode"
 
 import { Task } from "../../task/Task"
+import * as autoApprovalModule from "../../auto-approval"
 import { formatResponse } from "../../prompts/responses"
 import { ToolUse, AskApproval, HandleError, PushToolResult } from "../../../shared/tools"
 import { unescapeHtmlEntities } from "../../../utils/text-normalization"
@@ -547,6 +548,115 @@ describe("executeCommandTool", () => {
 			expect(mockCline.recordBlanketCommandDenial).not.toHaveBeenCalled()
 			expect(formatResponse.toolAutoDenied).not.toHaveBeenCalled()
 			expect(formatResponse.toolError).toHaveBeenCalledWith(expect.stringContaining("not a policy denial"))
+			expect(mockPushToolResult).toHaveBeenCalledTimes(1)
+		})
+
+		// Shared scenario for the protected-prompt transition: the command is
+		// DCG-denied with blanket auto-deny OFF, so the user sees the protected
+		// prompt, explicitly approves it, and the blanket setting engages before
+		// the command reaches the terminal.
+		const setupProtectedDwellFlip = async () => {
+			const provider = await mockCline.providerRef.deref()
+			provider.context = { globalStorageUri: { fsPath: "/test/storage" } }
+			provider.contextProxy.getValue.mockReturnValue(true)
+			provider.getState
+				.mockResolvedValueOnce({
+					destructiveCommandGuardEnabled: true,
+					alwaysDenyUnapprovedCommands: false,
+					autoApprovalEnabled: true,
+					alwaysAllowExecute: true,
+					allowedCommands: [],
+					deniedCommands: [],
+					terminalShellIntegrationDisabled: true,
+				})
+				.mockResolvedValue({
+					destructiveCommandGuardEnabled: true,
+					alwaysDenyUnapprovedCommands: true,
+					autoApprovalEnabled: true,
+					alwaysAllowExecute: true,
+					allowedCommands: [],
+					deniedCommands: [],
+					terminalShellIntegrationDisabled: true,
+				})
+			mockRunDcg.mockResolvedValue({
+				decision: "deny",
+				reason: "matches a destructive pattern",
+				ruleId: "recursive-delete",
+			})
+			// The user affirmatively approves the protected prompt during the dwell.
+			mockAskApproval.mockResolvedValue(true)
+			return provider
+		}
+
+		it("auto-denies a DCG-denied protected command when blanket deny engages during the approval dwell", async () => {
+			await setupProtectedDwellFlip()
+
+			await executeCommandTool.handle(mockCline, mockToolUse, {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+			})
+
+			// The prompt shown was the protected one — the blanket setting was off
+			// when the ask was built.
+			expect(mockAskApproval).toHaveBeenCalledWith("command", "echo test", undefined, true)
+
+			// The blanket denial wins over the affirmative approval: the command
+			// never reaches the terminal. The provider-level assertion is the
+			// load-bearing one — it is the real execution boundary.
+			expect(TerminalRegistry.getOrCreateTerminal).not.toHaveBeenCalled()
+			expect(executeCommandModule.executeCommandInTerminal).not.toHaveBeenCalled()
+			expect(mockCline.recordBlanketCommandDenial).toHaveBeenCalledTimes(1)
+			expect(formatResponse.toolAutoDenied).toHaveBeenCalledWith({
+				reason: expect.stringContaining("matches a destructive pattern"),
+				offendingCommand: "echo test",
+				ruleId: "recursive-delete",
+			})
+			expect(formatResponse.toolError).not.toHaveBeenCalled()
+			expect(mockPushToolResult).toHaveBeenCalledTimes(1)
+		})
+
+		it("re-derives the recheck's protected flag from the fresh state instead of forwarding the latched prompt flag", async () => {
+			await setupProtectedDwellFlip()
+			const originalCheckAutoApproval = autoApprovalModule.checkAutoApproval
+			const recheckSpy = vitest
+				.spyOn(autoApprovalModule, "checkAutoApproval")
+				.mockImplementation((args) => originalCheckAutoApproval(args))
+
+			await executeCommandTool.handle(mockCline, mockToolUse, {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+			})
+
+			expect(recheckSpy).toHaveBeenCalledTimes(1)
+			// The ask the user answered was protected, but protection is a property
+			// of the policy that produced the prompt. Forwarding the latched flag
+			// would make `checkAutoApproval` short-circuit to `ask` before ever
+			// evaluating the now-engaged blanket denial.
+			expect(recheckSpy).toHaveBeenCalledWith(expect.objectContaining({ ask: "command", isProtected: false }))
+			expect(TerminalRegistry.getOrCreateTerminal).not.toHaveBeenCalled()
+		})
+
+		it("fails closed when the execute-time recheck returns a non-approval other than deny", async () => {
+			await setupProtectedDwellFlip()
+			// The blanket-engaged command policy never answers `ask` today; force a
+			// result from the permitted-but-unexpected tail of the union to pin that
+			// any non-approval blocks execution instead of falling through.
+			vitest.spyOn(autoApprovalModule, "checkAutoApproval").mockResolvedValue({ decision: "ask" })
+
+			await executeCommandTool.handle(mockCline, mockToolUse, {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+			})
+
+			expect(TerminalRegistry.getOrCreateTerminal).not.toHaveBeenCalled()
+			expect(executeCommandModule.executeCommandInTerminal).not.toHaveBeenCalled()
+			// Not a policy denial: no latch, and the retryable-error channel instead.
+			expect(mockCline.recordBlanketCommandDenial).not.toHaveBeenCalled()
+			expect(formatResponse.toolAutoDenied).not.toHaveBeenCalled()
+			expect(formatResponse.toolError).toHaveBeenCalledWith(expect.stringContaining("instead of an approval"))
 			expect(mockPushToolResult).toHaveBeenCalledTimes(1)
 		})
 

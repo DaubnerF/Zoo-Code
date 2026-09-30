@@ -168,8 +168,10 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 			const blanketAutoDeny = isBlanketDenyEngaged(providerState)
 
 			// Outside blanket mode a DCG block is presented as the protected
-			// prompt. The execute-time re-check forwards the same flag so the fresh
-			// decision is computed against the ask the user actually answered.
+			// prompt. This flag governs prompt presentation only: protection is a
+			// property of the policy that produced the prompt, so the execute-time
+			// re-check re-derives it from the fresh state rather than reusing this
+			// value (below).
 			const isProtectedAsk = dcgDecision !== undefined && dcgDecision.decision === "deny" && !blanketAutoDeny
 
 			// DCG-approved commands are auto-approved by checkAutoApproval (from the
@@ -205,7 +207,15 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 				// fresh policy denies. Parity call with the drain-site re-check,
 				// forwarding the verdict already computed above — re-running the
 				// guard would respawn the process for no new information. A fresh
-				// policy that still approves executes normally. Routing keeps the
+				// policy that still approves executes normally. Protection is
+				// re-derived from the fresh state, not latched from the prompt:
+				// `isProtected` short-circuits the command policy to an ask before
+				// any denial is evaluated, so forwarding the ask-time flag would
+				// let a DCG block approved during the dwell execute even though
+				// the blanket setting is now on. Inside this branch blanket deny
+				// is engaged, so the protection rule (`DCG block && blanket off`)
+				// cannot hold under the current policy — the fresh derivation is
+				// `false`, and the blanket denial is evaluated. Routing keeps the
 				// ask-path distinction: `guard_unavailable` marks a guard-state
 				// inconsistency (retryable error, not a policy denial, and no
 				// latch); blanket kinds latch the turn so a queue message left by
@@ -217,7 +227,7 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 					cwd: task.cwd,
 					ask: "command",
 					text: canonicalCommand,
-					isProtected: isProtectedAsk,
+					isProtected: false,
 					dcgDecision,
 				})
 				if (recheck.decision === "deny") {
@@ -245,6 +255,18 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 							offendingCommand: detail.command,
 							ruleId: detail.dcgRuleId,
 						}),
+					)
+					return
+				} else if (recheck.decision !== "approve") {
+					// Fail closed on every non-approval, not just `deny`: with
+					// blanket engaged the command policy should never answer
+					// `ask`/`timeout` here, but the result union allows it, and an
+					// unexpected non-approval must not reach the terminal. Retry
+					// is safe — nothing ran and nothing latched.
+					pushToolResult(
+						formatResponse.toolError(
+							`Command \`${canonicalCommand}\` was not executed: the fresh command policy re-check returned "${recheck.decision}" instead of an approval. You may retry the same command.`,
+						),
 					)
 					return
 				}
