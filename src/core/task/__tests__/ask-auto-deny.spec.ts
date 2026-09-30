@@ -2,6 +2,7 @@
 
 import { type ClineMessage, type ExtensionState, RooCodeEventName } from "@roo-code/types"
 
+import * as autoApprovalModule from "../../auto-approval"
 import { createRateLimitClock } from "../RateLimitClock"
 import { Task } from "../Task"
 
@@ -954,5 +955,68 @@ describe("Task.ask queue path cannot bypass blanket deny", () => {
 		}
 		setIntervalSpy.mockRestore()
 		clearIntervalSpy.mockRestore()
+	})
+
+	it("never consults the policy when the fresh-state read lands after the abort", async () => {
+		// An abort must settle the re-check itself, not merely win a race against
+		// it: a re-check left pending on the uncancellable read retains the task
+		// and, when the read finally lands with the blanket deny engaged, runs
+		// `checkAutoApproval` post-abort. Here the read resolves only after the
+		// abort, with deny now ON — the settled re-check must not take it
+		// through the policy, and the claimed message must stay unconsumed.
+		state.alwaysDenyUnapprovedCommands = false
+		const checkAutoApprovalSpy = vi.spyOn(autoApprovalModule, "checkAutoApproval")
+
+		let resolveLateState: (() => void) | undefined
+		let getStateCalls = 0
+		provider.getState = () => {
+			getStateCalls++
+			if (getStateCalls >= 2) {
+				// The immediate-site re-check's fresh read stays pending until the
+				// test releases it, past the abort, with the policy engaged.
+				return new Promise<Partial<ExtensionState>>((resolve) => {
+					resolveLateState = () => {
+						state.alwaysDenyUnapprovedCommands = true
+						resolve(state)
+					}
+				})
+			}
+			return Promise.resolve(state)
+		}
+
+		const task = buildTask(provider, TASK_CWD)
+		const queue = await attachQueue(task)
+		queue.addMessage("queued before the ask begins")
+
+		const askPromise = task.ask("command", "rm x", false)
+		await vi.waitFor(() => expect(getStateCalls).toBe(2))
+		expect(queue.hasUnclaimed()).toBe(false)
+
+		task["abort"] = true
+
+		// `ask()` must reject on abort; racing a deadline distinguishes a wrong
+		// settle from a hang on the pending read.
+		const outcome = await Promise.race([
+			askPromise.then(
+				() => "resolved",
+				(error: unknown) => (error instanceof Error ? error.message : String(error)),
+			),
+			new Promise<string>((resolve) => setTimeout(() => resolve("deadline-exceeded"), 3_000)),
+		])
+		expect(outcome).toContain("aborted")
+
+		// The uncancellable read lands only now — the settled re-check must have
+		// detached from it, so its continuation never reaches the policy.
+		resolveLateState!()
+		await vi.waitFor(() => expect(queue.hasUnclaimed()).toBe(true))
+		// Past a full abort-watcher poll: enough for any retained continuation
+		// of the late read to have run and been caught by the spy.
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		expect(checkAutoApprovalSpy).not.toHaveBeenCalled()
+		// No post-abort consume: the message survives, unclaimed, for a later
+		// consumer.
+		expect(queue.messages).toHaveLength(1)
+		expect(queue.hasUnclaimed()).toBe(true)
+		checkAutoApprovalSpy.mockRestore()
 	})
 })

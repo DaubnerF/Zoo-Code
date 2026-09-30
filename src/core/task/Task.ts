@@ -1086,17 +1086,47 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * dwell. Re-reading here closes it: while blanket deny engages, the message
 	 * is never consumed as approval and the ask gets the structured denial policy
 	 * would have produced without a queued message.
+	 *
+	 * With `abortSignal`, the re-check settles on the abort itself instead of
+	 * merely losing a race against it: the fresh-state read ends in uncancellable
+	 * provider work, so a post-await check alone would leave this promise pending
+	 * whenever the read never lands, retaining the task and running policy work
+	 * after the abort. An aborted re-check resolves to the `release` no-op,
+	 * leaving the claim and the pending ask to the caller's release path.
 	 */
-	private async recheckQueuedCommandPolicy({
-		text,
-		isProtected,
-		dcgDecision,
-	}: {
-		text?: string
-		isProtected?: boolean
-		dcgDecision?: AutoApprovalContext["dcgDecision"]
-	}): Promise<QueuedCommandPolicyAction> {
-		const freshState = await this.providerRef.deref()?.getState()
+	private async recheckQueuedCommandPolicy(
+		{
+			text,
+			isProtected,
+			dcgDecision,
+		}: {
+			text?: string
+			isProtected?: boolean
+			dcgDecision?: AutoApprovalContext["dcgDecision"]
+		},
+		abortSignal?: AbortSignal,
+	): Promise<QueuedCommandPolicyAction> {
+		// Resolving a sentinel rather than rejecting keeps a late rejection from
+		// the uncancellable read unhandled once the abort has won the race, and
+		// routes the abort through the same release early-return as the checks.
+		const signal = abortSignal
+		const abortPromise = signal
+			? new Promise<"aborted">((resolve) => {
+					if (signal.aborted) {
+						resolve("aborted")
+					} else {
+						signal.addEventListener("abort", () => resolve("aborted"), { once: true })
+					}
+				})
+			: undefined
+		const freshState = abortPromise
+			? await Promise.race([this.providerRef.deref()?.getState(), abortPromise])
+			: await this.providerRef.deref()?.getState()
+		// The abort either won the race (sentinel) or landed while the read was
+		// still resolving; both settle the re-check before any policy work.
+		if (freshState === "aborted" || signal?.aborted) {
+			return { action: "release" }
+		}
 		if (!isBlanketDenyEngaged(freshState)) {
 			// Disengaged: the queued answer is a legitimate approval, as before.
 			return { action: "consume" }
@@ -1111,6 +1141,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			isProtected,
 			dcgDecision,
 		})
+		if (signal?.aborted) {
+			return { action: "release" }
+		}
 		if (approval.decision === "deny") {
 			return { action: "deny", detail: approval.autoDeny }
 		}
@@ -1931,38 +1964,34 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// ask began. Re-read policy before the message stands in for approval.
 				// Drain-site parity for cancellation and cleanup: the fresh policy
 				// read ends in an uncancellable provider read, so an abort poller
-				// races it and one `finally` releases the claim on the abort, throw,
-				// supersession, and "release" outcomes alike.
-				let abortWatcher: ReturnType<typeof setInterval> | undefined
+				// aborts a signal the re-check itself awaits — settling it on the
+				// abort instead of leaving a pending promise that retains this task
+				// and runs policy post-abort — and one `finally` releases the claim
+				// on the abort, throw, supersession, and "release" outcomes alike.
+				const recheckAbort = new AbortController()
+				const checkAbort = () => {
+					if (this.abort) {
+						recheckAbort.abort()
+					}
+				}
+				checkAbort()
+				const abortWatcher = setInterval(checkAbort, 100)
 				try {
-					const outcome = await Promise.race([
-						this.recheckQueuedCommandPolicy({
+					const action = await this.recheckQueuedCommandPolicy(
+						{
 							text,
 							isProtected,
 							dcgDecision: autoApprovalContext?.dcgDecision,
-						}).then((action) => ({ action })),
-						new Promise<{ aborted: true }>((resolve) => {
-							const checkAbort = () => {
-								if (this.abort) {
-									resolve({ aborted: true })
-								}
-							}
-							checkAbort()
-							abortWatcher = setInterval(checkAbort, 100)
-						}),
-					])
-					if (
-						!("aborted" in outcome) &&
-						!this.abort &&
-						this.askResponse === undefined &&
-						this.lastMessageTs === askTs
-					) {
-						// Any other outcome — the user answered, the ask was
-						// superseded, the task aborted — leaves the message for the
-						// next consumer; the `finally` below releases the claim and the
-						// ask resolves with the user's own response via the pWaitFor.
+						},
+						recheckAbort.signal,
+					)
+					if (!this.abort && this.askResponse === undefined && this.lastMessageTs === askTs) {
+						// Any outcome on a still-live ask — the user answered or the
+						// ask was superseded — leaves the message for the next
+						// consumer; the `finally` below releases the claim and the ask
+						// resolves with the user's own response via the pWaitFor.
 						queuedMessageId = this.applyQueuedCommandPolicyAction(
-							outcome.action,
+							action,
 							queuedMessage,
 							queuedAskResolution,
 						)
@@ -1976,9 +2005,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					console.error("[Task#ask] queued command policy re-check failed:", error)
 					armAskStatusTimers()
 				} finally {
-					if (abortWatcher !== undefined) {
-						clearInterval(abortWatcher)
-					}
+					clearInterval(abortWatcher)
 					// One release path for abort, throw, supersession, and "release".
 					// `releaseMessage` is idempotent, so it stays safe beside the
 					// helper-internal release. The durable consume is the one outcome
@@ -2008,45 +2035,38 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			resolution: QueuedAskResolution,
 		): Promise<void> => {
 			// The fresh policy read ends in `provider.getState()`, which awaits
-			// custom-mode file work that cannot be cancelled from here. Racing it
-			// against an abort poller settles this re-check within one tick of an
-			// abort instead of leaving `ask()` blocked on the pending read. The race
-			// attaches handlers to both inputs, so the read rejecting after the
-			// watcher wins is already considered handled — no extra `.catch` needed.
-			let abortWatcher: ReturnType<typeof setInterval> | undefined
+			// custom-mode file work that cannot be cancelled from here. An abort
+			// poller aborts a signal the re-check itself awaits, settling it within
+			// one poll of the abort instead of leaving `ask()` blocked on the pending
+			// read or a lost race retaining this task. The re-check's own race
+			// attaches handlers to the read, so it rejecting after the abort settles
+			// is already considered handled — no extra `.catch` needed.
+			const recheckAbort = new AbortController()
+			const checkAbort = () => {
+				if (this.abort) {
+					recheckAbort.abort()
+				}
+			}
+			checkAbort()
+			const abortWatcher = setInterval(checkAbort, 100)
 			try {
-				const outcome = await Promise.race([
-					this.recheckQueuedCommandPolicy({
+				const action = await this.recheckQueuedCommandPolicy(
+					{
 						text,
 						isProtected,
 						dcgDecision: autoApprovalContext?.dcgDecision,
-					}).then((action) => ({ action })),
-					new Promise<{ aborted: true }>((resolve) => {
-						const checkAbort = () => {
-							if (this.abort) {
-								resolve({ aborted: true })
-							}
-						}
-						checkAbort()
-						abortWatcher = setInterval(checkAbort, 100)
-					}),
-				])
-				if (
-					!("aborted" in outcome) &&
-					!this.abort &&
-					this.askResponse === undefined &&
-					this.lastMessageTs === askTs
-				) {
-					queuedMessageId = this.applyQueuedCommandPolicyAction(outcome.action, message, resolution)
+					},
+					recheckAbort.signal,
+				)
+				if (!this.abort && this.askResponse === undefined && this.lastMessageTs === askTs) {
+					queuedMessageId = this.applyQueuedCommandPolicyAction(action, message, resolution)
 					// A "release" outcome leaves the ask pending while the queue stays
 					// non-empty, so the arm that `isStatusMutable` gates — computed
 					// once, before the claim — must run here.
 					armAskStatusTimers()
 				}
 			} finally {
-				if (abortWatcher !== undefined) {
-					clearInterval(abortWatcher)
-				}
+				clearInterval(abortWatcher)
 				// One release path for abort, throw, supersession, and "release".
 				// `releaseMessage` is idempotent, so it stays safe beside the
 				// branch-local releases. The durable consume is the one outcome
@@ -2109,9 +2129,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Let a policy re-check that was in flight when the wait resolved run to
 			// completion: its bail-out path releases the claim, and leaving it
 			// unresolved would let the consume race the result below. On abort, detach
-			// instead: the re-check races the abort and its `finally` releases the claim
-			// either way, while awaiting an uncancellable read past the abort would
-			// retain this task instead of letting the throw below settle it.
+			// instead: the re-check settles on the abort and its `finally` releases the
+			// claim either way, while awaiting past the abort could stall on an
+			// uncancellable read instead of letting the throw below settle the ask.
 			if (queuedCommandPolicyCheck && !this.abort) {
 				await queuedCommandPolicyCheck
 			}
