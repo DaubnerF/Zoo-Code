@@ -60,6 +60,31 @@ describe("mergeLcov", () => {
 		expect(solo).not.toContain("-3")
 	})
 
+	it("clamps negative branch counts at the boundary while keeping zero and positive counts", () => {
+		const withBrda = (count) => report(new Set([1])).replace("BRDA:2,0,0,-", `BRDA:2,0,0,${count}`)
+
+		// -1 is the smallest interesting negative: clamped to uncovered ("-" renders 0).
+		const negative = mergeLcov([["core", withBrda(-1)]])
+		expect(negative).toContain("BRDA:2,0,0,-")
+		expect(negative).not.toContain("-1")
+
+		// 0 is already uncovered and must stay uncovered.
+		expect(mergeLcov([["core", withBrda(0)]])).toContain("BRDA:2,0,0,-")
+
+		// Positive counts must pass through unclamped.
+		expect(mergeLcov([["core", withBrda(4)]])).toContain("BRDA:2,0,0,4")
+
+		// A positive count from one lane must win the union over a clamped lane.
+		expect(mergeLcov([["core", withBrda(-1)], ["api", report(new Set([1, 2]))]])).toContain("BRDA:2,0,0,1")
+	})
+
+	it("still rejects non-integer branch counts", () => {
+		const withBrda = (value) => report(new Set([1])).replace("BRDA:2,0,0,-", `BRDA:2,0,0,${value}`)
+
+		expect(() => mergeLcov([["core", withBrda(1.5)]])).toThrow(/Invalid BRDA for src\/example\.ts: 1\.5/)
+		expect(() => mergeLcov([["core", withBrda("abc")]])).toThrow(/Invalid BRDA for src\/example\.ts: abc/)
+	})
+
 	it("merges disjoint source records without changing their paths", () => {
 		const merged = mergeLcov([
 			["api", report(new Set([1])).replaceAll("src/example.ts", "src/api.ts")],
