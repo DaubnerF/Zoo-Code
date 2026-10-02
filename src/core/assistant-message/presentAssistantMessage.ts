@@ -305,16 +305,16 @@ export async function presentAssistantMessage(cline: Task, policySnapshot: Reque
 			// errors repeatedly during streaming, pushing multiple tool_results for the
 			// same tool_use_id and making the stream appear frozen.
 			if (!mcpBlock.partial) {
-				const state = await cline.providerRef.deref()?.getState()
-				const { customModes, experiments: stateExperiments, disabledTools } = state ?? {}
+				// Policy inputs come from the request's frozen snapshot, never from a
+				// live provider-state re-read mid-stream.
+				const { customModes, experiments: stateExperiments, disabledTools } = policySnapshot
 				// Read the task-local mode, not the shared provider mode.
 				// A delegated child task may run in a different mode than its parent.
 				const taskMode = await cline.getTaskMode()
 
-				const modelInfo = cline.api.getModel()
 				// Resolve aliases in includedTools before validation
 				// e.g., "write_file" should resolve to "write_to_file"
-				const rawIncludedTools = modelInfo.info.includedTools
+				const rawIncludedTools = policySnapshot.modelInfo?.includedTools
 				const { resolveToolAlias } = await import("../prompts/tools/filter-tools-for-mode")
 				const includedTools = rawIncludedTools?.map((tool) => resolveToolAlias(tool))
 
@@ -326,7 +326,7 @@ export async function presentAssistantMessage(cline: Task, policySnapshot: Reque
 					// entry reaches the validator, which checks them before the
 					// always-available class. See `buildToolRequirements` in
 					// effective-tool-policy.ts.
-					const toolRequirements = buildToolRequirements(disabledTools, modelInfo.info)
+					const toolRequirements = buildToolRequirements(disabledTools, policySnapshot.modelInfo)
 
 					validateToolUse(
 						"use_mcp_tool",

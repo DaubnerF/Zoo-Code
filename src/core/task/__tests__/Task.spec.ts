@@ -882,8 +882,17 @@ describe("Cline", () => {
 			const pushToolResultSpy = vi.spyOn(task, "pushToolResultToUserContent")
 
 			vi.spyOn(task, "attemptApiRequest")
-				.mockImplementationOnce(() =>
-					asyncStreamFrom<ApiStreamChunk>([
+				.mockImplementationOnce(() => {
+					// The real generator publishes the request policy snapshot that
+					// presentAssistantMessage requires; with the generator replaced
+					// wholesale, the mock must publish one too or the presenter's
+					// entry guard throws before any block is processed.
+					getTaskTestAccess(task).requestPolicySnapshot = {
+						disabledTools: [],
+						customModes: [],
+						modelInfo: stubModelInfo,
+					}
+					return asyncStreamFrom<ApiStreamChunk>([
 						{
 							type: "tool_call_partial",
 							index: 0,
@@ -903,8 +912,8 @@ describe("Cline", () => {
 							// which would produce a false pass/fail unrelated to this bug.
 							arguments: '{"path":"docs/config.md","content":"sk-live-abc123',
 						},
-					]),
-				)
+					])
+				})
 				// The task recurses once the error tool_result makes the turn
 				// "ready" - this bounds that follow-up to a single harmless text
 				// reply instead of an unmocked second call.

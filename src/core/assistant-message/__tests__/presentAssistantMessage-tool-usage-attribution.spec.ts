@@ -7,6 +7,7 @@ import { validateToolUse } from "../../tools/validateToolUse"
 import { getModeBySlug } from "../../../shared/modes"
 import type { Task } from "../../task/Task"
 import type { RequestPolicySnapshot } from "../../prompts/tools/effective-tool-policy"
+import { useMcpToolTool } from "../../tools/UseMcpToolTool"
 
 vi.mock("../../task/Task")
 vi.mock("../../../shared/modes", async (importOriginal) => {
@@ -381,11 +382,7 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 			}
 			mockTask.providerRef = {
 				deref: () => ({
-					getState: vi.fn().mockResolvedValue({
-						mode: "code",
-						customModes: [],
-						disabledTools: ["use_mcp_tool"],
-					}),
+					getState: vi.fn().mockResolvedValue({ mode: "code" }),
 					getMcpHub: () => mockHub,
 				}),
 			}
@@ -405,7 +402,12 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 				},
 			]
 
-			await presentAssistantMessage(mockTask as unknown as Task)
+			// The policy input reaches the requirements map through the request's
+			// snapshot, not through provider state.
+			await presentAssistantMessage(mockTask as unknown as Task, {
+				...baseSnapshot,
+				disabledTools: ["use_mcp_tool"],
+			})
 
 			// The decision must come from the shared layer, under the canonical name,
 			// with the disabledTools entry folded into the requirements map.
@@ -449,18 +451,9 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 			}
 			mockTask.providerRef = {
 				deref: () => ({
-					getState: vi.fn().mockResolvedValue({
-						mode: "code",
-						customModes: [],
-					}),
+					getState: vi.fn().mockResolvedValue({ mode: "code" }),
 					getMcpHub: () => mockHub,
 				}),
-			}
-			// excludedTools reaches the requirements map only through
-			// buildToolRequirements' modelInfo fold, so this pins that input on the
-			// native path.
-			mockTask.api = {
-				getModel: () => ({ id: "test-model", info: { excludedTools: ["use_mcp_tool"] } }),
 			}
 			vi.mocked(validateToolUse).mockImplementationOnce(() => {
 				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
@@ -478,7 +471,14 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 				},
 			]
 
-			await presentAssistantMessage(mockTask as unknown as Task)
+			// excludedTools reaches the requirements map only through
+			// buildToolRequirements' modelInfo fold, so this pins that input on the
+			// native path: the model metadata travels in the request's snapshot,
+			// never through a live getModel() read.
+			await presentAssistantMessage(mockTask as unknown as Task, {
+				...baseSnapshot,
+				modelInfo: { contextWindow: 200_000, supportsPromptCache: true, excludedTools: ["use_mcp_tool"] },
+			})
 
 			const calls = vi.mocked(validateToolUse).mock.calls
 			expect(calls.length).toBeGreaterThan(0)
@@ -533,17 +533,17 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 				},
 			]
 
-			await presentAssistantMessage(mockTask as unknown as Task)
+			await presentAssistantMessage(mockTask as unknown as Task, baseSnapshot)
 
 			expect(validateToolUse).not.toHaveBeenCalled()
 			expect(mockTask.userMessageContent).toHaveLength(0)
 			expect(mockTask.consecutiveMistakeCount).toBe(0)
 		})
 
-		it("rejects through the state ?? {} fallback when the provider is unavailable", async () => {
+		it("rejects with the snapshot's policy inputs when the provider is unavailable", async () => {
 			// With no provider state the validator must still receive the task-local
-			// mode plus empty policy inputs: customModes [] and an empty requirements
-			// map, rather than the dispatch crashing.
+			// mode plus the snapshot's policy inputs: customModes [] and an empty
+			// requirements map, rather than the dispatch crashing.
 			mockTask.providerRef = { deref: () => undefined }
 			vi.mocked(validateToolUse).mockImplementationOnce(() => {
 				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
@@ -561,10 +561,10 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 				},
 			]
 
-			await presentAssistantMessage(mockTask as unknown as Task)
+			await presentAssistantMessage(mockTask as unknown as Task, baseSnapshot)
 
 			// The validator throws so the handler is never reached — the assertions
-			// pin the arguments the call site passed under the empty-state fallback.
+			// pin the arguments the call site passed from the snapshot alone.
 			const calls = vi.mocked(validateToolUse).mock.calls
 			expect(calls.length).toBeGreaterThan(0)
 			expect(calls[calls.length - 1][0]).toBe("use_mcp_tool")
@@ -593,10 +593,9 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 
 		it("resolves aliases in the model's includedTools before passing them to the shared layer", async () => {
 			// A model may advertise tools under alias names; the shared layer compares
-			// canonical names, so "write_file" must arrive as "write_to_file".
-			mockTask.api = {
-				getModel: () => ({ id: "test-model", info: { includedTools: ["write_file"] } }),
-			}
+			// canonical names, so "write_file" must arrive as "write_to_file". The
+			// model metadata travels in the request's snapshot, not via a live
+			// getModel() read.
 			mockTask.providerRef = {
 				deref: () => ({
 					getState: vi.fn().mockResolvedValue({
@@ -624,7 +623,10 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 				},
 			]
 
-			await presentAssistantMessage(mockTask as unknown as Task)
+			await presentAssistantMessage(mockTask as unknown as Task, {
+				...baseSnapshot,
+				modelInfo: { contextWindow: 200_000, supportsPromptCache: true, includedTools: ["write_file"] },
+			})
 
 			const calls = vi.mocked(validateToolUse).mock.calls
 			expect(calls.length).toBeGreaterThan(0)
@@ -662,7 +664,7 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 				},
 			]
 
-			await presentAssistantMessage(mockTask as unknown as Task)
+			await presentAssistantMessage(mockTask as unknown as Task, baseSnapshot)
 
 			expect(mockTask.pushToolResultToUserContent).not.toHaveBeenCalled()
 			expect(mockTask.userMessageContent).toHaveLength(0)
@@ -773,7 +775,7 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 				},
 			]
 
-			await presentAssistantMessage(mockTask as unknown as Task)
+			await presentAssistantMessage(mockTask as unknown as Task, baseSnapshot)
 
 			const calls = vi.mocked(validateToolUse).mock.calls
 			expect(calls.length).toBeGreaterThan(0)
@@ -781,6 +783,160 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 			// The discriminating assertion: task-local "architect", not provider
 			// "orchestrator" — the exact pre-delegation bug shape.
 			expect(calls[calls.length - 1][1]).toBe("architect")
+		})
+	})
+
+	describe("native mcp_tool_use policy snapshot consumption", () => {
+		// The native arm must validate against the request's frozen snapshot, never
+		// a live provider-state re-read. The doubles below deliberately disagree
+		// with the passed snapshot so any surviving live read flips an observable.
+		it("enforces the snapshot's disabledTools even when live state allows the tool", async () => {
+			const mockHub = {
+				findServerNameBySanitizedName: () => "my_server",
+				getAllServers: () => [
+					{
+						name: "my_server",
+						tools: [{ name: "do_thing", enabledForPrompt: true }],
+					},
+				],
+				callTool: vi.fn(),
+			}
+			// Live state allows use_mcp_tool (empty list); the snapshot disables it.
+			mockTask.providerRef = {
+				deref: () => ({
+					getState: vi.fn().mockResolvedValue({ mode: "code", customModes: [], disabledTools: [] }),
+					getMcpHub: () => mockHub,
+				}),
+			}
+			vi.mocked(validateToolUse).mockImplementationOnce(() => {
+				throw new Error('Tool "use_mcp_tool" is not allowed in code mode.')
+			})
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					id: "call_native_mcp_snapshot_disabled",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task, {
+				...baseSnapshot,
+				disabledTools: ["use_mcp_tool"],
+			})
+
+			// The requirements map folded the snapshot's disabledTools, not the
+			// live (empty) list — the policy decision is snapshot-sourced.
+			const calls = vi.mocked(validateToolUse).mock.calls
+			expect(calls.length).toBeGreaterThan(0)
+			expect(calls[calls.length - 1][0]).toBe("use_mcp_tool")
+			expect(calls[calls.length - 1][3]).toMatchObject({ use_mcp_tool: false })
+
+			// Rejection effects: error tool_result, no execution, no success attribution.
+			expect(mockTask.userMessageContent).toHaveLength(1)
+			expect(mockTask.userMessageContent[0]).toMatchObject({
+				type: "tool_result",
+				tool_use_id: "call_native_mcp_snapshot_disabled",
+				is_error: true,
+			})
+			expect(mockHub.callTool).not.toHaveBeenCalled()
+			expect(mockTask.recordToolUsage).not.toHaveBeenCalled()
+			expect(mockTask.recordToolError).toHaveBeenCalledWith("use_mcp_tool", expect.any(String))
+		})
+
+		it("executes when the snapshot allows the tool even though live state disables it", async () => {
+			const mockHub = {
+				findServerNameBySanitizedName: () => "my_server",
+				getAllServers: () => [
+					{
+						name: "my_server",
+						tools: [{ name: "do_thing", enabledForPrompt: true }],
+					},
+				],
+				callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] }),
+			}
+			// Live state disables use_mcp_tool; the snapshot (the request's policy)
+			// allows it. Only the snapshot may decide.
+			mockTask.providerRef = {
+				deref: () => ({
+					getState: vi.fn().mockResolvedValue({
+						mode: "code",
+						customModes: [],
+						disabledTools: ["use_mcp_tool"],
+					}),
+					getMcpHub: () => mockHub,
+				}),
+			}
+			// Mocked handle keeps the claim scoped to the validation region: the
+			// observable is the requirements the arm built, without handler noise.
+			const handleSpy = vi.spyOn(useMcpToolTool, "handle").mockResolvedValue(undefined)
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					id: "call_native_mcp_snapshot_allowed",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task, baseSnapshot)
+
+			const calls = vi.mocked(validateToolUse).mock.calls
+			expect(calls.length).toBeGreaterThan(0)
+			expect(calls[calls.length - 1][0]).toBe("use_mcp_tool")
+			// The snapshot's empty disabledTools produced an empty requirements map;
+			// a live read of the disabled list would have folded use_mcp_tool: false.
+			expect(calls[calls.length - 1][3]).toEqual({})
+			expect(handleSpy).toHaveBeenCalledTimes(1)
+		})
+
+		it("performs no provider-state read on the native validation path", async () => {
+			// Handler mocked so the only reachable pre-handler code is the
+			// validation arm itself; any getState call inside the presenter's
+			// native path is then a live policy re-read. Reads made by the real
+			// handler internals are out of this claim by construction.
+			const getState = vi.fn().mockResolvedValue({
+				mode: "code",
+				customModes: [],
+				disabledTools: ["use_mcp_tool"],
+			})
+			mockTask.providerRef = {
+				deref: () => ({
+					getState,
+					getMcpHub: () => ({
+						findServerNameBySanitizedName: () => "my_server",
+					}),
+				}),
+			}
+			const handleSpy = vi.spyOn(useMcpToolTool, "handle").mockResolvedValue(undefined)
+
+			mockTask.assistantMessageContent = [
+				{
+					type: "mcp_tool_use",
+					id: "call_native_mcp_no_live_read",
+					name: "mcp_my_server_do_thing",
+					serverName: "my_server",
+					toolName: "do_thing",
+					arguments: {},
+					partial: false,
+				},
+			]
+
+			await presentAssistantMessage(mockTask as unknown as Task, baseSnapshot)
+
+			// The arm ran (validation reached the shared layer) yet never touched
+			// provider state: policy came exclusively from the snapshot.
+			expect(vi.mocked(validateToolUse).mock.calls.length).toBeGreaterThan(0)
+			expect(handleSpy).toHaveBeenCalledTimes(1)
+			expect(getState).not.toHaveBeenCalled()
 		})
 	})
 })
