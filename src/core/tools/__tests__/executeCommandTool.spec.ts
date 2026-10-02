@@ -70,6 +70,11 @@ vitest.mock("../../../services/destructive-command-guard", () => ({
 import * as executeCommandModule from "../ExecuteCommandTool"
 const { executeCommandTool } = executeCommandModule
 
+// Spies installed on the auto-approval module are not restored between tests,
+// so a delegating spy must call the real policy captured at import time:
+// capturing inside a test can capture another test's leaked spy and recurse.
+const realCheckAutoApproval = autoApprovalModule.checkAutoApproval
+
 describe("executeCommandTool", () => {
 	// Setup common test variables
 	let mockCline: any & { consecutiveMistakeCount: number; didRejectTool: boolean }
@@ -658,6 +663,54 @@ describe("executeCommandTool", () => {
 			expect(formatResponse.toolAutoDenied).not.toHaveBeenCalled()
 			expect(formatResponse.toolError).toHaveBeenCalledWith(expect.stringContaining("instead of an approval"))
 			expect(mockPushToolResult).toHaveBeenCalledTimes(1)
+		})
+
+		it("executes an allowlisted command when blanket deny stays engaged and the recheck approves", async () => {
+			// The inverse of the dwell-flip denials: blanket deny is engaged on
+			// both the ask-time snapshot and the fresh read, but the command
+			// rides the allowlist, so the fresh policy still approves and the
+			// execute-time re-check must fall through to execution — blanket
+			// engagement alone is not a denial.
+			const provider = await mockCline.providerRef.deref()
+			provider.getState.mockResolvedValue({
+				alwaysDenyUnapprovedCommands: true,
+				autoApprovalEnabled: true,
+				alwaysAllowExecute: true,
+				allowedCommands: ["echo"],
+				deniedCommands: [],
+				destructiveCommandGuardEnabled: false,
+				terminalShellIntegrationDisabled: true,
+			})
+			// The command auto-approves against this snapshot, so the ask resolves true.
+			mockAskApproval.mockResolvedValue(true)
+			const recheckSpy = vitest
+				.spyOn(autoApprovalModule, "checkAutoApproval")
+				.mockImplementation((args) => realCheckAutoApproval(args))
+
+			await executeCommandTool.handle(mockCline as Task, mockToolUse, {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+			})
+
+			// The re-check genuinely ran against the fresh state — without this
+			// pin the assertions below could pass with the re-check skipped.
+			expect(recheckSpy).toHaveBeenCalledTimes(1)
+			expect(recheckSpy).toHaveBeenCalledWith(expect.objectContaining({ ask: "command", isProtected: false }))
+
+			// Approved: the command reaches the terminal and the pushed result is
+			// the execution output, not a denial or a retryable error. The
+			// TerminalRegistry assertion is the load-bearing one — the handler's
+			// intra-module call to `executeCommandInTerminal` is not intercepted
+			// by the spy, so the registry call is the real execution boundary.
+			expect(TerminalRegistry.getOrCreateTerminal).toHaveBeenCalledTimes(1)
+			expect(mockPushToolResult).toHaveBeenCalledTimes(1)
+			expect(mockPushToolResult).toHaveBeenCalledWith(
+				expect.stringContaining("Command executed in terminal within working directory"),
+			)
+			expect(mockCline.recordBlanketCommandDenial).not.toHaveBeenCalled()
+			expect(formatResponse.toolAutoDenied).not.toHaveBeenCalled()
+			expect(formatResponse.toolError).not.toHaveBeenCalled()
 		})
 
 		it("installs or updates DCG before evaluating an enabled command", async () => {
