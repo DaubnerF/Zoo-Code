@@ -1,6 +1,7 @@
 // npx vitest src/core/assistant-message/__tests__/presentAssistantMessage-tool-usage-attribution.spec.ts
 
 import type { Anthropic } from "@anthropic-ai/sdk"
+import { TelemetryEventName } from "@roo-code/types"
 import { describe, it, expect, beforeEach, vi, type Mock } from "vitest"
 import { presentAssistantMessage } from "../presentAssistantMessage"
 import { validateToolUse } from "../../tools/validateToolUse"
@@ -284,6 +285,37 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 		expect(mockTask.recordToolError).toHaveBeenCalledWith("invalid_tool_call", expect.any(String))
 		expect(mockTask.recordToolError).not.toHaveBeenCalledWith("totally_made_up_tool", expect.anything())
 		expect(mockTask.recordToolUsage).not.toHaveBeenCalled()
+	})
+
+	it("captures the legacy read_file telemetry event with the live model id", async () => {
+		// The model label on this event is a non-policy label read live from the
+		// api, never sourced from the request snapshot's modelInfo. The doubles
+		// deliberately disagree (live id vs a snapshot modelInfo carrying no id)
+		// so a source switch on the payload changes the captured value.
+		const liveModelId = "live-model-id"
+		mockTask.api = { getModel: vi.fn().mockReturnValue({ id: liveModelId, info: {} }) }
+
+		mockTask.assistantMessageContent = [
+			{
+				type: "tool_use",
+				id: "call_legacy_read",
+				name: "read_file",
+				params: { path: "test.txt" },
+				nativeArgs: { path: "test.txt" },
+				usedLegacyFormat: true,
+				partial: false,
+			},
+		]
+
+		await presentAssistantMessage(mockTask as unknown as Task, {
+			...baseSnapshot,
+			modelInfo: { contextWindow: 200_000, supportsPromptCache: true },
+		})
+
+		expect(TelemetryService.instance.captureEvent).toHaveBeenCalledWith(
+			TelemetryEventName.READ_FILE_LEGACY_FORMAT_USED,
+			{ taskId: mockTask.taskId, model: liveModelId },
+		)
 	})
 
 	describe("native mcp_tool_use block", () => {
