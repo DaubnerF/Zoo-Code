@@ -11,7 +11,7 @@ vi.mock("react-i18next", () => ({
 			const map: Record<string, string> = {
 				"chat:ignoredDisabledTools.title": "Disabled tool ignored",
 				"chat:ignoredDisabledTools.messageTemplate":
-					"The following tools cannot be disabled and will remain available: {{tools}}.",
+					"The following tools cannot be disabled, so their disabledTools entries were ignored: {{tools}}.",
 			}
 			const template = map[key] ?? key
 			if (!options) return template
@@ -54,8 +54,30 @@ describe("ChatRow - ignored disabled-tools notice", () => {
 
 		expect(screen.getByText("Disabled tool ignored")).toBeInTheDocument()
 		expect(
-			screen.getByText("The following tools cannot be disabled and will remain available: attempt_completion."),
+			screen.getByText(
+				"The following tools cannot be disabled, so their disabledTools entries were ignored: attempt_completion.",
+			),
 		).toBeInTheDocument()
+	})
+
+	it("does not claim the tool remains available", () => {
+		const message: ClineMessage = {
+			type: "say",
+			say: "ignored_disabled_tools_warning",
+			ts: Date.now(),
+			text: JSON.stringify({ ignoredTools: ["attempt_completion"] }),
+		}
+
+		renderChatRow(message)
+
+		expect(
+			screen.getByText(
+				"The following tools cannot be disabled, so their disabledTools entries were ignored: attempt_completion.",
+			),
+		).toBeInTheDocument()
+		// The notice names what was ignored but never promises the tool stays usable:
+		// a model profile's excludedTools can still strip the same tool.
+		expect(screen.queryByText(/available/i)).not.toBeInTheDocument()
 	})
 
 	it("renders nothing when the notice message text is missing", () => {

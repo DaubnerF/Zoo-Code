@@ -481,7 +481,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "已忽略被停用的工具",
-		"messageTemplate": "以下工具無法被停用，將繼續可用：{{tools}}。"
+		"messageTemplate": "以下工具無法被停用，因此它在 disabledTools 中的條目已被忽略：{{tools}}。"
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

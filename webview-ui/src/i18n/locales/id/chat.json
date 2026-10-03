@@ -496,7 +496,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "Tool nonaktif diabaikan",
-		"messageTemplate": "Tool berikut tidak dapat dinonaktifkan dan akan tetap tersedia: {{tools}}."
+		"messageTemplate": "Tool berikut tidak dapat dinonaktifkan, sehingga entri disabledTools-nya diabaikan: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

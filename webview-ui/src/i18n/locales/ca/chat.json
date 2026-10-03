@@ -490,7 +490,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "Eina desactivada ignorada",
-		"messageTemplate": "Les eines següents no es poden desactivar i continuaran disponibles: {{tools}}."
+		"messageTemplate": "Les eines següents no es poden desactivar, per això les entrades de disabledTools s'han ignorat: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

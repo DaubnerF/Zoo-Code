@@ -490,7 +490,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "Zignorowano wyłączane narzędzie",
-		"messageTemplate": "Następujących narzędzi nie można wyłączyć i pozostaną dostępne: {{tools}}."
+		"messageTemplate": "Następujących narzędzi nie można wyłączyć, dlatego ich wpisy w disabledTools zostały zignorowane: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

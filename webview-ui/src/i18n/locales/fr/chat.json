@@ -490,7 +490,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "Outil désactivé ignoré",
-		"messageTemplate": "Les outils suivants ne peuvent pas être désactivés et resteront disponibles : {{tools}}."
+		"messageTemplate": "Les outils suivants ne peuvent pas être désactivés ; leurs entrées disabledTools ont été ignorées : {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

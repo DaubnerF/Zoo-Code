@@ -490,7 +490,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "निष्क्रिय टूल अनदेखा किया गया",
-		"messageTemplate": "ये टूल निष्क्रिय नहीं किए जा सकते और उपलब्ध रहेंगे: {{tools}}."
+		"messageTemplate": "निम्नलिखित टूल निष्क्रिय नहीं किए जा सकते, इसलिए उनकी disabledTools प्रविष्टियाँ अनदेखी की गईं: {{tools}}।"
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

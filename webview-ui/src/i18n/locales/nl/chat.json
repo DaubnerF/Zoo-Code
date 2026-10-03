@@ -490,7 +490,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "Uitgeschakelde tool genegeerd",
-		"messageTemplate": "De volgende tools kunnen niet worden uitgeschakeld en blijven beschikbaar: {{tools}}."
+		"messageTemplate": "De volgende tools kunnen niet worden uitgeschakeld, zodat de bijbehorende disabledTools-vermeldingen zijn genegeerd: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

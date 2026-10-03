@@ -478,7 +478,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "Disabled tool ignored",
-		"messageTemplate": "The following tools cannot be disabled and will remain available: {{tools}}."
+		"messageTemplate": "The following tools cannot be disabled, so their disabledTools entries were ignored: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

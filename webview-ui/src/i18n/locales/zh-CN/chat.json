@@ -491,7 +491,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "已忽略被禁用的工具",
-		"messageTemplate": "以下工具无法被禁用，将继续可用：{{tools}}。"
+		"messageTemplate": "以下工具无法被禁用，因此它们在 disabledTools 中的条目已被忽略：{{tools}}。"
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

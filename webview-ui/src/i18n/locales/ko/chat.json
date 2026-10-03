@@ -490,7 +490,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "비활성화된 도구 무시됨",
-		"messageTemplate": "다음 도구는 비활성화할 수 없으며 계속 사용할 수 있습니다: {{tools}}."
+		"messageTemplate": "다음 도구는 비활성화할 수 없으므로 해당 disabledTools 항목이 무시되었습니다: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

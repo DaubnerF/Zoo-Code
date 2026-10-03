@@ -490,7 +490,7 @@
 	},
 	"ignoredDisabledTools": {
 		"title": "Deaktiviertes Tool ignoriert",
-		"messageTemplate": "Die folgenden Tools können nicht deaktiviert werden und bleiben verfügbar: {{tools}}."
+		"messageTemplate": "Die folgenden Tools können nicht deaktiviert werden; die entsprechenden disabledTools-Einträge wurden ignoriert: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo las Befehlsausgabe"
