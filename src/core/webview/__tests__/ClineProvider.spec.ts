@@ -89,6 +89,9 @@ vi.mock("../../../utils/storage", () => ({
 	getSettingsDirectoryPath: vi.fn().mockResolvedValue("/test/settings/path"),
 	getTaskDirectoryPath: vi.fn().mockResolvedValue("/test/task/path"),
 	getGlobalStoragePath: vi.fn().mockResolvedValue("/test/storage/path"),
+	// Deletion resolves the tasks directory before it removes a history
+	// file, so the harness must provide the passthrough base path.
+	getStorageBasePath: vi.fn().mockImplementation((defaultPath: string) => defaultPath),
 }))
 
 vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
@@ -1598,6 +1601,20 @@ describe("ClineProvider", () => {
 		expect(state.destructiveCommandGuardEnabled).toBe(true)
 	})
 
+	test("getState returns the saved blanket auto-deny setting", async () => {
+		await provider.contextProxy.setValue("alwaysDenyUnapprovedCommands", true)
+
+		const state = await provider.getState()
+
+		expect(state.alwaysDenyUnapprovedCommands).toBe(true)
+	})
+
+	test("getState defaults blanket auto-deny to false", async () => {
+		const state = await provider.getState()
+
+		expect(state.alwaysDenyUnapprovedCommands).toBe(false)
+	})
+
 	test("getState returns the saved allowed read files", async () => {
 		await provider.contextProxy.setValue("allowedReadFiles", ["notes.md"])
 
@@ -1675,6 +1692,23 @@ describe("ClineProvider", () => {
 		const state = await provider.getStateToPostToWebview()
 
 		expect(state.destructiveCommandGuardEnabled).toBe(false)
+	})
+
+	test("getStateToPostToWebview returns the saved blanket auto-deny setting", async () => {
+		await provider.resolveWebviewView(mockWebviewView)
+		await provider.contextProxy.setValue("alwaysDenyUnapprovedCommands", true)
+
+		const state = await provider.getStateToPostToWebview()
+
+		expect(state.alwaysDenyUnapprovedCommands).toBe(true)
+	})
+
+	test("getStateToPostToWebview disables blanket auto-deny by default", async () => {
+		await provider.resolveWebviewView(mockWebviewView)
+
+		const state = await provider.getStateToPostToWebview()
+
+		expect(state.alwaysDenyUnapprovedCommands).toBe(false)
 	})
 
 	test("language is set to VSCode language", async () => {
