@@ -2994,19 +2994,26 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Detection reads the raw list, so the notice also fires when a
 			// model-profile `excludedTools` entry suppresses the tool through a
 			// separate route. `startTask` runs exactly once per new task, which
-			// is what bounds this to a single notice.
-			const disabledToolsState = await this.providerRef.deref()?.getState()
-			const { ignored } = partitionDisabledToolsForProtocol(disabledToolsState?.disabledTools)
-			if (ignored.length > 0) {
-				await this.say(
-					"ignored_disabled_tools_warning",
-					JSON.stringify({ ignoredTools: ignored }),
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{ isNonInteractive: true },
-				)
+			// is what bounds this to a single notice. The block is guarded like
+			// `getEnabledMcpToolsCount` above: this is a telemetry-class notice,
+			// so a rejection from the state read or the say must never keep the
+			// task loop from starting.
+			try {
+				const disabledToolsState = await this.providerRef.deref()?.getState()
+				const { ignored } = partitionDisabledToolsForProtocol(disabledToolsState?.disabledTools)
+				if (ignored.length > 0) {
+					await this.say(
+						"ignored_disabled_tools_warning",
+						JSON.stringify({ ignoredTools: ignored }),
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						{ isNonInteractive: true },
+					)
+				}
+			} catch (error) {
+				console.error("[Task#startTask] ignored-disabled-tools notice failed:", error)
 			}
 			this.isInitialized = true
 

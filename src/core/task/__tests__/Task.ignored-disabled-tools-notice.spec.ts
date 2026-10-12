@@ -182,6 +182,42 @@ async function startTaskWithDisabledTools(disabledTools: string[] | undefined, p
 	return saySpy.mock.calls.filter(([type]) => type === "ignored_disabled_tools_warning")
 }
 
+// Mirrors `startTaskWithDisabledTools` but makes the provider state read
+// reject, exercising the failure-proofing around the notice emission: a
+// telemetry-class notice must never keep the task loop from starting.
+async function startTaskWithFailingStateRead() {
+	const mockProvider = createMockProvider(["attempt_completion"])
+	vi.mocked(mockProvider.getState).mockRejectedValue(new Error("state read failed"))
+
+	const apiConfiguration: ProviderSettings = {
+		apiProvider: providerIdentifiers.anthropic,
+		apiModelId: "claude-3-5-sonnet-20241022",
+		apiKey: "test-api-key",
+	}
+
+	const task = new Task({
+		provider: mockProvider,
+		apiConfiguration,
+		task: "example task",
+		startTask: false,
+	})
+
+	const saySpy = vi.spyOn(task, "say").mockResolvedValue(undefined)
+	const taskAccess = getStartTaskAccess(task)
+	vi.spyOn(taskAccess, "getEnabledMcpToolsCount").mockResolvedValue({
+		enabledToolCount: 0,
+		enabledServerCount: 0,
+	})
+	const initiateLoopSpy = vi.spyOn(taskAccess, "initiateTaskLoop").mockResolvedValue(undefined)
+
+	await taskAccess.startTask("example task")
+
+	return {
+		noticeCalls: saySpy.mock.calls.filter(([type]) => type === "ignored_disabled_tools_warning"),
+		initiateLoopSpy,
+	}
+}
+
 async function resumeTaskWithDisabledTools(disabledTools: string[] | undefined) {
 	const mockProvider = createMockProvider(disabledTools)
 
@@ -241,6 +277,30 @@ describe("Task - ignored disabled-tools notice", () => {
 		const [, text, , , , , options] = noticeCalls[0]
 		expect(JSON.parse(text as string)).toEqual({ ignoredTools: ["attempt_completion"] })
 		expect(options).toEqual({ isNonInteractive: true })
+	})
+
+	it("names a duplicated protocol-tool entry exactly once in the notice payload", async () => {
+		// A duplicate in the raw user list must collapse: without the de-dup
+		// in `partitionDisabledToolsForProtocol` the payload would read
+		// `{ ignoredTools: ["attempt_completion", "attempt_completion"] }`.
+		const noticeCalls = await startTaskWithDisabledTools([
+			"execute_command",
+			"attempt_completion",
+			"attempt_completion",
+		])
+
+		expect(noticeCalls).toHaveLength(1)
+		const [, text] = noticeCalls[0]
+		expect(JSON.parse(text as string)).toEqual({ ignoredTools: ["attempt_completion"] })
+	})
+
+	it("still starts the task loop when the notice's provider state read rejects", async () => {
+		const { noticeCalls, initiateLoopSpy } = await startTaskWithFailingStateRead()
+
+		// The notice path swallows the rejection, so startup proceeds; the
+		// notice itself is simply not emitted.
+		expect(initiateLoopSpy).toHaveBeenCalledTimes(1)
+		expect(noticeCalls).toHaveLength(0)
 	})
 
 	it("stays silent when the user list is absent or names only ordinary tools", async () => {
