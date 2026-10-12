@@ -325,6 +325,7 @@ describe("BaseOpenAiCompatibleProvider", () => {
 			expect(model.id).not.toBe("test-model")
 			// Falls back to sane default metadata so the rest of the pipeline works.
 			expect(model.info).toEqual(openAiModelInfoSaneDefaults)
+			expect(model.info).not.toHaveProperty("maxTokens")
 		})
 
 		it("sends the custom model id verbatim to the API", async () => {
@@ -343,6 +344,18 @@ describe("BaseOpenAiCompatibleProvider", () => {
 			)
 		})
 
+		it("omits max_tokens for a custom model", async () => {
+			mockCreate.mockImplementationOnce(() => asyncStreamFrom([]))
+
+			const customHandler = new TestOpenAiCompatibleProvider("test-api-key", {
+				apiModelId: "some/custom-model-not-in-list",
+			})
+
+			await collectStream(customHandler.createMessage("system prompt", []))
+
+			expect(mockCreate.mock.calls[0][0].max_tokens).toBeUndefined()
+		})
+
 		it("completePrompt sends the custom model id verbatim to the API", async () => {
 			mockCreate.mockResolvedValueOnce({ choices: [{ message: { content: "ok" } }] })
 
@@ -352,9 +365,7 @@ describe("BaseOpenAiCompatibleProvider", () => {
 
 			await customHandler.completePrompt("hello")
 
-			expect(mockCreate).toHaveBeenCalledWith(
-				expect.objectContaining({ model: "some/custom-model-not-in-list" }),
-			)
+			expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({ model: "some/custom-model-not-in-list" }))
 		})
 	})
 
