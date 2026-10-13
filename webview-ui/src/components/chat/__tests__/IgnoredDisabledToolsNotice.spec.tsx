@@ -60,24 +60,21 @@ describe("ChatRow - ignored disabled-tools notice", () => {
 		).toBeInTheDocument()
 	})
 
-	it("does not claim the tool remains available", () => {
-		const message: ClineMessage = {
-			type: "say",
-			say: "ignored_disabled_tools_warning",
-			ts: Date.now(),
-			text: JSON.stringify({ ignoredTools: ["attempt_completion"] }),
-		}
-
-		renderChatRow(message)
-
-		expect(
-			screen.getByText(
-				"The following tools cannot be disabled, so their disabledTools entries were ignored: attempt_completion.",
-			),
-		).toBeInTheDocument()
-		// The notice names what was ignored but never promises the tool stays usable:
-		// a model profile's excludedTools can still strip the same tool.
-		expect(screen.queryByText(/available/i)).not.toBeInTheDocument()
+	it("keeps the {{tools}} placeholder in every locale and never claims availability in en", () => {
+		// The react-i18next mock above hides the real strings, so read the locale files directly.
+		// A model profile's excludedTools can still strip the tool, so the copy must not promise it.
+		const locales = import.meta.glob<{ ignoredDisabledTools: { messageTemplate: string } }>(
+			"../../../i18n/locales/*/chat.json",
+			{ eager: true, import: "default" },
+		)
+		const entries = Object.entries(locales)
+		expect(entries.length).toBeGreaterThan(1)
+		const missing = entries
+			.filter(([, chat]) => !chat.ignoredDisabledTools.messageTemplate.includes("{{tools}}"))
+			.map(([path]) => path)
+		expect(missing).toEqual([])
+		const en = locales["../../../i18n/locales/en/chat.json"]
+		expect(en.ignoredDisabledTools.messageTemplate).not.toMatch(/available/i)
 	})
 
 	it("renders nothing when the notice message text is missing", () => {
