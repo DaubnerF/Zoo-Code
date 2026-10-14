@@ -420,6 +420,10 @@ describe("extension.ts", () => {
 				),
 				inspect: vi.fn().mockReturnValue({
 					key: "allowedCommands",
+					// Real inspect() always reports the declared package default;
+					// including it here lets the workspace-override test prove the
+					// default stays unseeded beside an override, not just absent.
+					defaultValue: ["git log", "git diff", "git show"],
 					globalValue,
 					workspaceValue,
 				}),
