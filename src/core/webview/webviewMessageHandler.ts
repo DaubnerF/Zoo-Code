@@ -60,6 +60,7 @@ import {
 import { changeLanguage, t } from "../../i18n"
 import { Package } from "../../shared/package"
 import {
+	type CommandListInspection,
 	commandListConfiguration,
 	readCommandListScopes,
 	resolveWorkspaceWriteTarget,
@@ -766,43 +767,58 @@ export const webviewMessageHandler = async (
 
 						// The webview always sends the full merged list (it displays
 						// the union of the global-state and workspace-scope layers).
-						// Read both layers BEFORE any write and split the incoming
-						// list by origin scope, so saving the dialog cannot flatten
-						// workspace-scoped entries into the user's global settings.
-						const currentScopes = readCommandListScopes(key, getGlobalState(key))
+						// Splitting that list by origin scope needs the workspace
+						// layer, the write target, and the rollback value to describe
+						// the SAME configuration state, so they are all derived from
+						// one inspect() snapshot taken before any write. Without a
+						// snapshot the key's save is aborted rather than guessed at:
+						// reading the workspace layer as empty would classify a
+						// workspace-scoped entry as brand new and re-copy it into
+						// global settings.
+						// Only the snapshot read is guarded: a failing
+						// commandListConfiguration() lookup propagates instead of being
+						// downgraded to a per-key save failure.
+						const config = commandListConfiguration()
+						let inspection: CommandListInspection | undefined
+						let inspectionFailure: string | undefined
+						try {
+							inspection = config.inspect<string[]>(key)
+						} catch (error) {
+							inspectionFailure = error instanceof Error ? error.message : String(error)
+						}
+						if (inspection === undefined) {
+							// No snapshot: the workspace layer could only be guessed
+							// at, and a guessed-empty layer re-copies workspace entries
+							// into global settings, so this key's save is abandoned
+							// while the remaining keys of the payload persist normally.
+							vscode.window.showErrorMessage(
+								`Failed to save ${key}: ${inspectionFailure ?? "the configuration value could not be read"}`,
+							)
+							continue
+						}
+
+						const currentScopes = readCommandListScopes(key, getGlobalState(key), inspection)
 						const { globalWrite, workspaceWrite } = splitCommandListScopes(
 							incoming,
 							currentScopes.workspace,
 							currentScopes.global,
 						)
-						const workspaceTarget = resolveWorkspaceWriteTarget(key)
-						const config = commandListConfiguration()
+						const workspaceTarget = resolveWorkspaceWriteTarget(key, inspection)
 
 						// The two configuration writes below are not atomic, so the raw
-						// previous workspace value is captured before the write: a failed
-						// global write rewinds the workspace layer to exactly what the
-						// configuration held beforehand, including the entries this save
-						// drops. The raw inspected value is used rather than the sanitized
-						// layer so the rewind reproduces the file contents instead of a
-						// cleaned-up approximation of them.
-						let previousWorkspaceValue: string[] | undefined
+						// previous workspace value comes from the same snapshot the split
+						// used, taken from the target that owns the workspace layer: a
+						// failed global write rewinds that target to exactly what it held
+						// beforehand, including the entries this save drops. The raw
+						// inspected value is used rather than the sanitized layer so the
+						// rewind reproduces the file contents instead of a cleaned-up
+						// approximation of them.
+						const previousWorkspaceValue =
+							workspaceTarget === vscode.ConfigurationTarget.WorkspaceFolder
+								? inspection.workspaceFolderValue
+								: inspection.workspaceValue
 						let workspaceWriteApplied = false
 						try {
-							// Capture the raw previous value for the compensation path
-							// before anything is written, from the target that owns the
-							// workspace layer, so the rewind reproduces exactly what that
-							// target held. With no inspect result there is nothing
-							// trustworthy to rewind to; the layer can only have been
-							// created or changed by this save's own writes, so the
-							// compensation write clears it.
-							const previousInspected = config.inspect<string[]>(key)
-							if (previousInspected !== undefined) {
-								previousWorkspaceValue =
-									workspaceTarget === vscode.ConfigurationTarget.WorkspaceFolder
-										? previousInspected.workspaceFolderValue
-										: previousInspected.workspaceValue
-							}
-
 							// Write the workspace layer first, at the target that owns it.
 							// When no workspace layer exists the write is skipped entirely
 							// so saving never materializes one; when entries were deleted

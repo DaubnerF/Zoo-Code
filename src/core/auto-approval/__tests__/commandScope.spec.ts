@@ -140,6 +140,19 @@ describe("readCommandListScopes", () => {
 		expect(scopes.workspace).toEqual([])
 		expect(scopes.merged).toEqual(["git"])
 	})
+
+	it("takes the workspace layer from a caller-supplied snapshot without reading the configuration", () => {
+		// The save path threads one captured inspection through every
+		// derivation, so the snapshot is authoritative: the configuration's own
+		// value must never be consulted a second time.
+		mockConfiguration({ inspect: { key: "deniedCommands", workspaceValue: ["stale"] } })
+
+		const scopes = readCommandListScopes("deniedCommands", [], { workspaceValue: ["docker"] })
+
+		expect(scopes.workspace).toEqual(["docker"])
+		expect(scopes.merged).toEqual(["docker"])
+		expect(vscode.workspace.getConfiguration).not.toHaveBeenCalled()
+	})
 })
 
 describe("splitCommandListScopes", () => {
@@ -259,6 +272,18 @@ describe("resolveWorkspaceWriteTarget", () => {
 		})
 
 		expect(resolveWorkspaceWriteTarget("deniedCommands")).toBeUndefined()
+	})
+
+	it("resolves the target from a caller-supplied snapshot without reading the configuration", () => {
+		// The snapshot alone decides the target, so a folder value the live
+		// configuration does not report still selects the folder target —
+		// keeping split, write, and rollback on one captured state.
+		mockConfiguration({ inspect: { key: "deniedCommands", workspaceValue: ["docker"] } })
+
+		expect(resolveWorkspaceWriteTarget("deniedCommands", { workspaceFolderValue: ["pnpm docker"] })).toBe(
+			vscode.ConfigurationTarget.WorkspaceFolder,
+		)
+		expect(vscode.workspace.getConfiguration).not.toHaveBeenCalled()
 	})
 
 	it("resolves the target from the configuration scoped to the first workspace folder", () => {
