@@ -178,6 +178,11 @@ vi.mock("vscode", () => {
 	const showTextDocument = vi.fn().mockResolvedValue(undefined)
 
 	return {
+		ConfigurationTarget: {
+			Global: 1,
+			Workspace: 2,
+			WorkspaceFolder: 3,
+		},
 		window: {
 			showInformationMessage,
 			showErrorMessage,
@@ -1426,6 +1431,91 @@ describe("webviewMessageHandler - allowlists together", () => {
 
 		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("allowedReadFiles", ["read.md"])
 		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("allowedWriteFiles", ["write.md"])
+	})
+})
+
+describe("webviewMessageHandler - command list scope-aware persistence", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	// Mirrors the real VS Code configuration API: `inspect()` exposes the
+	// per-scope values, and `update()` records the target it was written to.
+	// Extension global state is left unset (getValue returns undefined), i.e.
+	// the global layer starts empty.
+	function mockCommandConfiguration(inspected: {
+		globalValue?: string[]
+		workspaceValue?: string[]
+		workspaceFolderValue?: string[]
+	}) {
+		const update = vi.fn()
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+			get: vi.fn().mockReturnValue([]),
+			inspect: vi.fn().mockReturnValue(inspected),
+			update,
+		} as never)
+		return update
+	}
+
+	it("keeps workspace-scoped denied commands out of the global write when saving the merged list", async () => {
+		const update = mockCommandConfiguration({ workspaceValue: ["docker"] })
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { deniedCommands: ["docker", "aws"] },
+		})
+
+		// "docker" stays at the workspace scope instead of leaking into the
+		// user's global settings (issue #1939 leg B).
+		expect(update).toHaveBeenCalledWith("deniedCommands", ["docker"], vscode.ConfigurationTarget.Workspace)
+		expect(update).toHaveBeenCalledWith("deniedCommands", ["aws"], vscode.ConfigurationTarget.Global)
+		// Extension global state holds only the global layer, so the next save
+		// cannot double-home the workspace entry.
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("deniedCommands", ["aws"])
+	})
+
+	it("writes the workspace-folder value at the folder target in multi-root workspaces", async () => {
+		const update = mockCommandConfiguration({ workspaceValue: ["npm"], workspaceFolderValue: ["docker"] })
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { deniedCommands: ["docker", "aws"] },
+		})
+
+		expect(update).toHaveBeenCalledWith("deniedCommands", ["docker"], vscode.ConfigurationTarget.WorkspaceFolder)
+		expect(update).toHaveBeenCalledWith("deniedCommands", ["aws"], vscode.ConfigurationTarget.Global)
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("deniedCommands", ["aws"])
+	})
+
+	it("clears a deleted workspace entry at the workspace scope without adding it to global", async () => {
+		const update = mockCommandConfiguration({ workspaceValue: ["docker"] })
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { deniedCommands: [] },
+		})
+
+		// Deleting a project entry must clear it where it lives...
+		expect(update).toHaveBeenCalledWith("deniedCommands", [], vscode.ConfigurationTarget.Workspace)
+		// ...and must not copy it into global settings.
+		expect(update).not.toHaveBeenCalledWith("deniedCommands", ["docker"], vscode.ConfigurationTarget.Global)
+		expect(update).toHaveBeenCalledWith("deniedCommands", [], vscode.ConfigurationTarget.Global)
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("deniedCommands", [])
+	})
+
+	it("does not create a workspace layer when none exists", async () => {
+		const update = mockCommandConfiguration({})
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { allowedCommands: ["git"] },
+		})
+
+		// Only the Global write happens; saving must not materialize an empty
+		// workspace-scoped value in settings.json.
+		expect(update).toHaveBeenCalledTimes(1)
+		expect(update).toHaveBeenCalledWith("allowedCommands", ["git"], vscode.ConfigurationTarget.Global)
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("allowedCommands", ["git"])
 	})
 })
 

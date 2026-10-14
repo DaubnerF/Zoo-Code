@@ -59,6 +59,11 @@ import {
 } from "./rulesMessageHandler"
 import { changeLanguage, t } from "../../i18n"
 import { Package } from "../../shared/package"
+import {
+	readCommandListScopes,
+	resolveWorkspaceWriteTarget,
+	splitCommandListScopes,
+} from "../auto-approval/commandScope"
 import { type RouterName, toRouterName } from "../../shared/api"
 import { MessageEnhancer } from "./messageEnhancer"
 
@@ -751,26 +756,43 @@ export const webviewMessageHandler = async (
 					if (key === "language") {
 						newValue = value ?? "en"
 						changeLanguage(newValue as Language)
-					} else if (key === "allowedCommands") {
+					} else if (key === "allowedCommands" || key === "deniedCommands") {
 						const commands = value ?? []
 
-						newValue = Array.isArray(commands)
+						const incoming = Array.isArray(commands)
 							? commands.filter((cmd) => typeof cmd === "string" && cmd.trim().length > 0)
 							: []
 
-						await vscode.workspace
-							.getConfiguration(Package.name)
-							.update("allowedCommands", newValue, vscode.ConfigurationTarget.Global)
-					} else if (key === "deniedCommands") {
-						const commands = value ?? []
+						// The webview always sends the full merged list (it displays
+						// the union of the global-state and workspace-scope layers).
+						// Read both layers BEFORE any write and split the incoming
+						// list by origin scope, so saving the dialog cannot flatten
+						// workspace-scoped entries into the user's global settings.
+						const currentScopes = readCommandListScopes(key, getGlobalState(key))
+						const { globalWrite, workspaceWrite } = splitCommandListScopes(
+							incoming,
+							currentScopes.workspace,
+							currentScopes.global,
+						)
+						const workspaceTarget = resolveWorkspaceWriteTarget(key)
+						const config = vscode.workspace.getConfiguration(Package.name)
 
-						newValue = Array.isArray(commands)
-							? commands.filter((cmd) => typeof cmd === "string" && cmd.trim().length > 0)
-							: []
+						// Write the workspace layer first, at the target that owns it.
+						// When no workspace layer exists the write is skipped entirely
+						// so saving never materializes one; when entries were deleted
+						// the `[]` write clears them at that scope.
+						if (workspaceTarget !== undefined) {
+							await config.update(key, workspaceWrite, workspaceTarget)
+						}
 
-						await vscode.workspace
-							.getConfiguration(Package.name)
-							.update("deniedCommands", newValue, vscode.ConfigurationTarget.Global)
+						await config.update(key, globalWrite, vscode.ConfigurationTarget.Global)
+
+						// Extension global state keeps only the global layer:
+						// enforcement re-adds the workspace layer through
+						// readCommandListScopes, so storing the merged list here
+						// would double-home workspace entries and re-leak them on the
+						// next save.
+						newValue = globalWrite
 					} else if (key === "allowedReadFiles" || key === "allowedWriteFiles") {
 						const patterns = value ?? []
 
@@ -1712,38 +1734,6 @@ export const webviewMessageHandler = async (
 			// Cancel any pending auto-approval timeout for the current task
 			provider.getCurrentTask()?.cancelAutoApprovalTimeout()
 			break
-		case "allowedCommands": {
-			// Validate and sanitize the commands array
-			const commands = message.commands ?? []
-			const validCommands = Array.isArray(commands)
-				? commands.filter((cmd) => typeof cmd === "string" && cmd.trim().length > 0)
-				: []
-
-			await updateGlobalState("allowedCommands", validCommands)
-
-			// Also update workspace settings.
-			await vscode.workspace
-				.getConfiguration(Package.name)
-				.update("allowedCommands", validCommands, vscode.ConfigurationTarget.Global)
-
-			break
-		}
-		case "deniedCommands": {
-			// Validate and sanitize the commands array
-			const commands = message.commands ?? []
-			const validCommands = Array.isArray(commands)
-				? commands.filter((cmd) => typeof cmd === "string" && cmd.trim().length > 0)
-				: []
-
-			await updateGlobalState("deniedCommands", validCommands)
-
-			// Also update workspace settings.
-			await vscode.workspace
-				.getConfiguration(Package.name)
-				.update("deniedCommands", validCommands, vscode.ConfigurationTarget.Global)
-
-			break
-		}
 		case "openCustomModesSettings": {
 			const customModesFilePath = await provider.customModesManager.getCustomModesFilePath()
 
