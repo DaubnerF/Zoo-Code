@@ -1,7 +1,5 @@
 // npx vitest run core/task/__tests__/Task.ignored-disabled-tools-notice.spec.ts
 
-import * as vscode from "vscode"
-
 import type { ClineMessage, HistoryItem, ModelInfo, ProviderSettings } from "@roo-code/types"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
