@@ -1,6 +1,15 @@
 import * as vscode from "vscode"
 
+import { Package } from "../../../shared/package"
+import { makeUri, makeWorkspaceConfiguration } from "../../../test-utils/vscode"
 import { readCommandListScopes, resolveWorkspaceWriteTarget, splitCommandListScopes } from "../commandScope"
+
+// Scriptable stand-in for `vscode.workspace.workspaceFolders`: the module
+// mock's getter reads through this object, so a test can change the open
+// folders without re-mocking the module.
+const workspaceState = vi.hoisted(() => ({
+	workspaceFolders: undefined as { uri: unknown }[] | undefined,
+}))
 
 vi.mock("vscode", () => ({
 	ConfigurationTarget: {
@@ -9,6 +18,9 @@ vi.mock("vscode", () => ({
 		WorkspaceFolder: 3,
 	},
 	workspace: {
+		get workspaceFolders() {
+			return workspaceState.workspaceFolders
+		},
 		getConfiguration: vi.fn(),
 	},
 }))
@@ -25,11 +37,12 @@ interface ConfigDouble {
 }
 
 function mockConfiguration({ inspect, effective = [] }: ConfigDouble = {}) {
-	vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-		get: vi.fn().mockReturnValue(effective),
-		inspect: vi.fn().mockReturnValue(inspect),
-		update: vi.fn(),
-	} as unknown as vscode.WorkspaceConfiguration)
+	const config = makeWorkspaceConfiguration()
+	// The shared double is scripted after creation so the per-test fixture
+	// values need no type assertion at the construction site.
+	vi.mocked(config.get).mockReturnValue(effective)
+	vi.mocked(config.inspect).mockReturnValue(inspect)
+	vi.mocked(vscode.workspace.getConfiguration).mockReturnValue(config)
 }
 
 describe("readCommandListScopes", () => {
@@ -192,6 +205,8 @@ describe("splitCommandListScopes", () => {
 	})
 
 	it("drops blank and non-string entries from the incoming list", () => {
+		// Deliberate wrong runtime type: configuration lists arrive as unknown,
+		// so the sanitizer must drop non-strings instead of throwing on them.
 		const result = splitCommandListScopes(["git", "", "   ", 42 as unknown as string], [], ["git"])
 
 		expect(result.globalWrite).toEqual(["git"])
@@ -209,6 +224,7 @@ describe("splitCommandListScopes", () => {
 describe("resolveWorkspaceWriteTarget", () => {
 	beforeEach(() => {
 		vi.clearAllMocks()
+		workspaceState.workspaceFolders = undefined
 	})
 
 	it("returns the workspace-folder target when a folder value is set", () => {
@@ -244,4 +260,30 @@ describe("resolveWorkspaceWriteTarget", () => {
 
 		expect(resolveWorkspaceWriteTarget("deniedCommands")).toBeUndefined()
 	})
+
+	it("resolves the target from the configuration scoped to the first workspace folder", () => {
+		const folderA = makeUri("/mock/folder-a")
+		const folderB = makeUri("/mock/folder-b")
+		workspaceState.workspaceFolders = [{ uri: folderA }, { uri: folderB }]
+		mockConfiguration({ inspect: { key: "deniedCommands", workspaceFolderValue: ["pnpm docker"] } })
+
+		expect(resolveWorkspaceWriteTarget("deniedCommands")).toBe(vscode.ConfigurationTarget.WorkspaceFolder)
+		expect(vscode.workspace.getConfiguration).toHaveBeenCalledWith(Package.name, folderA)
+		// Only the first folder is ever in scope: reading any other folder's
+		// configuration would silently target the wrong folder's settings file.
+		expect(vscode.workspace.getConfiguration).not.toHaveBeenCalledWith(Package.name, folderB)
+	})
+
+	it.each([undefined, [] as { uri: unknown }[]])(
+		"falls back to an unscoped configuration when no workspace folder is open (%s)",
+		(workspaceFolders) => {
+			workspaceState.workspaceFolders = workspaceFolders
+			mockConfiguration({ inspect: { key: "deniedCommands", workspaceValue: ["docker"] } })
+
+			// With no resource to resolve against, no folder value can be
+			// reported, so the folder target stays unreachable.
+			expect(resolveWorkspaceWriteTarget("deniedCommands")).toBe(vscode.ConfigurationTarget.Workspace)
+			expect(vscode.workspace.getConfiguration).toHaveBeenCalledWith(Package.name, undefined)
+		},
+	)
 })

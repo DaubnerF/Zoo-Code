@@ -19,18 +19,22 @@ export async function seedAllowedCommands(globalState: vscode.Memento): Promise<
 		return
 	}
 
-	let globalValue: string[] | undefined
+	// Only the configuration lookup itself is guarded: it can fail (for example
+	// before the workspace is ready), and skipping the seed then only defers it
+	// to a later activation. The `?.globalValue` read below stays outside the
+	// guarded region so a genuine lookup failure stays distinguishable from an
+	// absent value rather than being swallowed as one.
+	let inspected: { globalValue?: string[] } | undefined
 	try {
-		globalValue = vscode.workspace.getConfiguration(Package.name).inspect<string[]>("allowedCommands")?.globalValue
+		inspected = vscode.workspace.getConfiguration(Package.name).inspect<string[]>("allowedCommands")
 	} catch {
-		// Configuration access can fail (for example before the workspace is
-		// ready); skipping the seed only defers it to a later activation.
 		return
 	}
 
 	// An absent global-scope value leaves global state untouched: seeding the
 	// package.json default or a workspace override would defeat the point of
 	// scoping the seed to the user's own settings.
+	const globalValue = inspected?.globalValue
 	if (!Array.isArray(globalValue)) {
 		return
 	}

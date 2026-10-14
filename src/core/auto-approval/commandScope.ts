@@ -11,6 +11,20 @@ export interface CommandListScopes {
 }
 
 /**
+ * The configuration object for every command-list read and write, scoped to
+ * the first workspace folder. Sharing one scoped access path keeps the two
+ * sides symmetric: `inspect()` can report `workspaceFolderValue`, and
+ * `ConfigurationTarget.WorkspaceFolder` updates are legal (the API contract
+ * throws for that target when the configuration is not scoped to a
+ * resource). In a multi-root workspace only the first folder's values are in
+ * scope; with no folder open the configuration is unscoped and reports no
+ * folder value.
+ */
+export function commandListConfiguration(): vscode.WorkspaceConfiguration {
+	return vscode.workspace.getConfiguration(Package.name, vscode.workspace.workspaceFolders?.[0]?.uri)
+}
+
+/**
  * Reads an auto-approval command list from both configuration layers and
  * composes the list that should be enforced and displayed.
  *
@@ -28,18 +42,22 @@ export function readCommandListScopes(
 	globalList: string[] | undefined,
 ): CommandListScopes {
 	const global = sanitizeCommandList(globalList)
-	let workspace: string[] = []
 
+	// Only the configuration lookup itself is guarded: it can fail (for example
+	// before the workspace is ready), and an absent workspace layer must not
+	// break enforcement. The value reads below have no failure mode of their
+	// own, so the catch covers exactly the failure it exists to absorb.
+	let inspected: { workspaceValue?: string[]; workspaceFolderValue?: string[] } | undefined
 	try {
-		const inspected = vscode.workspace.getConfiguration(Package.name).inspect(configKey)
-		// The folder value wins over the workspace value, matching VS Code's own
-		// resolution precedence for multi-root workspaces.
-		workspace = sanitizeCommandList(inspected?.workspaceFolderValue ?? inspected?.workspaceValue)
+		inspected = commandListConfiguration().inspect<string[]>(configKey)
 	} catch {
-		// Configuration access can fail (for example before the workspace is
-		// ready); an absent workspace layer must not break enforcement.
-		workspace = []
+		inspected = undefined
 	}
+
+	// The folder value wins over the workspace value, matching VS Code's
+	// folder-over-workspace precedence. An absent inspect result composes to
+	// an empty workspace layer: enforcement must not break.
+	const workspace = sanitizeCommandList(inspected?.workspaceFolderValue ?? inspected?.workspaceValue)
 
 	// Set union: an entry present in both layers collapses to one, so
 	// composition cannot change prefix-match outcomes.
@@ -98,9 +116,11 @@ export function splitCommandListScopes(
 
 /**
  * Picks the configuration target that owns the current workspace-scope layer
- * for `configKey`, mirroring how `readCommandListScopes` reads it via an
- * unscoped `getConfiguration(Package.name)` (which resolves folder values
- * from the first workspace folder).
+ * for `configKey`, inspecting the same `commandListConfiguration()` object
+ * `readCommandListScopes` reads. Because that configuration is scoped to the
+ * first workspace folder, folder values resolve against that folder's
+ * settings; with no folder open the configuration is unscoped and reports no
+ * folder value, so no folder target can be selected.
  *
  * - `workspaceFolderValue` set -> write at `WorkspaceFolder` scope.
  * - Otherwise `workspaceValue` set -> write at `Workspace` scope.
@@ -114,20 +134,22 @@ export function splitCommandListScopes(
 export function resolveWorkspaceWriteTarget(
 	configKey: CommandListConfigKey,
 ): vscode.ConfigurationTarget.WorkspaceFolder | vscode.ConfigurationTarget.Workspace | undefined {
+	// Same defensive posture as readCommandListScopes: only the configuration
+	// lookup itself may fail, and a failure means we create no workspace layer.
+	let inspected: { workspaceValue?: string[]; workspaceFolderValue?: string[] } | undefined
 	try {
-		const inspected = vscode.workspace.getConfiguration(Package.name).inspect(configKey)
-		if (inspected?.workspaceFolderValue !== undefined) {
-			return vscode.ConfigurationTarget.WorkspaceFolder
-		}
-		if (inspected?.workspaceValue !== undefined) {
-			return vscode.ConfigurationTarget.Workspace
-		}
-		return undefined
+		inspected = commandListConfiguration().inspect<string[]>(configKey)
 	} catch {
-		// Same defensive posture as readCommandListScopes: configuration
-		// access failures mean we create no workspace layer.
-		return undefined
+		inspected = undefined
 	}
+
+	if (inspected?.workspaceFolderValue !== undefined) {
+		return vscode.ConfigurationTarget.WorkspaceFolder
+	}
+	if (inspected?.workspaceValue !== undefined) {
+		return vscode.ConfigurationTarget.Workspace
+	}
+	return undefined
 }
 
 function sanitizeCommandList(list: unknown): string[] {

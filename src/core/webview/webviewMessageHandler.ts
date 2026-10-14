@@ -60,6 +60,7 @@ import {
 import { changeLanguage, t } from "../../i18n"
 import { Package } from "../../shared/package"
 import {
+	commandListConfiguration,
 	readCommandListScopes,
 	resolveWorkspaceWriteTarget,
 	splitCommandListScopes,
@@ -775,17 +776,69 @@ export const webviewMessageHandler = async (
 							currentScopes.global,
 						)
 						const workspaceTarget = resolveWorkspaceWriteTarget(key)
-						const config = vscode.workspace.getConfiguration(Package.name)
+						const config = commandListConfiguration()
 
-						// Write the workspace layer first, at the target that owns it.
-						// When no workspace layer exists the write is skipped entirely
-						// so saving never materializes one; when entries were deleted
-						// the `[]` write clears them at that scope.
-						if (workspaceTarget !== undefined) {
-							await config.update(key, workspaceWrite, workspaceTarget)
+						// The two configuration writes below are not atomic, so the raw
+						// previous workspace value is captured before the write: a failed
+						// global write rewinds the workspace layer to exactly what the
+						// configuration held beforehand, including the entries this save
+						// drops. The raw inspected value is used rather than the sanitized
+						// layer so the rewind reproduces the file contents instead of a
+						// cleaned-up approximation of them.
+						let previousWorkspaceValue: string[] | undefined
+						let workspaceWriteApplied = false
+						try {
+							// Capture the raw previous value for the compensation path
+							// before anything is written, from the target that owns the
+							// workspace layer, so the rewind reproduces exactly what that
+							// target held. With no inspect result there is nothing
+							// trustworthy to rewind to; the layer can only have been
+							// created or changed by this save's own writes, so the
+							// compensation write clears it.
+							const previousInspected = config.inspect<string[]>(key)
+							if (previousInspected !== undefined) {
+								previousWorkspaceValue =
+									workspaceTarget === vscode.ConfigurationTarget.WorkspaceFolder
+										? previousInspected.workspaceFolderValue
+										: previousInspected.workspaceValue
+							}
+
+							// Write the workspace layer first, at the target that owns it.
+							// When no workspace layer exists the write is skipped entirely
+							// so saving never materializes one; when entries were deleted
+							// the `[]` write clears them at that scope.
+							if (workspaceTarget !== undefined) {
+								await config.update(key, workspaceWrite, workspaceTarget)
+								workspaceWriteApplied = true
+							}
+
+							await config.update(key, globalWrite, vscode.ConfigurationTarget.Global)
+						} catch (error) {
+							const failure = error instanceof Error ? error.message : String(error)
+
+							// A failed workspace write leaves nothing changed, so only a
+							// global-write failure has a changed workspace layer to rewind,
+							// and the rewind goes to the same target the write used.
+							if (workspaceWriteApplied) {
+								try {
+									await config.update(key, previousWorkspaceValue, workspaceTarget)
+								} catch (restoreError) {
+									// The rewind itself failed: the configuration keeps the
+									// partially written values and the extension global-state
+									// write is skipped, so stored state never reflects a save
+									// that did not complete. The user hears about both failures.
+									vscode.window.showErrorMessage(
+										`Failed to save ${key}: ${failure}. The workspace-scoped restore also failed: ${restoreError}. Review the command lists in your user and workspace settings.`,
+									)
+									continue
+								}
+							}
+
+							// Only this key's save is abandoned; the remaining keys of the
+							// payload persist normally.
+							vscode.window.showErrorMessage(`Failed to save ${key}: ${failure}`)
+							continue
 						}
-
-						await config.update(key, globalWrite, vscode.ConfigurationTarget.Global)
 
 						// Extension global state keeps only the global layer:
 						// enforcement re-adds the workspace layer through

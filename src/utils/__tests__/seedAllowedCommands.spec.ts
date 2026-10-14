@@ -2,6 +2,7 @@
 
 import * as vscode from "vscode"
 
+import { makeWorkspaceConfiguration } from "../../test-utils/vscode"
 import { seedAllowedCommands } from "../seedAllowedCommands"
 
 vi.mock("vscode", () => ({
@@ -23,16 +24,17 @@ interface ConfigDouble {
 }
 
 function mockConfiguration({ inspect, effective = [], inspectThrows = false }: ConfigDouble = {}) {
-	vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-		get: vi.fn().mockReturnValue(effective),
-		inspect: vi.fn().mockImplementation(() => {
-			if (inspectThrows) {
-				throw new Error("configuration access failed")
-			}
-			return inspect
-		}),
-		update: vi.fn(),
-	} as unknown as vscode.WorkspaceConfiguration)
+	const config = makeWorkspaceConfiguration()
+	// The shared double is scripted after creation so the per-test fixture
+	// values need no type assertion at the construction site.
+	vi.mocked(config.get).mockReturnValue(effective)
+	vi.mocked(config.inspect).mockImplementation(() => {
+		if (inspectThrows) {
+			throw new Error("configuration access failed")
+		}
+		return inspect
+	})
+	vi.mocked(vscode.workspace.getConfiguration).mockReturnValue(config)
 }
 
 function mockMemento(existing: unknown = undefined) {
@@ -41,9 +43,12 @@ function mockMemento(existing: unknown = undefined) {
 		store.set("allowedCommands", existing)
 	}
 
+	// Structurally complete Memento double (keys/get/update), so the call
+	// sites need no type assertion.
 	return {
-		get: vi.fn((key: string) => store.get(key)),
-		update: vi.fn(async (key: string, value: unknown) => {
+		keys: vi.fn((): readonly string[] => [...store.keys()]),
+		get: vi.fn().mockImplementation((key: string) => store.get(key)),
+		update: vi.fn().mockImplementation(async (key: string, value: unknown) => {
 			store.set(key, value)
 		}),
 	}
@@ -64,7 +69,7 @@ describe("seedAllowedCommands", () => {
 		})
 		const globalState = mockMemento()
 
-		await seedAllowedCommands(globalState as unknown as vscode.Memento)
+		await seedAllowedCommands(globalState)
 
 		expect(globalState.update).not.toHaveBeenCalled()
 		expect(globalState.get("allowedCommands")).toBeUndefined()
@@ -74,7 +79,7 @@ describe("seedAllowedCommands", () => {
 		mockConfiguration({ inspect: { key: "allowedCommands", globalValue: ["git"] }, effective: ["git"] })
 		const globalState = mockMemento()
 
-		await seedAllowedCommands(globalState as unknown as vscode.Memento)
+		await seedAllowedCommands(globalState)
 
 		expect(globalState.update).toHaveBeenCalledExactlyOnceWith("allowedCommands", ["git"])
 		expect(globalState.get("allowedCommands")).toEqual(["git"])
@@ -84,17 +89,37 @@ describe("seedAllowedCommands", () => {
 		mockConfiguration({ inspect: { key: "allowedCommands", globalValue: ["git"] }, effective: ["git"] })
 		const globalState = mockMemento(["npm"])
 
-		await seedAllowedCommands(globalState as unknown as vscode.Memento)
+		await seedAllowedCommands(globalState)
 
 		expect(globalState.update).not.toHaveBeenCalled()
 		expect(globalState.get("allowedCommands")).toEqual(["npm"])
+	})
+
+	it("inspects the global value under the extension's own section key", async () => {
+		// The seed must read the extension's own section; asking VS Code about
+		// a different (or empty) section key would silently never find the
+		// user's global list.
+		mockConfiguration({ inspect: { key: "allowedCommands", globalValue: ["git"] } })
+		// Structurally complete Memento double (keys/get/update), so the call
+		// site needs no type assertion.
+		const globalState: vscode.Memento = {
+			keys: () => [],
+			get: vi.fn(),
+			update: vi.fn(),
+		}
+
+		await seedAllowedCommands(globalState)
+
+		const config = vi.mocked(vscode.workspace.getConfiguration).mock.results[0].value
+		expect(config.inspect).toHaveBeenCalledWith("allowedCommands")
+		expect(globalState.update).toHaveBeenCalledExactlyOnceWith("allowedCommands", ["git"])
 	})
 
 	it("leaves global state untouched when there is no inspect result at all", async () => {
 		mockConfiguration({ inspect: undefined, effective: ["git"] })
 		const globalState = mockMemento()
 
-		await seedAllowedCommands(globalState as unknown as vscode.Memento)
+		await seedAllowedCommands(globalState)
 
 		expect(globalState.update).not.toHaveBeenCalled()
 	})
@@ -103,7 +128,7 @@ describe("seedAllowedCommands", () => {
 		mockConfiguration({ inspectThrows: true })
 		const globalState = mockMemento()
 
-		await expect(seedAllowedCommands(globalState as unknown as vscode.Memento)).resolves.toBeUndefined()
+		await expect(seedAllowedCommands(globalState)).resolves.toBeUndefined()
 
 		expect(globalState.update).not.toHaveBeenCalled()
 	})
@@ -113,7 +138,7 @@ describe("seedAllowedCommands", () => {
 		mockConfiguration({ inspect: { key: "allowedCommands", globalValue } })
 		const globalState = mockMemento()
 
-		await seedAllowedCommands(globalState as unknown as vscode.Memento)
+		await seedAllowedCommands(globalState)
 
 		expect(globalState.update).toHaveBeenCalledWith("allowedCommands", expect.arrayContaining(["git"]))
 		expect(globalState.update.mock.calls[0][1]).not.toBe(globalValue)

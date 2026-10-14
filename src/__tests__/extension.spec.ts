@@ -424,6 +424,8 @@ describe("extension.ts", () => {
 					workspaceValue,
 				}),
 				update: vi.fn(),
+				// The double scripts key-scoped get() and per-scope inspect()
+				// shapes the shared helper cannot express without obscuring them.
 			} as unknown as vscode.WorkspaceConfiguration)
 		}
 
@@ -436,6 +438,8 @@ describe("extension.ts", () => {
 			vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
 				get: vi.fn().mockReturnValue([]),
 				inspect: vi.fn(),
+				// Restores the neutral default after the scope fixtures above;
+				// update is intentionally absent because no test runs after this.
 			} as unknown as vscode.WorkspaceConfiguration)
 		})
 
