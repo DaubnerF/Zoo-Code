@@ -98,6 +98,74 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	it("should ask user for dangerous parameter expansion even when command is allowed", () => {
 		expect(getCommandDecision('echo "${var@P}"', allowedCommands)).toBe("ask_user")
 	})
+
+	it("does not auto-approve a substitution embedded in a parameter expansion", () => {
+		// The shell runs $(rm -rf ~/work) when x is unset, so the inner command must
+		// match the lists on its own; allowing `echo` must not approve the payload.
+		expect(getCommandDecision("echo ${x:-$(rm -rf ~/work)}", ["echo"])).toBe("ask_user")
+	})
+
+	it("does not auto-approve a nested substitution riding outer allowlist entries", () => {
+		// `$(foo $(rm -rf /) bar)` must decompose so the innermost `rm -rf /` is
+		// evaluated independently; cutting at the first ")" would let the payload ride
+		// the `foo` and `bar` allowlist entries.
+		expect(getCommandDecision("ls $(foo $(rm -rf /) bar)", ["ls", "foo", "bar"])).toBe("ask_user")
+	})
+
+	it("asks user when a heredoc opened inside a parameter expansion carries a substitution", () => {
+		// With x unset, bash expands the alternate word and runs the heredoc body's
+		// $(evil) even though the expansion itself stays one segment.
+		expect(getCommandDecision("cat ${x:-y <<EOF\n$(evil)\nEOF\n}", ["cat"])).toBe("ask_user")
+	})
+
+	it("fails closed on a NUL byte gluing a substitution to an allowed command", () => {
+		// bash drops the NUL and runs the glued substitution, so the placeholder
+		// degradation must not leave `git status$(whoami)` looking like one allowed
+		// word: the input is rejected as malformed instead.
+		expect(getCommandDecision("git status\x00$(whoami)", ["git"])).toBe("malformed_command")
+	})
+
+	it("asks user for a substitution on the heredoc opener line after the delimiter", () => {
+		// The opener line's remainder is expanded even when the delimiter is quoted,
+		// so $(whoami) there matches the lists on its own.
+		expect(getCommandDecision("cat <<EOF $(whoami)\nbody\nEOF", ["cat"])).toBe("ask_user")
+	})
+
+	it("asks user when a heredoc body with an unquoted delimiter contains a substitution", () => {
+		// The shell expands $(whoami) inside an unquoted-delimiter heredoc body, so the
+		// inner command must match the lists even though the heredoc is one host segment.
+		const heredoc = "cat <<EOF\n$(whoami)\nEOF"
+		expect(getCommandDecision(heredoc, ["cat"])).toBe("ask_user")
+	})
+
+	it("asks user for the inner commands of process substitutions", () => {
+		expect(getCommandDecision("diff <(sort a) <(sort b)", ["diff"])).toBe("ask_user")
+	})
+
+	it("auto-approves an unbalanced delimiter inside single quotes", () => {
+		// A shell never parses delimiter characters inside single quotes, so an
+		// unbalanced "$(" there is ordinary argument text, not a syntax error.
+		expect(getCommandDecision("echo 'a $(b'", ["echo"])).toBe("auto_approve")
+	})
+
+	it("fails closed on a stray closer even when the first word is allowed", () => {
+		// A stray ")" is a shell syntax error; treating the command as malformed
+		// costs a prompt instead of letting an allowlisted first word carry a
+		// structure the parser cannot account for straight to execution.
+		expect(getCommandDecision("echo )", ["echo"])).toBe("malformed_command")
+	})
+
+	it("fails closed on an unclosed arithmetic opener even when the first word is allowed", () => {
+		// bash refuses an unclosed "$(("; the masked remainder must not let the
+		// allowlisted "echo" carry a never-closed "$(" straight to execution.
+		expect(getCommandDecision("echo $(( $(evil)", ["echo"])).toBe("malformed_command")
+	})
+
+	it("fails closed on a CR-only heredoc opener even when the first word is allowed", () => {
+		// A lone CR does not terminate the opener line, so the heredoc is
+		// unterminated: the input must not look well-formed to the allowlists.
+		expect(getCommandDecision("cat <<EOF\r$(evil)\rEOF", ["cat"])).toBe("malformed_command")
+	})
 })
 
 describe("getCommandDecision — multi-line script wrapped in a quoted argument", () => {
@@ -195,6 +263,17 @@ describe("getCommandDecisionDetailed", () => {
 	it("returns plain approval details for auto-approved commands", () => {
 		expect(getCommandDecisionDetailed("git status", ["git"])).toEqual({ decision: "auto_approve" })
 		expect(getCommandDecisionDetailed("   ", ["git"])).toEqual({ decision: "auto_approve" })
+	})
+
+	it("reports malformed_command for an unclosed command substitution", () => {
+		// An opened "$(" the scanner cannot close means the input's structure is
+		// unaccounted for; the raw (unsplit) command is reported so no fragment of a
+		// partial decomposition can be approved in isolation.
+		const result = getCommandDecisionDetailed("echo $(whoami", ["echo"])
+
+		expect(result.decision).toBe("malformed_command")
+		expect(result.offendingCommand).toBe("echo $(whoami")
+		expect(result.parseError).toContain("command substitution")
 	})
 
 	it("returns the same decision as getCommandDecision across representative inputs", () => {

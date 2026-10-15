@@ -323,6 +323,23 @@ describe("parseCommand", () => {
 			expect(result).toHaveLength(2)
 			expect(result[result.length - 1]).toBe("echo world")
 		})
+
+		it("parses CRLF heredocs for every delimiter form and extracts unquoted-body substitutions", () => {
+			// A CR ends the delimiter word in every delimiter form, so the
+			// terminator line (which ends at the CR like every other line) stays
+			// matchable and a well-formed CRLF heredoc never over-fires.
+			const { commands, parseError } = parseCommand("cat <<EOF\r\n$(whoami)\r\nEOF\r\n")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\r\n$(whoami)\r\nEOF", "whoami"])
+			expect(findUnterminatedQuote("cat <<-EOF\r\n\techo C\r\n\tEOF\r\n")).toBeNull()
+			expect(findUnterminatedQuote("cat <<'EOF'\r\nbody\r\nEOF\r\n")).toBeNull()
+			expect(findUnterminatedQuote('cat <<"EOF"\r\nbody\r\nEOF\r\n')).toBeNull()
+			expect(findUnterminatedQuote("cat <<\\EOF\r\nbody\r\nEOF\r\n")).toBeNull()
+			// Even with the delimiter quote itself left open, the CR bounds the
+			// delimiter word so the terminator line can still match.
+			expect(findUnterminatedQuote("cat <<'EOF\r\nbody\r\nEOF\r\n")).toBeNull()
+			expect(findUnterminatedQuote('cat <<"EOF\r\nbody\r\nEOF\r\n')).toBeNull()
+		})
 	})
 
 	describe("herestring (<<<)", () => {
@@ -498,10 +515,333 @@ describe("parseCommand", () => {
 		})
 
 		it("returns null for a balanced <<- heredoc with an indented terminator", () => {
-			// stripTabs must be true for <<- so the indented terminator line is
-			// recognized; without the fix every terminator line was unconditionally
-			// stripped of tabs, making <<- and << behave identically.
+			// <<- alone enables tab stripping; stripping unconditionally would make
+			// << and <<- indistinguishable at the terminator.
 			expect(findUnterminatedQuote("sh <<-EOF\n\techo hello\n\tEOF")).toBeNull()
+		})
+	})
+
+	describe("command substitution extraction", () => {
+		// Every command substitution must be extracted with balanced-paren
+		// awareness wherever it sits, so each inner command matches the
+		// allow/deny lists on its own.
+
+		it("extracts the inner payload of a nested substitution as its own segment", () => {
+			// A non-balanced parser truncates the payload at the first ')' and hides
+			// the inner command from the lists.
+			expect(parseCommand("echo $(foo $(bar))").commands).toEqual(["echo", "foo", "bar"])
+		})
+
+		it("extracts a substitution embedded inside a parameter expansion", () => {
+			// ${x:-$(cmd)} falls back to running the substitution when x is
+			// unset, so the payload must be matched independently even though
+			// the expansion itself stays verbatim in its host segment.
+			const input = "echo ${x:-$(rm -rf ~/work)}"
+			expect(parseCommand(input).commands).toEqual([input, "rm -rf ~/work"])
+		})
+
+		it("extracts a substitution inside a parameter expansion inside a substitution", () => {
+			// Recursion: the outer $() payload is re-scanned, which finds the
+			// ${b:-$(c)} expansion and extracts c from inside it.
+			expect(parseCommand("$(a ${b:-$(c)} d)").commands).toEqual(["a ${b:-$(c)} d", "c"])
+		})
+
+		it("extracts both sides of a process substitution pair", () => {
+			expect(parseCommand("diff <(sort a) <(sort b)").commands).toEqual(["diff", "sort a", "sort b"])
+		})
+
+		it("extracts a nested process substitution", () => {
+			expect(parseCommand("cat <(a <(b))").commands).toEqual(["cat", "a", "b"])
+		})
+
+		it("closes a backtick region at the next backtick (backticks do not nest)", () => {
+			// The second ` closes the first region; the third ` opens a second
+			// region. Middle text between regions stays in its host word.
+			expect(parseCommand("echo `a`b`c`").commands).toEqual(["echo", "a", "b", "c"])
+		})
+
+		it("masks arithmetic without emitting segments from inside it", () => {
+			// $((...)) and $[...] are not command substitutions: the whole
+			// arithmetic stays inside the host word and never balances as an
+			// extraction delimiter.
+			expect(parseCommand("echo $((1+2))").commands).toEqual(["echo $((1+2))"])
+			expect(parseCommand("echo $[1+2]").commands).toEqual(["echo $[1+2]"])
+		})
+
+		it("extracts substitutions from an unquoted-delimiter heredoc body while the heredoc stays one segment", () => {
+			// The shell expands $(...) inside such bodies, so the payload must
+			// match the lists on its own; the heredoc itself remains opaque.
+			const input = "cat <<EOF\n$(whoami)\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input, "whoami"])
+		})
+
+		it("extracts a substitution inside a closed $((…)) as its own segment", () => {
+			// bash performs command substitutions inside $((…)) before evaluating
+			// the arithmetic, so the payload must match the lists on its own
+			// instead of riding the allowlisted host word.
+			const input = "echo $(( $(rm -rf /) ))"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input, "rm -rf /"])
+		})
+
+		it("does not extract from a quoted-delimiter heredoc body (the shell suppresses expansion there)", () => {
+			const input = "cat <<'EOF'\n$(whoami)\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input])
+		})
+
+		it("extracts a substitution from a heredoc body opened inside a parameter expansion", () => {
+			// With x unset, bash expands the alternate word: the heredoc runs inside
+			// the expansion and executes $(evil), so the body payload must surface as
+			// its own segment even though the expansion host stays verbatim.
+			const input = "cat ${x:-y <<EOF\n$(evil)\nEOF\n}"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input, "evil"])
+		})
+
+		it("keeps a quoted-delimiter heredoc body opaque inside a parameter expansion", () => {
+			// A quoted delimiter suppresses body expansion, so $(evil) is literal
+			// text the shell never runs; no payload segment may appear.
+			const input = "cat ${x:-y <<'EOF'\n$(evil)\nEOF\n}"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input])
+		})
+
+		it("extracts a substitution after the delimiter on a heredoc opener line", () => {
+			// The opener line's remainder is expanded regardless of delimiter quoting:
+			// bash runs the substitution sitting between the delimiter and the newline.
+			const input = "cat <<EOF $(whoami)\nbody\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input, "whoami"])
+		})
+
+		it("extracts opener-line substitutions for quoted and <<- delimiters too", () => {
+			// Quoting suppresses expansion in the body only, never on the opener
+			// line, so <<'EOF' and <<- carry the same remainder obligation as <<.
+			const quoted = "cat <<'EOF' $(whoami)\nbody\nEOF"
+			expect(parseCommand(quoted).commands).toEqual([quoted, "whoami"])
+			const dash = "cat <<-EOF\t$(whoami)\nbody\nEOF"
+			expect(parseCommand(dash).commands).toEqual([dash, "whoami"])
+		})
+	})
+
+	describe("fail-closed on unaccountable structure", () => {
+		// A command whose structure the scan cannot fully account for must cost
+		// a prompt (parseError -> malformed_command), never an approval built on
+		// a partial decomposition.
+
+		it("reports an unclosed command substitution", () => {
+			const input = "echo $(foo"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("command-substitution")
+		})
+
+		it("reports an unclosed parameter expansion", () => {
+			const input = "echo ${x"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("parameter-expansion")
+		})
+
+		it("reports an unclosed backtick region", () => {
+			const input = "echo `foo"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("backtick")
+		})
+
+		it("reports an unclosed process substitution", () => {
+			const input = "diff <(sort"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("process-substitution")
+		})
+
+		it("reports a stray closing paren at depth zero", () => {
+			const input = "echo )"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("stray-closer")
+		})
+
+		it("reports a stray closing brace at depth zero", () => {
+			const input = "echo }"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("stray-closer")
+		})
+
+		it("treats a non-matching closer inside an open region as literal and still fails at end of input", () => {
+			// '}' cannot close $( ...; shell-faithful: it is literal content.
+			// The substitution never closes, so the command fails at EOF.
+			const input = "echo $(a}"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("command-substitution")
+		})
+
+		it("reports the widened expansion kinds with the opening index", () => {
+			expect(findUnterminatedQuote("echo $(x")).toEqual(
+				expect.objectContaining({ quoteType: "command-substitution", openIndex: 5 }),
+			)
+			expect(findUnterminatedQuote("echo `x")).toEqual(
+				expect.objectContaining({ quoteType: "backtick", openIndex: 5 }),
+			)
+		})
+
+		it("fails closed on a raw NUL byte anywhere in the input", () => {
+			// NUL is the scan's placeholder sentinel: a raw NUL glued to a
+			// substitution would degrade the masked placeholder to inert text and
+			// hide the payload, so the whole command is rejected before tokenizing.
+			const glued = "git status\x00$(whoami)"
+			const { commands, parseError } = parseCommand(glued)
+			expect(commands).toEqual([glued])
+			expect(parseError?.quoteType).toBe("nul-byte")
+
+			const backtickGlue = parseCommand("echo ok\x00`whoami`")
+			expect(backtickGlue.parseError?.quoteType).toBe("nul-byte")
+
+			const loneNul = parseCommand("\x00")
+			expect(loneNul.parseError?.quoteType).toBe("nul-byte")
+		})
+
+		it("caps substitution re-scan depth at the documented boundary, failing closed past it", () => {
+			// Unbounded payload re-scanning burns quadratic time on generated
+			// nesting and finally overflows the call stack; the cap converts deep
+			// nesting to a parse error at exactly MAX_PAYLOAD_SCAN_DEPTH + 1 layers
+			// while leaving anything a hand-written command could contain parseable.
+			const nest = (layers: number) => "echo " + "$(a ".repeat(layers) + "x" + ")".repeat(layers)
+			expect(parseCommand(nest(64)).parseError).toBeNull()
+			expect(parseCommand(nest(65)).parseError?.quoteType).toBe("nesting-too-deep")
+			expect(parseCommand(nest(8000)).parseError?.quoteType).toBe("nesting-too-deep")
+		})
+
+		it("fails on an unclosed substitution inside an unquoted-delimiter heredoc body", () => {
+			// The terminator line is found, but the shell would never finish
+			// expanding the body, so whatever follows the $( is unaccountable.
+			const input = "cat <<EOF\n$(x\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("command-substitution")
+		})
+
+		// bash itself refuses an unclosed `$((`/`$[` or a CR-only heredoc line
+		// ending; each must fail closed rather than mask away text that could
+		// hide a never-closed substitution behind an allowlisted first word.
+		it("fails closed on an unclosed $(( hiding an embedded substitution", () => {
+			const input = "echo $(( $(evil)"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("arithmetic")
+		})
+
+		it("fails closed on an unclosed $(( that would swallow a later statement", () => {
+			// Routing the masked remainder to the host instead would split the
+			// input into two segments that can each match the allowlist; bash
+			// rejects the input outright, so failing closed only costs a prompt.
+			const swallowed = "echo $((1 )\nevilcmd arg"
+			const { commands, parseError } = parseCommand(swallowed)
+			expect(commands).toEqual([swallowed])
+			expect(parseError?.quoteType).toBe("arithmetic")
+			// The matched control keeps its extraction behavior unchanged.
+			const control = "echo $(( $(evil) ))"
+			expect(parseCommand(control).commands).toEqual([control, "evil"])
+		})
+
+		it("reports an unclosed $(( nested in a parameter expansion by its own kind", () => {
+			// The error must name the arithmetic opener: letting the outer
+			// region fail at end of input would report the wrong construct and
+			// silently drop the arithmetic's interior payloads.
+			const input = "echo ${x:-$(( $(evil) }"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("arithmetic")
+		})
+
+		it("fails closed on an unclosed $(( inside a heredoc body", () => {
+			const input = "cat <<EOF\n$((1 )\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("arithmetic")
+		})
+
+		it("fails closed on an unclosed $[ at top level and inside a heredoc body", () => {
+			// `$[` is the deprecated sibling of `$((`: bash errors on a missing
+			// `]`, so an unclosed opener must fail closed exactly like `$((`.
+			const top = "echo $[ $(evil)"
+			expect(parseCommand(top).commands).toEqual([top])
+			expect(parseCommand(top).parseError?.quoteType).toBe("arithmetic")
+			expect(parseCommand("cat <<EOF\n$[ $(evil)\nEOF").parseError?.quoteType).toBe("arithmetic")
+		})
+
+		it("rejects a CR-only heredoc opener line as unterminated", () => {
+			// A lone CR is not a bash line terminator, so the opener line never
+			// ends: the shell reports an unterminated heredoc.
+			const input = "cat <<EOF\r$(evil)\rEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("rejects a CR-only heredoc opener even when the body ends with LF", () => {
+			const input = "cat <<EOF\r$(evil)\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("rejects a CR-only-bounded heredoc terminator line", () => {
+			// With an LF opener but CR-only line endings in the body, "EOF\r" is
+			// body text to bash; accepting it as the terminator would validate a
+			// heredoc the shell reports unterminated.
+			const input = "cat <<EOF\nbody\rEOF\r"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("still parses a CRLF heredoc with an unquoted-body substitution", () => {
+			// Requiring LF terminators keeps every CRLF case working: the CR is
+			// consumed as part of the pair, so the delimiter word and terminator
+			// line still match and the body payload is still extracted.
+			const { commands, parseError } = parseCommand("cat <<EOF\r\n$(evil)\r\nEOF\r\n")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\r\n$(evil)\r\nEOF", "evil"])
+		})
+	})
+
+	describe("stays parseable inside opaque regions", () => {
+		// Unbalanced delimiter characters a shell never looks at inside quoted
+		// regions stay parseable rather than failing closed.
+
+		it("does not fail on an unbalanced substitution inside single quotes", () => {
+			const input = "echo '$(x'"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input])
+		})
+
+		it("does not fail on unbalanced delimiters inside double quotes", () => {
+			const input = 'echo "$(}"'
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input])
+		})
+
+		it("ignores a stray closer inside a comment and a substitution text inside a quoted-delimiter heredoc body", () => {
+			const input = "echo hi # )\ncat <<'EOF'\n$(x\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands[0]).toBe("echo hi")
+			expect(commands[commands.length - 1]).toContain("$(x")
 		})
 	})
 })
