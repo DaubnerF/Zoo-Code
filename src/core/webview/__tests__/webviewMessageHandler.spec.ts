@@ -1659,6 +1659,32 @@ describe("webviewMessageHandler - command list scope-aware persistence", () => {
 		)
 	})
 
+	it("propagates a configuration lookup failure instead of degrading it to a per-key abort", async () => {
+		// The commandListConfiguration() lookup sits outside the guarded
+		// snapshot read on purpose: a lookup that cannot return a configuration
+		// object at all is a different failure class than an unreadable value,
+		// so it aborts the entire message rather than the one key.
+		vi.mocked(vscode.workspace.getConfiguration).mockImplementation(() => {
+			throw new Error("workspace not ready")
+		})
+
+		await expect(
+			webviewMessageHandler(mockClineProvider, {
+				type: "updateSettings",
+				// A second key pins that the whole message aborts, not just the
+				// command-list key: with the guarded per-key failure paths this
+				// key would still persist.
+				updatedSettings: { deniedCommands: ["docker", "aws"], alwaysDenyUnapprovedCommands: true },
+			}),
+		).rejects.toThrow("workspace not ready")
+
+		// Nothing persisted for any key, no per-key error handling ran, and the
+		// state post was skipped — the rejection surfaced to the caller instead.
+		expect(mockClineProvider.contextProxy.setValue).not.toHaveBeenCalled()
+		expect(vscode.window.showErrorMessage).not.toHaveBeenCalled()
+		expect(mockClineProvider.postStateToWebview).not.toHaveBeenCalled()
+	})
+
 	it("reports partial failure when the compensating restore also fails", async () => {
 		// update() call order: workspace write succeeds, global write rejects,
 		// restore write rejects too. The raw workspace value differs from the

@@ -2,6 +2,7 @@
 
 import * as vscode from "vscode"
 
+import { readCommandListScopes } from "../../core/auto-approval/commandScope"
 import { Package } from "../../shared/package"
 import { makeUri, makeWorkspaceConfiguration } from "../../test-utils/vscode"
 import { seedAllowedCommands } from "../seedAllowedCommands"
@@ -213,6 +214,56 @@ describe("seedAllowedCommands", () => {
 
 		expect(globalState.update).not.toHaveBeenCalled()
 		expect(globalState.get("allowedCommands")).toEqual(["npm"])
+	})
+
+	it("leaves an explicitly empty global-state list untouched", async () => {
+		// The guard treats presence, not emptiness: saving [] is a deliberate
+		// choice to auto-approve nothing, and re-seeding the package default
+		// would silently re-grant the approvals the user just revoked.
+		mockConfiguration({ inspect: { key: "allowedCommands", defaultValue: ["git log", "git diff", "git show"] } })
+		const globalState = mockMemento([])
+
+		await seedAllowedCommands(globalState)
+
+		expect(globalState.update).not.toHaveBeenCalled()
+		expect(globalState.get("allowedCommands")).toEqual([])
+	})
+
+	it("composes a later workspace override as a union with the seeded defaults", async () => {
+		// Full schedule: a fresh activation seeds the declared default, then a
+		// workspace override appears in a later activation. The seed
+		// early-returns because global state already holds a list, so the
+		// override is never persisted — and the enforcement read composes the
+		// two layers as a set union. Neither list replaces the other; the
+		// longest-prefix matcher decides which entry governs a given command.
+		const defaultValue = ["git log", "git diff", "git show"]
+		mockConfiguration({
+			inspect: { key: "allowedCommands", defaultValue },
+			effective: defaultValue,
+		})
+		const globalState = mockMemento()
+
+		await seedAllowedCommands(globalState)
+		expect(globalState.update).toHaveBeenCalledExactlyOnceWith("allowedCommands", defaultValue)
+
+		// A later activation in a workspace whose settings file sets the list:
+		// the guard early-returns before any inspection, so no second write.
+		mockConfiguration({
+			inspect: { key: "allowedCommands", defaultValue, workspaceValue: ["docker ps"] },
+			effective: ["docker ps"],
+		})
+
+		await seedAllowedCommands(globalState)
+		expect(globalState.update).toHaveBeenCalledTimes(1)
+		expect(globalState.get("allowedCommands")).toEqual(defaultValue)
+
+		// The enforcement view (ClineProvider.getState) keeps both layers and
+		// merges them: the override adds entries, it does not replace the
+		// seeded defaults, and vice versa.
+		const scopes = readCommandListScopes("allowedCommands", globalState.get("allowedCommands"))
+		expect(scopes.global).toEqual(defaultValue)
+		expect(scopes.workspace).toEqual(["docker ps"])
+		expect(scopes.merged).toEqual([...defaultValue, "docker ps"])
 	})
 
 	it("inspects the global value under the extension's own section key", async () => {
