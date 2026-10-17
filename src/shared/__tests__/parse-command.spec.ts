@@ -1605,14 +1605,56 @@ describe("parseCommand", () => {
 			expect(commands).toEqual(["cat <<'EOF'\nEO\\\nF\nrm -rf /\nEOF"])
 		})
 
-		it("strips <<- leading tabs per physical line before joining continuations", () => {
-			// Tab stripping applies to each physical line, then the join builds
-			// the terminator candidate, so the tab-indented `EO\` + `F` pair
-			// still matches `EOF`.
+		it("strips the joined <<- terminator line's leading tabs after joining continuations", () => {
+			// The join assembles the candidate from raw physical lines first;
+			// tab stripping then applies once to that joined line, so the
+			// tab-indented `EO\` + `F` pair still matches `EOF`.
 			const input = "cat <<-EOF\n\tEO\\\nF\nrm -rf /\n"
 			const { commands, parseError } = parseCommand(input)
 			expect(parseError).toBeNull()
 			expect(commands).toEqual(["cat <<-EOF\n\tEO\\\nF", "rm -rf /"])
+		})
+
+		it("strips every leading tab of the <<- terminator line", () => {
+			// Indentation depth is irrelevant: all leading tabs are stripped,
+			// so a multiply tabbed terminator still matches the delimiter.
+			const input = "cat <<-EOF\nbody\n\t\tEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input])
+		})
+
+		it("keeps a continuation line's tab inside the <<- terminator candidate", () => {
+			// Stripping after joining leaves `EO\tF` for the tab-on-both-lines
+			// pair, so the heredoc runs to the real `EOF` line instead of
+			// closing early; the commands after it stay visible for approval
+			// checks, exactly as bash executes them.
+			const input = "cat <<-EOF\n\tEO\\\n\tF\ncat <<X\nEOF\nrm -rf /\nX\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<-EOF\n\tEO\\\n\tF\ncat <<X\nEOF", "rm -rf /", "X"])
+		})
+
+		it("strips a tab that joins into the front of the <<- terminator", () => {
+			// A continuation-only backslash leaves the candidate starting at
+			// the next physical line, so the tab that opens it is the joined
+			// line's leading tab and stripping removes it: the terminator
+			// matches and the following command is live.
+			const input = "cat <<-EOF\n\t\\\n\tEOF\ntouch x\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<-EOF\n\t\\\n\tEOF", "touch x"])
+		})
+
+		it("leaves a <<- heredoc unterminated when the joined candidate differs from the delimiter", () => {
+			// `EO\` + `\tF` joins to `EO\tF`, which stays unequal to `EOF`
+			// after stripping the joined line's leading tab: bash finds no
+			// terminator and reads the body to end of input, so the scan
+			// fails closed rather than validating the construct.
+			const input = "cat <<-EOF\nEO\\\n\tF\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
 		it("does not join a line ending in an even number of backslashes", () => {
@@ -1625,13 +1667,68 @@ describe("parseCommand", () => {
 		})
 
 		it("joins a continuation backslash across a CRLF line ending", () => {
-			// The CR of a CRLF pair belongs to the line ending, so a lone
-			// backslash before it ends the physical line just like before a
-			// bare LF, and the terminator candidate joins across it.
+			// The msys/Cygwin read layer (the reference shell on the Windows
+			// target) strips the CR from every line it reads, so the logical
+			// line ends with the lone backslash and continues into the `F`
+			// line, joining the candidate into the `EOF` terminator; what
+			// follows is live syntax, exactly as bash executes it.
 			const input = "cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n"
 			const { commands, parseError } = parseCommand(input)
 			expect(parseError).toBeNull()
 			expect(commands).toEqual(["cat <<EOF\r\nEO\\\r\nF", "touch x", "EOF"])
+		})
+
+		it("does not join a backslash before a lone CR", () => {
+			// The read-layer CR strip leaves `EO\F`: the backslash escapes the
+			// `F` instead of ending the line, so no continuation happens, the
+			// candidate stays unequal to the delimiter, and the heredoc
+			// continues to the next real terminator (bash-confirmed: the whole body
+			// stays masked; only commands after the real terminator run).
+			const input = "cat <<EOF\nEO\\\rF\ntouch x\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\nEO\\\rF\ntouch x\nEOF"])
+		})
+
+		it("terminates an unquoted heredoc at a bare-CR-concatenated terminator", () => {
+			// The msys/Cygwin read layer strips the bare CR, so the body line
+			// arrives as the terminator `EOF` and closes the heredoc early,
+			// leaving `curl evil` live. POSIX bash would keep the CR and not
+			// close here; closing early only exposes the following commands
+			// for review, never masks what either shell executes.
+			const input = "cat <<EOF\nEO\rF\ncurl evil\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\nEO\rF", "curl evil", "EOF"])
+		})
+
+		it("terminates a <<- heredoc at a bare-CR-concatenated tabbed terminator", () => {
+			// Tab stripping applies to the CR-stripped logical line, so the
+			// tab-indented `EO<CR>F` pair still matches `EOF`.
+			const input = "cat <<-EOF\n\tEO\rF\ncurl evil\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<-EOF\n\tEO\rF", "curl evil", "EOF"])
+		})
+
+		it("terminates a quoted-delimiter heredoc at a bare-CR-concatenated terminator", () => {
+			// The CR strip happens in the shell's read layer before quoting is
+			// considered, so a quoted delimiter does not protect the body: the
+			// heredoc still closes early at the `EO<CR>F` line.
+			const input = "cat <<'EOF'\nEO\rF\ncurl evil\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<'EOF'\nEO\rF", "curl evil", "EOF"])
+		})
+
+		it("keeps a bare-CR line whose stripped content only contains the delimiter", () => {
+			// Stripping yields `EOFx`, which is not the terminator: bash (CR
+			// stripped at read-line) keeps the body open, so the substitution
+			// after it stays masked until the real terminator line.
+			const input = "cat <<EOF\nEOF\rx\ncurl evil\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input.trimEnd()])
 		})
 
 		it("treats a backslash at end of input as part of the delimiter word", () => {

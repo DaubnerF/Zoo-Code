@@ -296,8 +296,15 @@ function isIdentChar(char: string): boolean {
  * - Heredocs: the opener line through the terminator line mask as one opaque
  *   host word, so the heredoc stays a single segment no matter how many lines
  *   it spans. Lines end only at LF (a CR counts solely as the CR of a CRLF
- *   pair): a CR-only opener or terminator line does not validate a heredoc,
- *   because bash would report such a construct unterminated. An
+ *   pair on the opener line): a CR-only-separated opener does not validate a
+ *   heredoc, because bash would report such a construct unterminated. Body
+ *   lines are matched against the delimiter with every CR removed: POSIX bash
+ *   keeps a lone CR as ordinary content, but the msys/Cygwin read layer (the
+ *   reference shell on the Windows target) strips CR from every line before
+ *   parsing, so a CR-adjacent terminator closes the heredoc early there. The
+ *   parser can therefore close at or before either shell, never after: a CR
+ *   divergence exposes extra following commands for review instead of masking
+ *   executed ones. An
  *   unquoted-delimiter body is expansion-active: substitutions
  *   opened inside it are extracted and must balance before the terminator. A
  *   quoted or backslash-escaped delimiter suppresses expansion entirely in the
@@ -490,41 +497,58 @@ function scanShellSyntax(text: string): ScanOutcome {
 		if (wordPresent) {
 			let found = false
 			const bodyStart = i
-			// A terminator candidate spans physical lines until it stops
-			// continuing: bash joins a backslash-newline pair before matching
-			// the delimiter, so an unquoted body line whose content ends in an
-			// odd number of backslashes flows into the next physical line
-			// (trailing CR dropped only as the CR of a CRLF pair). <<- strips
-			// leading tabs per physical line, before that join. A quoted
-			// delimiter makes the backslash literal, so no joining happens.
+			// The terminator search emulates the shell's read layer: a line
+			// runs to LF (or end of input) with every CR byte dropped. POSIX
+			// bash keeps a lone CR as ordinary content, but the msys/Cygwin
+			// read layer (the reference shell on the Windows target) strips
+			// CR from every line before parsing, so `EO<CR>F` arrives as the
+			// terminator `EOF` and closes the heredoc early. Comparing the
+			// stripped form therefore closes at or before either variant: a
+			// divergence can only expose following commands for review,
+			// never mask what either shell would execute. Bash joins a
+			// backslash-newline pair before matching the delimiter, so an
+			// unquoted logical line whose stripped content ends in an odd
+			// number of backslashes flows into the next physical line. A
+			// quoted delimiter makes the backslash literal, so no joining
+			// happens (the CR strip is read-layer and unaffected by quoting).
+			// <<- strips leading tabs from the fully joined line afterwards,
+			// never from a physical line on its own.
 			search: while (i < text.length) {
 				const groupStart = i
 				let candidate = ""
 				for (;;) {
 					const lineStart = i
-					while (i < text.length && text[i] !== "\n" && text[i] !== "\r") {
+					while (i < text.length && text[i] !== "\n") {
 						i++
 					}
-					const rawLine = text.slice(lineStart, i)
-					// Leading tabs are stripped only for <<- heredocs.
-					const line = stripTabs ? rawLine.replace(/^\t*/, "") : rawLine
-					// The terminator line must be bounded by LF or EOF (a CR counts
-					// only as the CR of a CRLF pair): a CR-only-bounded "EOF\r" is
-					// body text to bash, so treating it as the terminator would
-					// validate a heredoc the shell reports as unterminated.
-					const boundedByEol =
-						i >= text.length || text[i] === "\n" || (text[i] === "\r" && text[i + 1] === "\n")
-					const endsAtLineBreak = text[i] === "\n" || (text[i] === "\r" && text[i + 1] === "\n")
-					const trailingBackslashes = line.match(/\\*$/)?.[0].length ?? 0
-					if (!quoted && endsAtLineBreak && trailingBackslashes % 2 === 1) {
-						candidate += line.slice(0, -1) // drop the continuation backslash
-						i += text[i] === "\r" ? 2 : 1
+					const logicalLine = text.slice(lineStart, i).replace(/\r/g, "")
+					const trailingBackslashes = logicalLine.match(/\\*$/)?.[0].length ?? 0
+					if (!quoted && text[i] === "\n" && trailingBackslashes % 2 === 1) {
+						candidate += logicalLine.slice(0, -1) // drop the continuation backslash
+						i++ // consume the newline of the continued line
 						continue
 					}
-					candidate += line
-					if (candidate === delimiter && boundedByEol) {
+					candidate += logicalLine
+					// <<- strips leading tabs from the fully joined logical line,
+					// after continuation joining and only once -- a tab that opens
+					// a continuation line stays inside the candidate, so an
+					// early-terminator match cannot hide live commands.
+					const candidateText = stripTabs ? candidate.replace(/^\t+/, "") : candidate
+					if (candidateText === delimiter) {
 						found = true
 						bodyEnd = groupStart
+						// The match is on the CR-stripped logical line, so the
+						// raw line-ending byte the scan would have stopped at is
+						// back before the strip point: over the CR of a CRLF-
+						// terminated terminator line, and over a lone CR that is
+						// the whole raw terminator text (its stripped-empty line
+						// matches an empty delimiter right after a line break).
+						if (i > 0 && text[i] === "\n" && text[i - 1] === "\r") {
+							i--
+						}
+						if (i > 0 && text[i] === "\r" && i - 1 >= bodyStart && text[i - 1] === "\n") {
+							i--
+						}
 						break search
 					}
 					break
