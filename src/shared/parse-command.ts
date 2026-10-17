@@ -169,6 +169,13 @@ interface RegionFrame {
 	/** Whether a backslash inside the region escapes the next character. */
 	escaped: boolean
 	/**
+	 * For command/process-substitution frames: the number of bare `(` grouping
+	 * parentheses opened inside the region and not yet closed. A subshell group
+	 * balances independently of the frame's own closer, so a `)` while this is
+	 * positive matches the group and must not pop the frame.
+	 */
+	groupDepth: number
+	/**
 	 * For parameter-expansion frames: every command substitution closed inside
 	 * the expansion, at any nesting depth. A parameter expansion masks its text
 	 * from the tokenizer but must not stop substitution extraction, because the
@@ -289,8 +296,11 @@ function isIdentChar(char: string): boolean {
  *   opened inside it are extracted and must balance before the terminator. A
  *   quoted or backslash-escaped delimiter suppresses expansion entirely in the
  *   body (the shell does not expand those), so its body stays opaque and is
- *   never balance-checked. Bodies are not quote-parsed and carry no comments:
- *   a `"` or `#` inside a body is literal text. The opener line's remainder
+ *   never balance-checked. Bodies carry no comments and are not tokenized
+ *   outside an expansion region: a `"` or `#` there is literal text, while
+ *   quotes and word-initial `#` comments inside an expansion region follow the
+ *   shell's rules there (a comment ends at the newline, not at the region end).
+ *   The opener line's remainder
  *   (text after the delimiter word) is walked for substitutions even when the
  *   delimiter is quoted: quoting suppresses expansion in the body only, so
  *   `cat <<'EOF' $(cmd)` still runs `cmd`.
@@ -319,6 +329,17 @@ function scanShellSyntax(text: string): ScanOutcome {
 	// `(` is never an error. Depth is tracked only so a `)` that matches an
 	// open bare `(` is not reported as a stray closer.
 	let parenDepth = 0
+	// Index just past the most recent expansion or quote region the scan closed
+	// at host level (including `$((…))`/`$[…]`), or -1. The shell ends the
+	// expansion at such a closer but not the surrounding word, so a `#` sitting
+	// exactly there is word content, never a comment start.
+	let expansionCloseEnd = -1
+	// Index just past the most recent `\c` escape pair the scan emitted at host
+	// level, or -1. To the shell the escaped character is an ordinary word
+	// character, so the word continues past the pair: a `#` sitting exactly at
+	// this index is word content even when the escaped character is whitespace
+	// or a metacharacter in the raw text.
+	let escapedWordCharEnd = -1
 
 	const mark = (name: string): string => `${NUL}${name}${NUL}`
 
@@ -349,10 +370,26 @@ function scanShellSyntax(text: string): ScanOutcome {
 	/** Open the quoted region starting at `i`, or return null if none. */
 	const openQuote = (i: number): RegionFrame | null => {
 		if (text[i] === "$" && text[i + 1] === "'") {
-			return { kind: "ansi-c", openIndex: i, closer: "'", contentStart: i + 2, escaped: true, payloads: null }
+			return {
+				kind: "ansi-c",
+				openIndex: i,
+				closer: "'",
+				contentStart: i + 2,
+				escaped: true,
+				groupDepth: 0,
+				payloads: null,
+			}
 		}
 		if (text[i] === "$" && text[i + 1] === '"') {
-			return { kind: "locale", openIndex: i, closer: '"', contentStart: i + 2, escaped: true, payloads: null }
+			return {
+				kind: "locale",
+				openIndex: i,
+				closer: '"',
+				contentStart: i + 2,
+				escaped: true,
+				groupDepth: 0,
+				payloads: null,
+			}
 		}
 		if (text[i] === "'") {
 			return {
@@ -361,11 +398,20 @@ function scanShellSyntax(text: string): ScanOutcome {
 				closer: "'",
 				contentStart: i + 1,
 				escaped: false,
+				groupDepth: 0,
 				payloads: null,
 			}
 		}
 		if (text[i] === '"') {
-			return { kind: "double", openIndex: i, closer: '"', contentStart: i + 1, escaped: true, payloads: null }
+			return {
+				kind: "double",
+				openIndex: i,
+				closer: '"',
+				contentStart: i + 1,
+				escaped: true,
+				groupDepth: 0,
+				payloads: null,
+			}
 		}
 		return null
 	}
@@ -404,7 +450,14 @@ function scanShellSyntax(text: string): ScanOutcome {
 		while (i < text.length && (text[i] === " " || text[i] === "\t")) {
 			i++
 		}
-		const { delimiter, endIndex, quoted } = parseHeredocDelimiter(text, i)
+		const { delimiter, endIndex, quoted, wordPresent, malformed } = parseHeredocDelimiter(text, i)
+		if (malformed) {
+			// The delimiter word still has an open quote region at end of input.
+			// bash reads it as a multi-line word that can never match a body line,
+			// while the opener line's tail keeps executing as ordinary syntax --
+			// the body and everything after it are unaccountable, so fail closed.
+			return { error: errorAt("heredoc", start) }
+		}
 		const payloads: string[] = []
 		// The opener line's remainder after the delimiter is expanded by the shell
 		// even when the delimiter is quoted (quoting suppresses expansion in the
@@ -428,7 +481,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 		}
 		i++
 		let bodyEnd = text.length
-		if (delimiter.length > 0) {
+		if (wordPresent) {
 			let found = false
 			const bodyStart = i
 			while (i < text.length) {
@@ -481,9 +534,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 			}
 			return { end: i }
 		}
-		// No delimiter word: nothing can terminate the body, so mask the opener
-		// through end of input as one opaque word (an empty delimiter would
-		// terminate on an empty line, which is not reliably detectable here).
+		// No delimiter token at all (a bare `<<`, or `<<` followed only by
+		// blanks, before end of line): bash rejects such input with a syntax
+		// error and never executes it, so masking the opener through end of
+		// input as one opaque word over-approximates a never-runnable
+		// construct and cannot hide a live command.
 		outcome.heredocs.push(text.slice(start, text.length))
 		outcome.heredocPayloads[outcome.heredocs.length - 1] = payloads
 		if (frames.length === 0) {
@@ -496,12 +551,17 @@ function scanShellSyntax(text: string): ScanOutcome {
 	 * Walk a heredoc body region `[start, end)` collecting command
 	 * substitutions the shell would expand there.
 	 *
-	 * Heredoc bodies are not quote-parsed: a `"` in the body is literal text,
-	 * so this walk tracks only the expansion delimiters and backslash escapes.
-	 * A closer with no opener inside the body is literal data (the shell prints
-	 * it); a delimiter still open when the terminator line is reached is a
-	 * structural error — the shell would never finish expanding the body, so
-	 * whatever follows it is unaccountable.
+	 * Outside an expansion region this walk tracks only the expansion
+	 * delimiters and backslash escapes: a heredoc body is not tokenized, so a
+	 * `"` or `#` in the body is literal text. Inside an expansion region the
+	 * shell does tokenize, so a quote there opens a region exactly as the main
+	 * scan treats it — the region masks the frame's closer and group tests, and
+	 * a region still open at the end of the body fails closed like any other
+	 * unclosed delimiter — while a word-initial `#` begins a comment that the
+	 * shell skips to end of line. A closer with no opener inside the body is
+	 * literal data (the shell prints it); a delimiter still open when the
+	 * terminator line is reached is a structural error — the shell would never
+	 * finish expanding the body, so whatever follows it is unaccountable.
 	 *
 	 * `depth` bounds the recursion through nested `$((…))` interiors; beyond
 	 * `MAX_PAYLOAD_SCAN_DEPTH` the region fails closed instead of recursing into
@@ -527,8 +587,42 @@ function scanShellSyntax(text: string): ScanOutcome {
 					i += 2
 					continue
 				}
+				// A `#` at the start of a word inside a `$(…)`/`<(` frame begins a
+				// comment the shell skips to end of line (body regions span lines,
+				// so the comment ends at the newline, not at the frame's end): a
+				// `)` riding inside the comment never closes the frame, and the
+				// continuation lines stay inside the same substitution. Quote and
+				// backtick frames keep `#` literal — their regions reach this test
+				// too — and so do parameter expansions (`${#var}` is the length
+				// operator), so only substitution frames take the comment. The
+				// word-boundary set is the top-level comment rule's whitespace
+				// plus the metacharacters that end a word: a missed comment lets
+				// its `)` slice the payload, so the boundary must be exact.
+				if (
+					char === "#" &&
+					(top.kind === "command-substitution" || top.kind === "process-substitution") &&
+					/[\s;&()|<>]/.test(text[i - 1])
+				) {
+					// Clamp at the region end: a comment running past it leaves the
+					// frame open, and the still-open frame fails closed.
+					i = Math.min(endOfLine(i), end)
+					continue
+				}
 				if (char === top.closer) {
+					if (top.groupDepth > 0) {
+						// This closer matches an inner grouping paren opened inside
+						// the region, not the region's own opener.
+						top.groupDepth--
+						i++
+						continue
+					}
 					const closed = frames.pop() as RegionFrame
+					if (QUOTE_FRAME_KINDS.includes(closed.kind)) {
+						// Quote regions are opaque: nothing inside them is extracted,
+						// and the enclosing frame resumes after the closing quote.
+						i++
+						continue
+					}
 					if (closed.kind === "parameter-expansion") {
 						localParamOpen--
 						if (frames.length === 0) {
@@ -554,10 +648,30 @@ function scanShellSyntax(text: string): ScanOutcome {
 					i++
 					continue
 				}
-				// Inside a backtick region only its closer matters: backticks do not
-				// nest.
-				if (top.kind === "backtick") {
+				// A quote frame is opaque except for its own closer and escapes; a
+				// backtick region is opaque except for its closer (backticks do not
+				// nest). Only expansion frames descend for nested constructs.
+				if (QUOTE_FRAME_KINDS.includes(top.kind) || top.kind === "backtick") {
 					i++
+					continue
+				}
+				// A bare `(` inside a substitution region opens a subshell group the
+				// shell balances independently of the region's closer; only its
+				// depth matters here, so the group's `)` cannot slice the payload.
+				if ((top.kind === "command-substitution" || top.kind === "process-substitution") && char === "(") {
+					top.groupDepth++
+					i++
+					continue
+				}
+				// Inside an expansion frame a quote is shell syntax, not body text:
+				// the region it opens masks everything up to its closer, so a `)`
+				// or `(` inside quotes is neither a closer nor a group-opener. An
+				// unclosed region fails at the end of the walk like any other
+				// unclosed frame.
+				const nestedQuote = openQuote(i)
+				if (nestedQuote) {
+					frames.push(nestedQuote)
+					i = nestedQuote.contentStart
 					continue
 				}
 			}
@@ -572,6 +686,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					closer: "`",
 					contentStart: i + 1,
 					escaped: true,
+					groupDepth: 0,
 					payloads: null,
 				})
 				i++
@@ -602,6 +717,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 						closer: ")",
 						contentStart: i + 2,
 						escaped: true,
+						groupDepth: 0,
 						payloads: null,
 					})
 					i += 2
@@ -614,6 +730,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 						closer: "}",
 						contentStart: i + 2,
 						escaped: true,
+						groupDepth: 0,
 						payloads: [],
 					})
 					localParamOpen++
@@ -638,6 +755,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					closer: ")",
 					contentStart: i + 2,
 					escaped: true,
+					groupDepth: 0,
 					payloads: null,
 				})
 				i += 2
@@ -732,6 +850,14 @@ function scanShellSyntax(text: string): ScanOutcome {
 				continue
 			}
 			if (char === top.closer) {
+				if (top.groupDepth > 0) {
+					// This closer matches an inner grouping paren opened inside the
+					// region, not the region's own opener: the subshell group
+					// balances before the substitution frame does.
+					top.groupDepth--
+					i++
+					continue
+				}
 				const closeEnd = i + 1
 				const closed = stack.pop() as RegionFrame
 				if (closed.kind === "parameter-expansion") {
@@ -758,6 +884,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 						const id = outcome.substitutions.push(text.slice(closed.contentStart, i).trim()) - 1
 						outcome.host += mark(`S${id}`)
 					}
+					expansionCloseEnd = closeEnd
 				} else {
 					// Nested inside an expansion region: a substitution inside a
 					// parameter expansion belongs to that expansion's payload list;
@@ -778,6 +905,15 @@ function scanShellSyntax(text: string): ScanOutcome {
 			// backtick region is opaque except for its closer (backticks do not
 			// nest). Only expansion frames descend for nested constructs.
 			if (QUOTE_FRAME_KINDS.includes(top.kind) || top.kind === "backtick") {
+				i++
+				continue
+			}
+			// A bare `(` inside a substitution region opens a subshell group the
+			// shell balances independently of the region's closer; tracking its
+			// depth keeps the group's `)` from popping the substitution frame.
+			// `(`/`)` inside a parameter expansion stay literal word characters.
+			if ((top.kind === "command-substitution" || top.kind === "process-substitution") && char === "(") {
+				top.groupDepth++
 				i++
 				continue
 			}
@@ -819,6 +955,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 						closer: ")",
 						contentStart: i + 2,
 						escaped: true,
+						groupDepth: 0,
 						payloads: null,
 					})
 					i += 2
@@ -831,6 +968,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 						closer: "}",
 						contentStart: i + 2,
 						escaped: true,
+						groupDepth: 0,
 						payloads: [],
 					})
 					paramFramesOpen++
@@ -847,6 +985,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					closer: "`",
 					contentStart: i + 1,
 					escaped: true,
+					groupDepth: 0,
 					payloads: null,
 				})
 				i++
@@ -859,6 +998,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					closer: ")",
 					contentStart: i + 2,
 					escaped: true,
+					groupDepth: 0,
 					payloads: null,
 				})
 				i += 2
@@ -881,16 +1021,51 @@ function scanShellSyntax(text: string): ScanOutcome {
 		if (char === "\\") {
 			// A backslash escapes the next character; a quote after it is literal.
 			outcome.host += text.slice(i, i + 2)
+			escapedWordCharEnd = i + 2
 			i += 2
 			continue
 		}
-		if (char === "#" && (i === 0 || /\s/.test(text[i - 1]))) {
+		if (char === "#" && i === expansionCloseEnd) {
+			// A `#` riding directly against the closer of an expansion or quote
+			// region continues the surrounding word: the shell ends the expansion
+			// at its closer but not the word, and starts a comment only at a word
+			// start. The tokenizer comments at any unquoted `#`, so the character
+			// goes through tokenization as an opaque placeholder (like the
+			// mid-word case below) and expands back verbatim, keeping the rest of
+			// the line parseable instead of dropping it as comment text.
+			const id = outcome.variables.push("#") - 1
+			outcome.host += mark(`V${id}`)
+			i++
+			continue
+		}
+		if (char === "#" && (i === 0 || (/\s/.test(text[i - 1]) && i !== escapedWordCharEnd))) {
 			// Comment: pass the rest of the line through untouched. Quotes and
 			// delimiters inside a comment are not shell syntax; shell-quote drops
-			// the comment text when tokenizing.
+			// the comment text when tokenizing. A `#` at the end of a `\c` escape
+			// pair is excluded even when the escaped character is whitespace: the
+			// escape makes it word content, so this `#` continues the word and the
+			// masking branch below handles it.
 			const end = endOfLine(i)
 			outcome.host += text.slice(i, end)
 			i = end
+			continue
+		}
+		if (char === "#" && (!/[;&()|<>]/.test(text[i - 1]) || i === escapedWordCharEnd)) {
+			// A `#` inside a word is an ordinary character to the shell: a
+			// comment starts only at a word start. The tokenizer starts a comment
+			// at any `#`, so a mid-word one goes through tokenization as an
+			// opaque placeholder and expands back verbatim, instead of dropping
+			// the rest of the line including a real separator riding after it.
+			// The character right after a `\c` escape pair is also word interior
+			// — an escaped character is a literal word character to the shell —
+			// so a `#` at that position rides the placeholder channel even when
+			// the raw character before it is whitespace or a metacharacter. What
+			// reaches the tokenizer unmasked sits at a real word start (index 0,
+			// after whitespace, or after a bare metacharacter), where the shell
+			// starts a comment too.
+			const id = outcome.variables.push("#") - 1
+			outcome.host += mark(`V${id}`)
+			i++
 			continue
 		}
 		if (char === "<" && text[i + 1] === "<" && text[i + 2] === "<") {
@@ -916,6 +1091,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 				closer: ")",
 				contentStart: i + 2,
 				escaped: true,
+				groupDepth: 0,
 				payloads: null,
 			})
 			i += 2
@@ -949,6 +1125,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 				closer: "`",
 				contentStart: i + 1,
 				escaped: true,
+				groupDepth: 0,
 				payloads: null,
 			})
 			i++
@@ -982,6 +1159,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					const id = outcome.arithmetic.push(text.slice(i, arith.end)) - 1
 					outcome.arithmeticPayloads[id] = arithPayloads
 					outcome.host += mark(`A${id}`)
+					expansionCloseEnd = arith.end
 					i = arith.end
 					continue
 				}
@@ -991,6 +1169,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					closer: ")",
 					contentStart: i + 2,
 					escaped: true,
+					groupDepth: 0,
 					payloads: null,
 				})
 				i += 2
@@ -1003,6 +1182,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					closer: "}",
 					contentStart: i + 2,
 					escaped: true,
+					groupDepth: 0,
 					payloads: [],
 				})
 				paramFramesOpen++
@@ -1021,6 +1201,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 				const id = outcome.arithmetic.push(text.slice(i, arith.end)) - 1
 				outcome.arithmeticPayloads[id] = []
 				outcome.host += mark(`A${id}`)
+				expansionCloseEnd = arith.end
 				i = arith.end
 				continue
 			}
@@ -1066,67 +1247,98 @@ function scanShellSyntax(text: string): ScanOutcome {
 
 /**
  * Parse a heredoc delimiter word starting at position `start` in `command`.
- * The delimiter may be:
- * - Unquoted:          `EOF`   -- expansion-active body
- * - Single-quoted:     `'EOF'` -- literal body, strip outer quotes
- * - Double-quoted:     `"EOF"` -- literal body, strip outer quotes
- * - Backslash-escaped: `\EOF`  -- literal body, strip leading backslash
+ * The word is walked with bash's quoting rules: a quote character opens a
+ * quote region anywhere in the word (mid-word as well as at the start), a
+ * quote region spans newlines until its closing quote, and outside single
+ * quotes a backslash escapes the next character (backslash-newline drops the
+ * newline as a line continuation). Quote removal produces the bare word a
+ * terminator line must equal exactly.
  *
- * Returns the bare delimiter word (for terminator line matching), whether the
- * delimiter was quoted or escaped (a quoted/escaped delimiter suppresses all
- * expansion in the body), and the index of the first character after the
- * delimiter token.
+ * Returns:
+ * - `delimiter`: the word after quote removal (terminator text; empty for
+ *   `<<''`, which bash terminates at the first blank body line).
+ * - `endIndex`: index of the first character after the delimiter token.
+ * - `quoted`: whether any quoting construct appeared -- a quoted/escaped
+ *   delimiter suppresses all expansion in the body.
+ * - `wordPresent`: whether any delimiter token appeared at all (bare `<<`
+ *   before end of line has none).
+ * - `malformed`: whether the word reached end of input with a quote region
+ *   still open. bash then reads the delimiter as a multi-line word that can
+ *   never match a body line while the opener line's tail keeps executing as
+ *   ordinary syntax, so no body can be accounted for.
  */
 function parseHeredocDelimiter(
 	command: string,
 	start: number,
-): { delimiter: string; endIndex: number; quoted: boolean } {
+): {
+	delimiter: string
+	endIndex: number
+	quoted: boolean
+	wordPresent: boolean
+	malformed: boolean
+} {
 	let i = start
 	let delimiter = ""
 	let quoted = false
+	// The quote region currently open inside the word, if any.
+	let quote: "'" | '"' | null = null
 
-	// A CR ends the delimiter word: on CRLF input the terminator line is the
-	// bare word, so absorbing the CR into the delimiter would make it never
-	// match and turn a well-formed heredoc into a false syntax error.
-	if (command[i] === "'") {
-		quoted = true
-		i++ // skip opening '
-		while (i < command.length && command[i] !== "'" && command[i] !== "\n" && command[i] !== "\r") {
-			delimiter += command[i++]
+	while (i < command.length) {
+		const char = command[i]
+		if (quote) {
+			if (char === quote) {
+				quote = null
+			} else if (quote === '"' && char === "\\" && i + 1 < command.length) {
+				// Inside double quotes a backslash escapes the next character;
+				// backslash-newline drops the newline (line continuation).
+				if (command[i + 1] !== "\n") {
+					delimiter += command[i + 1]
+				}
+				i += 2
+				continue
+			} else {
+				// Inside a quote, newlines and blanks are ordinary word content:
+				// bash closes the word only at the matching quote.
+				delimiter += char
+			}
+			i++
+			continue
 		}
-		if (command[i] === "'") i++ // consume closing '
-	} else if (command[i] === '"') {
-		quoted = true
-		i++ // skip opening "
-		while (i < command.length && command[i] !== '"' && command[i] !== "\n" && command[i] !== "\r") {
-			delimiter += command[i++]
+		if (char === "'" || char === '"') {
+			quote = char
+			quoted = true
+			i++
+			continue
 		}
-		if (command[i] === '"') i++ // consume closing "
-	} else if (command[i] === "\\") {
-		quoted = true
-		i++ // skip backslash
-		while (
-			i < command.length &&
-			command[i] !== "\n" &&
-			command[i] !== "\r" &&
-			command[i] !== " " &&
-			command[i] !== "\t"
-		) {
-			delimiter += command[i++]
+		if (char === "\\") {
+			quoted = true
+			if (i + 1 < command.length) {
+				if (command[i + 1] !== "\n") {
+					delimiter += command[i + 1]
+				}
+				i += 2
+				continue
+			}
+			i++
+			continue
 		}
-	} else {
-		while (
-			i < command.length &&
-			command[i] !== "\n" &&
-			command[i] !== "\r" &&
-			command[i] !== " " &&
-			command[i] !== "\t"
-		) {
-			delimiter += command[i++]
+		// An unquoted space/tab/newline/CR ends the word. A CR is a boundary so
+		// a CRLF-bounded well-formed opener keeps its terminator line matchable
+		// (the CR belongs to the line ending, not to the delimiter).
+		if (char === " " || char === "\t" || char === "\n" || char === "\r") {
+			break
 		}
+		delimiter += char
+		i++
 	}
 
-	return { delimiter, endIndex: i, quoted }
+	return {
+		delimiter,
+		endIndex: i,
+		quoted,
+		wordPresent: i > start,
+		malformed: quote !== null,
+	}
 }
 
 /** Look up the raw text a placeholder name stands for, or undefined. */
