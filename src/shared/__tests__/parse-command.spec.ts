@@ -589,6 +589,42 @@ describe("parseCommand", () => {
 			expect(commands).toEqual([input, "rm -rf /"])
 		})
 
+		it("extracts a substitution inside a closed $[…] as its own segment", () => {
+			// `$[ … ]` is the deprecated arithmetic form and expands command
+			// substitutions before evaluating, exactly like $((…)), so the
+			// payload must match the lists on its own instead of riding the
+			// allowlisted host word.
+			const input = "echo $[1+$(whoami)]"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input, "whoami"])
+		})
+
+		it("fails closed on an unclosed $[ whose interior holds a substitution", () => {
+			// bash reports a syntax error when the `]` never arrives, so the
+			// input must not look well-formed to the allowlists.
+			const input = "echo $[1+$(whoami)"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("arithmetic")
+		})
+
+		it("fails closed when a nested ] slices a $[…] payload open", () => {
+			// bash tracks bracket nesting through its arithmetic grammar while
+			// the scanner ends `$[…]` at the first `]`; the truncated payload
+			// leaves its `$(` unclosed, which fails closed like the shell's own
+			// arithmetic syntax error for the same input — at top level and
+			// inside a heredoc body.
+			const input = "echo $[1+$(echo ])]"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("command-substitution")
+			const body = "cat <<EOF\n$[1+$(echo ])]\nEOF"
+			const bodyResult = parseCommand(body)
+			expect(bodyResult.commands).toEqual([body])
+			expect(bodyResult.parseError?.quoteType).toBe("command-substitution")
+		})
+
 		it("does not extract from a quoted-delimiter heredoc body (the shell suppresses expansion there)", () => {
 			const input = "cat <<'EOF'\n$(whoami)\nEOF"
 			const { commands, parseError } = parseCommand(input)
@@ -1335,14 +1371,14 @@ describe("parseCommand", () => {
 			expect(commands).toEqual([input, "echo x"])
 		})
 
-		it("masks $[…] inside a heredoc body without extracting from its interior", () => {
-			// `$[ … ]` is arithmetic: deprecated bash syntax whose interior is
-			// never expansion-inspected, so the embedded substitution stays
-			// masked and no error is reported.
+		it("extracts a substitution inside $[…] within a heredoc body", () => {
+			// bash expands command substitutions inside `$[ … ]` (the deprecated
+			// arithmetic form) before evaluating it, exactly like inside
+			// `$(( … ))`, so the payload must match the lists on its own.
 			const input = "cat <<EOF\n$[1 + $(whoami)]\nEOF"
 			const { commands, parseError } = parseCommand(input)
 			expect(parseError).toBeNull()
-			expect(commands).toEqual([input])
+			expect(commands).toEqual([input, "whoami"])
 		})
 
 		it("extracts both process substitutions from a heredoc body", () => {
@@ -1509,6 +1545,93 @@ describe("parseCommand", () => {
 			const { commands, parseError } = parseCommand(input)
 			expect(parseError).toBeNull()
 			expect(commands).toEqual(['cat <<"a\\\nb"\nab'])
+		})
+
+		it("keeps a backslash before a non-escapable character in a double-quoted delimiter", () => {
+			// Inside double quotes bash drops a backslash only before `$ ` " \
+			// and newline; before `q` it stays part of the word, so the
+			// terminator line is `a\q` and everything after it is live syntax
+			// again rather than masked body text.
+			const input = 'cat <<"a\\q"\na\\q\nrm -rf /\naq\n'
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(['cat <<"a\\q"\na\\q', "rm -rf /", "aq"])
+		})
+
+		it("drops a backslash before $ inside a double-quoted delimiter", () => {
+			// `$` is in the escapable set, so the delimiter is the three-char
+			// word `a$q` and the matching body line terminates the heredoc.
+			const input = 'cat <<"a\\$q"\na$q\nrm -rf /\n'
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(['cat <<"a\\$q"\na$q', "rm -rf /"])
+		})
+
+		it("keeps backslashes verbatim in a single-quoted delimiter", () => {
+			// Single quotes suppress all escaping, so the delimiter is the
+			// literal `a\q` and the terminator line carries the backslash.
+			const input = "cat <<'a\\q'\na\\q\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<'a\\q'\na\\q", "rm -rf /"])
+		})
+
+		it("terminates a double-quoted-delimiter heredoc after a continuation-joined word", () => {
+			// Backslash-newline inside double quotes joins the word, so the
+			// delimiter is `aq` and the following line is already live syntax.
+			const input = 'cat <<"a\\\nq"\naq\nrm -rf /\n'
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(['cat <<"a\\\nq"\naq', "rm -rf /"])
+		})
+
+		it("terminates an unquoted heredoc whose delimiter is split by line continuation", () => {
+			// bash joins backslash-newline pairs before testing a body line
+			// against the terminator, so `EO\` + `F` ends the heredoc there and
+			// the following line executes rather than staying masked body text.
+			const input = "cat <<EOF\nEO\\\nF\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\nEO\\\nF", "rm -rf /"])
+		})
+
+		it("does not join backslash-newline inside a quoted-delimiter body", () => {
+			// A quoted delimiter makes every body backslash literal, so `EO\`
+			// + `F` is ordinary body text and only the real `EOF` line ends the
+			// heredoc.
+			const input = "cat <<'EOF'\nEO\\\nF\nrm -rf /\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<'EOF'\nEO\\\nF\nrm -rf /\nEOF"])
+		})
+
+		it("strips <<- leading tabs per physical line before joining continuations", () => {
+			// Tab stripping applies to each physical line, then the join builds
+			// the terminator candidate, so the tab-indented `EO\` + `F` pair
+			// still matches `EOF`.
+			const input = "cat <<-EOF\n\tEO\\\nF\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<-EOF\n\tEO\\\nF", "rm -rf /"])
+		})
+
+		it("does not join a line ending in an even number of backslashes", () => {
+			// Two trailing backslashes escape each other, so the line ends
+			// literally and the body runs to the real terminator.
+			const input = "cat <<EOF\nX\\\\\nrm -rf /\nEOF\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\nX\\\\\nrm -rf /\nEOF"])
+		})
+
+		it("joins a continuation backslash across a CRLF line ending", () => {
+			// The CR of a CRLF pair belongs to the line ending, so a lone
+			// backslash before it ends the physical line just like before a
+			// bare LF, and the terminator candidate joins across it.
+			const input = "cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\r\nEO\\\r\nF", "touch x", "EOF"])
 		})
 
 		it("treats a backslash at end of input as part of the delimiter word", () => {

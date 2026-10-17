@@ -157,6 +157,12 @@ type FrameKind =
 
 const QUOTE_FRAME_KINDS: FrameKind[] = ["posix-single", "ansi-c", "double", "locale"]
 
+/**
+ * The characters a backslash escapes inside double quotes. Before any other
+ * character the backslash is itself literal and stays part of the word.
+ */
+const DOUBLE_QUOTE_ESCAPABLE = '$`"\\\n'
+
 /** An open region the scanner is inside of; one entry per unclosed delimiter. */
 interface RegionFrame {
 	kind: FrameKind
@@ -484,22 +490,43 @@ function scanShellSyntax(text: string): ScanOutcome {
 		if (wordPresent) {
 			let found = false
 			const bodyStart = i
-			while (i < text.length) {
-				const lineStart = i
-				while (i < text.length && text[i] !== "\n" && text[i] !== "\r") {
-					i++
-				}
-				const rawLine = text.slice(lineStart, i)
-				// Leading tabs are stripped only for <<- heredocs.
-				const line = stripTabs ? rawLine.replace(/^\t*/, "") : rawLine
-				// The terminator line must be bounded by LF or EOF (a CR counts
-				// only as the CR of a CRLF pair): a CR-only-bounded "EOF\r" is
-				// body text to bash, so treating it as the terminator would
-				// validate a heredoc the shell reports as unterminated.
-				const boundedByEol = i >= text.length || text[i] === "\n" || (text[i] === "\r" && text[i + 1] === "\n")
-				if (line === delimiter && boundedByEol) {
-					found = true
-					bodyEnd = lineStart
+			// A terminator candidate spans physical lines until it stops
+			// continuing: bash joins a backslash-newline pair before matching
+			// the delimiter, so an unquoted body line whose content ends in an
+			// odd number of backslashes flows into the next physical line
+			// (trailing CR dropped only as the CR of a CRLF pair). <<- strips
+			// leading tabs per physical line, before that join. A quoted
+			// delimiter makes the backslash literal, so no joining happens.
+			search: while (i < text.length) {
+				const groupStart = i
+				let candidate = ""
+				for (;;) {
+					const lineStart = i
+					while (i < text.length && text[i] !== "\n" && text[i] !== "\r") {
+						i++
+					}
+					const rawLine = text.slice(lineStart, i)
+					// Leading tabs are stripped only for <<- heredocs.
+					const line = stripTabs ? rawLine.replace(/^\t*/, "") : rawLine
+					// The terminator line must be bounded by LF or EOF (a CR counts
+					// only as the CR of a CRLF pair): a CR-only-bounded "EOF\r" is
+					// body text to bash, so treating it as the terminator would
+					// validate a heredoc the shell reports as unterminated.
+					const boundedByEol =
+						i >= text.length || text[i] === "\n" || (text[i] === "\r" && text[i + 1] === "\n")
+					const endsAtLineBreak = text[i] === "\n" || (text[i] === "\r" && text[i + 1] === "\n")
+					const trailingBackslashes = line.match(/\\*$/)?.[0].length ?? 0
+					if (!quoted && endsAtLineBreak && trailingBackslashes % 2 === 1) {
+						candidate += line.slice(0, -1) // drop the continuation backslash
+						i += text[i] === "\r" ? 2 : 1
+						continue
+					}
+					candidate += line
+					if (candidate === delimiter && boundedByEol) {
+						found = true
+						bodyEnd = groupStart
+						break search
+					}
 					break
 				}
 				if (i < text.length) {
@@ -738,11 +765,20 @@ function scanShellSyntax(text: string): ScanOutcome {
 					continue
 				}
 				if (text[i + 1] === "[") {
-					const close = text.indexOf("]", i + 2)
-					if (close === -1) {
+					const arith = skipArithmetic(i)
+					// An unclosed opener fails closed: the shell refuses the
+					// input, and masking the rest of the body would hide it.
+					if (!arith.closed) {
 						return errorAt("arithmetic", i)
 					}
-					i = close + 1
+					// $[…] is expansion-active exactly like $((…)): the shell
+					// performs the substitutions inside it, so they must balance
+					// and be collected.
+					const arithError = walkBodyPayloads(i + 2, arith.end - 1, collect, depth + 1)
+					if (arithError) {
+						return arithError
+					}
+					i = arith.end
 					continue
 				}
 				i++
@@ -775,8 +811,8 @@ function scanShellSyntax(text: string): ScanOutcome {
 	/**
 	 * Consume a `$((…))` or `$[…]` arithmetic expression. `closed` reports
 	 * whether the closing delimiter was found; callers fail closed when it is
-	 * missing (bash refuses an unclosed opener), and only a closed `$((…))`
-	 * interior is expansion-walked.
+	 * missing (bash refuses an unclosed opener), and only a closed
+	 * expression's interior is expansion-walked.
 	 */
 	const skipArithmetic = (i: number): { end: number; closed: boolean } => {
 		if (text[i + 1] === "[") {
@@ -1190,16 +1226,24 @@ function scanShellSyntax(text: string): ScanOutcome {
 				continue
 			}
 			if (text[i + 1] === "[") {
-				// $[…] stays mask-only: its interior is never inspected for
-				// substitutions. An unclosed opener still fails closed — the
-				// shell refuses it, and masking would swallow the remainder.
 				const arith = skipArithmetic(i)
+				// An unclosed opener fails closed: masking the remainder
+				// to end of input would hide its text behind the host word.
 				if (!arith.closed) {
 					outcome.error = errorAt("arithmetic", i)
 					return outcome
 				}
+				// The shell performs command substitutions inside a $[…]
+				// exactly like anywhere else, so they are extracted as
+				// independent segments and must balance.
+				const arithPayloads: string[] = []
+				const arithError = walkBodyPayloads(i + 2, arith.end - 1, arithPayloads, 0)
+				if (arithError) {
+					outcome.error = arithError
+					return outcome
+				}
 				const id = outcome.arithmetic.push(text.slice(i, arith.end)) - 1
-				outcome.arithmeticPayloads[id] = []
+				outcome.arithmeticPayloads[id] = arithPayloads
 				outcome.host += mark(`A${id}`)
 				expansionCloseEnd = arith.end
 				i = arith.end
@@ -1249,10 +1293,11 @@ function scanShellSyntax(text: string): ScanOutcome {
  * Parse a heredoc delimiter word starting at position `start` in `command`.
  * The word is walked with bash's quoting rules: a quote character opens a
  * quote region anywhere in the word (mid-word as well as at the start), a
- * quote region spans newlines until its closing quote, and outside single
- * quotes a backslash escapes the next character (backslash-newline drops the
- * newline as a line continuation). Quote removal produces the bare word a
- * terminator line must equal exactly.
+ * quote region spans newlines until its closing quote, and a backslash
+ * escapes the next character — inside double quotes only the characters in
+ * `DOUBLE_QUOTE_ESCAPABLE`, outside quotes anything (backslash-newline drops
+ * the newline as a line continuation everywhere). Quote removal produces the
+ * bare word a terminator line must equal exactly.
  *
  * Returns:
  * - `delimiter`: the word after quote removal (terminator text; empty for
@@ -1289,10 +1334,13 @@ function parseHeredocDelimiter(
 			if (char === quote) {
 				quote = null
 			} else if (quote === '"' && char === "\\" && i + 1 < command.length) {
-				// Inside double quotes a backslash escapes the next character;
-				// backslash-newline drops the newline (line continuation).
+				// Inside double quotes only `DOUBLE_QUOTE_ESCAPABLE` is
+				// escapable: the backslash drops before those characters and
+				// stays literal text of the word before anything else.
+				// Backslash-newline drops both (line continuation).
 				if (command[i + 1] !== "\n") {
-					delimiter += command[i + 1]
+					const next = command[i + 1]
+					delimiter += DOUBLE_QUOTE_ESCAPABLE.includes(next) ? next : char + next
 				}
 				i += 2
 				continue

@@ -138,6 +138,24 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision(heredoc, ["cat"])).toBe("ask_user")
 	})
 
+	it("asks user for a substitution inside the deprecated $[…] arithmetic form", () => {
+		// bash expands `$[ … ]` interiors before evaluating, so `touch` must
+		// match the lists on its own instead of riding the allowlisted echo.
+		expect(getCommandDecision("echo $[1+$(touch /tmp/pwn; echo 1)]", ["echo"])).toBe("ask_user")
+	})
+
+	it("asks user for the line after a double-quoted-delimiter heredoc whose backslash bash keeps", () => {
+		// bash retains `\` before `q`, so the heredoc ends at the `a\q` line
+		// and `rm -rf /` is an ordinary following command the lists must see.
+		expect(getCommandDecision('cat <<"a\\q"\na\\q\nrm -rf /\naq\n', ["cat"])).toBe("ask_user")
+	})
+
+	it("asks user for the line after a heredoc whose terminator bash joins from continued lines", () => {
+		// `EO\` + `F` joins into the `EOF` terminator before bash matches it,
+		// so `rm -rf /` runs as a following command, not as masked body text.
+		expect(getCommandDecision("cat <<EOF\nEO\\\nF\nrm -rf /\n", ["cat"])).toBe("ask_user")
+	})
+
 	it("asks user for the inner commands of process substitutions", () => {
 		expect(getCommandDecision("diff <(sort a) <(sort b)", ["diff"])).toBe("ask_user")
 	})
