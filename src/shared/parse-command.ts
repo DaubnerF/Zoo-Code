@@ -139,6 +139,8 @@ function unterminatedQuoteMessage(quoteType: QuoteType, openIndex: number, comma
  *
  * Unbalanced delimiter characters inside ordinary quoted regions remain
  * parseable: a shell never looks at them, so neither does this check.
+ *
+ * @internal
  */
 export function findUnterminatedQuote(command: string): UnterminatedQuote | null {
 	return scanShellSyntax(command).error
