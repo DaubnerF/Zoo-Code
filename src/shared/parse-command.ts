@@ -298,14 +298,24 @@ function isIdentChar(char: string): boolean {
  *   it spans. Lines end only at LF (a CR counts solely as the CR of a CRLF
  *   pair on the opener line): a CR-only-separated opener does not validate a
  *   heredoc, because bash would report such a construct unterminated. Body
- *   lines are matched against the delimiter with every CR removed: POSIX bash
- *   keeps a lone CR as ordinary content, but the msys/Cygwin read layer (the
- *   reference shell on the Windows target) strips CR from every line before
- *   parsing, so a CR-adjacent terminator closes the heredoc early there. The
- *   parser can therefore close at or before either shell, never after: a CR
- *   divergence exposes extra following commands for review instead of masking
- *   executed ones. An
- *   unquoted-delimiter body is expansion-active: substitutions
+ *   lines are matched against the delimiter with every CR removed because the
+ *   msys/Cygwin read layer (the reference shell on the Windows target) strips
+ *   CR before parsing -- every CR in the construct, the delimiter word and
+ *   the terminator line included -- while POSIX bash keeps all of them as
+ *   ordinary content. The two models can therefore place the terminator on
+ *   different lines, and either direction of divergence is unsafe: an early
+ *   close feeds the remaining body back into the scanner as live syntax (where
+ *   it can open a new heredoc that masks commands the other model executes), a
+ *   late close masks them outright. A CR anywhere in the region from the
+ *   opener line through the closing terminator line means the two layers do
+ *   not read the same bytes, so the parser cannot verify that both models
+ *   close at the same line; such heredocs fail closed for review rather than
+ *   guess which model decides the boundary, over-rejecting even uniformly-
+ *   CRLF constructs whose models happen to agree -- the accepted cost of
+ *   never picking a model. Only heredocs whose region is CR-free are parsed,
+ *   and there both models read byte-identical text. An unquoted-delimiter body
+ *   is
+ *   expansion-active: substitutions
  *   opened inside it are extracted and must balance before the terminator. A
  *   quoted or backslash-escaped delimiter suppresses expansion entirely in the
  *   body (the shell does not expand those), so its body stays opaque and is
@@ -498,14 +508,19 @@ function scanShellSyntax(text: string): ScanOutcome {
 			let found = false
 			const bodyStart = i
 			// The terminator search emulates the shell's read layer: a line
-			// runs to LF (or end of input) with every CR byte dropped. POSIX
-			// bash keeps a lone CR as ordinary content, but the msys/Cygwin
-			// read layer (the reference shell on the Windows target) strips
-			// CR from every line before parsing, so `EO<CR>F` arrives as the
-			// terminator `EOF` and closes the heredoc early. Comparing the
-			// stripped form therefore closes at or before either variant: a
-			// divergence can only expose following commands for review,
-			// never mask what either shell would execute. Bash joins a
+			// runs to LF (or end of input). POSIX bash keeps every CR as
+			// ordinary content, while the msys/Cygwin read layer (the reference
+			// shell on the Windows target) strips every CR before parsing, so
+			// `EO<CR>F` arrives as the terminator `EOF` and closes the heredoc
+			// early there. The strip also reaches the delimiter word: a CRLF
+			// opener line leaves POSIX reading the delimiter `EOF<CR>` where
+			// msys reads `EOF`. A CR from the opener line through the closing
+			// terminator line leaves the two layers reading different bytes, so
+			// the close cannot be verified model-independent; such heredocs fail
+			// closed for review (the region test at the terminator match below),
+			// over-rejecting even agreeing uniformly-CRLF constructs as the
+			// accepted cost. A CR-free region is byte-identical under both
+			// models, so it parses. Bash joins a
 			// backslash-newline pair before matching the delimiter, so an
 			// unquoted logical line whose stripped content ends in an odd
 			// number of backslashes flows into the next physical line. A
@@ -535,6 +550,21 @@ function scanShellSyntax(text: string): ScanOutcome {
 					// early-terminator match cannot hide live commands.
 					const candidateText = stripTabs ? candidate.replace(/^\t+/, "") : candidate
 					if (candidateText === delimiter) {
+						if (text.lastIndexOf("\r", i - 1) >= start) {
+							// A CR anywhere from the `<<` through this
+							// terminator line -- opener-line CRLF, body line,
+							// joined continuation, or the terminator line's own
+							// CR -- leaves the two layers reading different
+							// bytes, so the parser cannot verify both models
+							// close at the same line; even a uniformly-CRLF
+							// construct whose models happen to agree fails
+							// closed here, accepted as the cost. A close only
+							// one model can see would hand the other model's
+							// remainder back to the scanner as live syntax, so
+							// the heredoc fails closed rather than picking a
+							// model.
+							return { error: errorAt("heredoc", start) }
+						}
 						found = true
 						bodyEnd = groupStart
 						// The match is on the CR-stripped logical line, so the
@@ -1394,9 +1424,11 @@ function parseHeredocDelimiter(
 			i++
 			continue
 		}
-		// An unquoted space/tab/newline/CR ends the word. A CR is a boundary so
-		// a CRLF-bounded well-formed opener keeps its terminator line matchable
-		// (the CR belongs to the line ending, not to the delimiter).
+		// An unquoted space/tab/newline/CR ends the word: the msys read layer
+		// strips CR, so there the CR is line-ending content, not part of the
+		// delimiter word. Any CR-bounded delimiter word leaves its CR inside
+		// the construct's region, and skipHeredoc's region test fails such a
+		// heredoc closed whether or not a terminator line matches.
 		if (char === " " || char === "\t" || char === "\n" || char === "\r") {
 			break
 		}

