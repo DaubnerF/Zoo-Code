@@ -940,6 +940,68 @@ describe("parseCommand", () => {
 			expect(parseError).toBeNull()
 			expect(commands).toEqual([input])
 		})
+
+		it("fails closed on a bare-<< heredoc whose opener line ends CRLF", () => {
+			// The delimiter word stops at the unquoted CR, so no delimiter token
+			// is present and the opener masks through end of input -- but the
+			// masked span carries that CR, which the msys read layer strips while
+			// POSIX bash keeps as ordinary content. The two layers would mask
+			// different bytes, so the mask fails closed instead of picking one.
+			const input = "cat << \r\nEOF\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a bare-<< heredoc with a lone-CR body line", () => {
+			// The lone CR terminates a line for one read layer and is stripped
+			// content for the other, so the masked span again spans bytes the two
+			// layers do not read identically, and the mask fails closed.
+			const input = "cat << \r\nEOF\n\r\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a bare-<< heredoc whose CR rides directly against the opener", () => {
+			// Same shape with no blank between `<<` and the CR: the word break
+			// lands on the CR itself, and the CR is still inside the masked span.
+			const input = "cat <<\r\nEOF\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when a CR sits in a bare-<< mask away from the opener", () => {
+			// The check spans the whole masked region, not just the bytes adjacent
+			// to `<<`: the opener line here is pure LF and the CR opens the first
+			// masked line. This construct is never-runnable under both read
+			// layers, so failing it closed over-rejects -- the accepted cost of
+			// keeping one region rule for every masked heredoc span.
+			const input = "cat <<\nEOF\r\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a <<- heredoc with no delimiter word and a CRLF opener line", () => {
+			// The dashed form strips tabs before reaching the same no-delimiter
+			// masking, so the emission check covers it identically.
+			const input = "cat <<- \r\nEOF\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("keeps masking a CR-free bare-<< opener through end of input", () => {
+			// Accept-path control: a CR-free masked span is byte-identical under
+			// both read layers, so the bare-<< masking policy is unchanged and a
+			// CR-free opener still masks through end of input.
+			const input = "cat <<\nEOF\nrm -rf /\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input])
+		})
 	})
 
 	describe("grouping parentheses inside substitution frames", () => {

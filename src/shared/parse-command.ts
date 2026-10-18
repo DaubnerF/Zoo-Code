@@ -484,6 +484,29 @@ function scanShellSyntax(text: string): ScanOutcome {
 			return { error: errorAt("heredoc", start) }
 		}
 		const payloads: string[] = []
+		// The only place a heredoc mask is emitted: every non-error outcome of
+		// skipHeredoc returns through here, so every masked span carries the same
+		// check. A CR byte inside [start, end) leaves the two read layers reading
+		// different bytes -- msys strips each CR before parsing, POSIX keeps it
+		// as ordinary content -- so a close one layer sees may not be the close
+		// the other sees, and a close only one layer can see would hand that
+		// model's remainder back to the scanner as live syntax. The parser cannot
+		// verify both layers close the construct the same way, so the heredoc
+		// fails closed rather than picking a model; a uniformly-CRLF construct
+		// whose layers happen to agree is over-rejected as the accepted cost.
+		const emitMask = (end: number): { end: number } | { error: UnterminatedQuote } => {
+			if (text.lastIndexOf("\r", end - 1) >= start) {
+				return { error: errorAt("heredoc", start) }
+			}
+			const id = outcome.heredocs.push(text.slice(start, end)) - 1
+			outcome.heredocPayloads[id] = payloads
+			// Inside an expansion region the host is masked wholesale anyway; only
+			// top-level heredocs need a placeholder in the host text.
+			if (frames.length === 0) {
+				outcome.host += mark(`H${id}`)
+			}
+			return { end }
+		}
 		// The opener line's remainder after the delimiter is expanded by the shell
 		// even when the delimiter is quoted (quoting suppresses expansion in the
 		// body only), so walk it unconditionally; an error there fails the whole
@@ -509,6 +532,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 		if (wordPresent) {
 			let found = false
 			const bodyStart = i
+			// Raw scan index at the terminator match: the mask-emission guard
+			// tests the region [start, rawIndex), before the back-step
+			// adjustments at the match shift the scan index off the terminator
+			// line's line ending.
+			let rawIndex = bodyStart
 			// The terminator search emulates the shell's read layer: a line
 			// runs to LF (or end of input). POSIX bash keeps every CR as
 			// ordinary content, while the msys/Cygwin read layer (the reference
@@ -518,11 +546,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 			// opener line leaves POSIX reading the delimiter `EOF<CR>` where
 			// msys reads `EOF`. A CR from the opener line through the closing
 			// terminator line leaves the two layers reading different bytes, so
-			// the close cannot be verified model-independent; such heredocs fail
-			// closed for review (the region test at the terminator match below),
-			// over-rejecting even agreeing uniformly-CRLF constructs as the
-			// accepted cost. A CR-free region is byte-identical under both
-			// models, so it parses. Bash joins a
+			// the close cannot be verified model-independent; every masked span
+			// is tested against this region by the mask-emission guard above, so
+			// such heredocs fail closed for review, over-rejecting even agreeing
+			// uniformly-CRLF constructs as the accepted cost. A CR-free region is
+			// byte-identical under both models, so it parses. Bash joins a
 			// backslash-newline pair before matching the delimiter, so an
 			// unquoted logical line whose stripped content ends in an odd
 			// number of backslashes flows into the next physical line. A
@@ -552,21 +580,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 					// early-terminator match cannot hide live commands.
 					const candidateText = stripTabs ? candidate.replace(/^\t+/, "") : candidate
 					if (candidateText === delimiter) {
-						if (text.lastIndexOf("\r", i - 1) >= start) {
-							// A CR anywhere from the `<<` through this
-							// terminator line -- opener-line CRLF, body line,
-							// joined continuation, or the terminator line's own
-							// CR -- leaves the two layers reading different
-							// bytes, so the parser cannot verify both models
-							// close at the same line; even a uniformly-CRLF
-							// construct whose models happen to agree fails
-							// closed here, accepted as the cost. A close only
-							// one model can see would hand the other model's
-							// remainder back to the scanner as live syntax, so
-							// the heredoc fails closed rather than picking a
-							// model.
-							return { error: errorAt("heredoc", start) }
-						}
+						rawIndex = i
 						found = true
 						bodyEnd = groupStart
 						// The match is on the CR-stripped logical line, so the
@@ -608,26 +622,17 @@ function scanShellSyntax(text: string): ScanOutcome {
 				// payload is re-scanned whole and recovers them there.
 				innermostParam(frames, paramFramesOpen)?.payloads?.push(...payloads)
 			}
-			const id = outcome.heredocs.push(text.slice(start, i)) - 1
-			outcome.heredocPayloads[id] = payloads
-			// Inside an expansion region the host is masked wholesale anyway; only
-			// top-level heredocs need a placeholder in the host text.
-			if (frames.length === 0) {
-				outcome.host += mark(`H${id}`)
-			}
-			return { end: i }
+			return emitMask(rawIndex)
 		}
 		// No delimiter token at all (a bare `<<`, or `<<` followed only by
 		// blanks, before end of line): bash rejects such input with a syntax
-		// error and never executes it, so masking the opener through end of
-		// input as one opaque word over-approximates a never-runnable
-		// construct and cannot hide a live command.
-		outcome.heredocs.push(text.slice(start, text.length))
-		outcome.heredocPayloads[outcome.heredocs.length - 1] = payloads
-		if (frames.length === 0) {
-			outcome.host += mark(`H${outcome.heredocs.length - 1}`)
-		}
-		return { end: text.length }
+		// error and never executes it, so the opener masks through end of input
+		// as one opaque word over a never-runnable construct. The mask is sound
+		// only while both read layers see the same bytes, so the region test at
+		// the mask-emission guard above fails the mask closed when a CR enters
+		// the span -- over-rejecting the CR-touched shapes whose layers happen to
+		// agree, as the accepted cost of keeping one region rule.
+		return emitMask(text.length)
 	}
 
 	/**
@@ -1429,8 +1434,9 @@ function parseHeredocDelimiter(
 		// An unquoted space/tab/newline/CR ends the word: the msys read layer
 		// strips CR, so there the CR is line-ending content, not part of the
 		// delimiter word. Any CR-bounded delimiter word leaves its CR inside
-		// the construct's region, and skipHeredoc's region test fails such a
-		// heredoc closed whether or not a terminator line matches.
+		// the construct's region, and skipHeredoc's region test at mask
+		// emission fails such a heredoc closed whether or not a terminator
+		// line matches.
 		if (char === " " || char === "\t" || char === "\n" || char === "\r") {
 			break
 		}

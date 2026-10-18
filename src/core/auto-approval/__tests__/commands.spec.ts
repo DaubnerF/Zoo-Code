@@ -268,6 +268,37 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("cat <<EOF\r$(evil)\rEOF", ["cat"])).toBe("malformed_command")
 	})
 
+	it("fails closed on a CR immediately after a bare-<< opener", () => {
+		// The lone CR is not a line terminator for bash, so the opener line never
+		// ends: the parser reports the heredoc unterminated and the allowlisted
+		// `cat` must not carry the masked remainder.
+		expect(getCommandDecision("cat <<\rEOF\nEOF\nrm -rf /\n", ["cat"], [])).toBe("malformed_command")
+	})
+
+	it("fails closed on a bare-<< heredoc whose opener line ends CRLF", () => {
+		// The CR inside the masked span leaves the msys and POSIX read layers
+		// reading different bytes, so the mask cannot be verified model-
+		// independent and fails closed: the decision is a rejection, never the
+		// approval an opaque `cat` word would otherwise earn.
+		expect(getCommandDecision("cat << \r\nEOF\n\r\nrm -rf /\n", ["cat"], [])).not.toBe("auto_approve")
+		expect(getCommandDecision("cat << \r\nEOF\n\r\nrm -rf /\n", ["cat"], [])).toBe("malformed_command")
+	})
+
+	it("fails closed on a bare-<< heredoc whose CR rides against the opener", () => {
+		// Same decision-level rejection with the CR directly after `<<`: one CR
+		// byte inside the masked region is enough to fail the heredoc closed.
+		expect(getCommandDecision("cat <<\r\nEOF\nrm -rf /\n", ["cat"], [])).not.toBe("auto_approve")
+		expect(getCommandDecision("cat <<\r\nEOF\nrm -rf /\n", ["cat"], [])).toBe("malformed_command")
+	})
+
+	it("auto-approves a CR-free bare-<< heredoc (no over-fire)", () => {
+		// The masked span here is byte-identical under both read layers, so the
+		// accepted masking policy for this never-runnable shape is unchanged: a
+		// CR-free bare-<< opener still masks through end of input and stays
+		// approved under an allowlisted `cat`.
+		expect(getCommandDecision("cat <<\nEOF\nrm -rf /\n", ["cat"], [])).toBe("auto_approve")
+	})
+
 	it("asks user when a quoted-empty heredoc delimiter lets a later command escape", () => {
 		// bash's quote removal makes `<<''` terminate at the first blank line,
 		// so `rm -rf /` really executes as its own command; now that the parser
