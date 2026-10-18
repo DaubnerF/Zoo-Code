@@ -495,10 +495,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 		// fails closed rather than picking a model; a uniformly-CRLF construct
 		// whose layers happen to agree is over-rejected as the accepted cost.
 		const emitMask = (end: number): { end: number } | { error: UnterminatedQuote } => {
-			if (text.lastIndexOf("\r", end - 1) >= start) {
+			const region = text.slice(start, end)
+			if (region.includes("\r")) {
 				return { error: errorAt("heredoc", start) }
 			}
-			const id = outcome.heredocs.push(text.slice(start, end)) - 1
+			const id = outcome.heredocs.push(region) - 1
 			outcome.heredocPayloads[id] = payloads
 			// Inside an expansion region the host is masked wholesale anyway; only
 			// top-level heredocs need a placeholder in the host text.

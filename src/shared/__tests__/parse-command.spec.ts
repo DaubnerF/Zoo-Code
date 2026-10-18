@@ -1002,6 +1002,28 @@ describe("parseCommand", () => {
 			expect(parseError).toBeNull()
 			expect(commands).toEqual([input])
 		})
+
+		it("accepts a CR on the line before a heredoc's opener line", () => {
+			// The masking check spans only the opener-through-terminator region,
+			// not the whole command: a CR before the opener is ordinary content
+			// of an earlier line and both read layers agree on the CR-free
+			// region, so the heredoc masks and the surrounding commands split.
+			const input = "printf x\r\ncat <<EOF\nbody\nEOF\ncat ok\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["printf x", "cat <<EOF\nbody\nEOF", "cat ok"])
+		})
+
+		it("accepts a CR after a heredoc's terminator line", () => {
+			// Dual of the preceding pin: a CR past the closing terminator sits
+			// outside the masked region, so the region stays byte-identical
+			// under both read layers and the heredoc masks while the trailing
+			// CRLF line still splits as its own command.
+			const input = "cat <<EOF\nbody\nEOF\nprintf y\r\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\nbody\nEOF", "printf y"])
+		})
 	})
 
 	describe("grouping parentheses inside substitution frames", () => {
