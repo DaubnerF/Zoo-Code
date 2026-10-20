@@ -5,36 +5,40 @@ export type ShellToken = string | { op: string } | { command: string }
 /**
  * The kind of structural region a malformed-command error refers to.
  *
- * Quote and heredoc kinds describe regions that were opened and never closed:
+ * Quote and heredoc kinds describe regions that open and never close:
  *
- * - `posix-single` and `ansi-c` share the `'` delimiter but follow different
- *   escaping rules, so they must be distinguished.
- * - `locale` and `double` share the `"` delimiter but `locale` is prefixed with
- *   `$`, making `$"..."` a distinct token for accurate restoration.
- * - `heredoc` covers `<<WORD`, `<<'WORD'`, `<<"WORD"`, and `<<\WORD` openers
- *   whose body extends through the terminator line.
+ * - `posix-single` and `ansi-c` share the `'` delimiter. They follow different
+ *   escaping rules, so the parser must tell them apart.
+ * - `locale` and `double` share the `"` delimiter. A `$` prefix marks
+ *   `locale`. The `$"..."` form is therefore a distinct token, and
+ *   restoration stays accurate.
+ * - `heredoc` covers `<<WORD`, `<<'WORD'`, `<<"WORD"`, and `<<\WORD` openers.
+ *   Their body extends through the terminator line.
  *
- * Expansion kinds describe the delimiters the scanner balances while extracting
- * command substitutions (`stray-closer` is the dual failure: a closer with no
- * opener):
+ * Expansion kinds describe delimiters the scanner balances while it extracts
+ * command substitutions. `stray-closer` is the opposite failure: a `}` with
+ * no matching opener.
  *
- * - `command-substitution`: a `$(` that was never closed.
- * - `process-substitution`: a `<(…` or `>(…` that was never closed.
- * - `parameter-expansion`: a `${` that was never closed.
- * - `backtick`: a backtick region that was never closed.
- * - `arithmetic`: an arithmetic expression (`$((` or `$[`) that was never
- *   closed.
- * - `stray-closer`: a `)` or `}` seen at nesting depth 0 outside any quoted
- *   region, comment, or heredoc body — a closer with no matching opener.
+ * - `command-substitution`: a `$(` that never closes.
+ * - `process-substitution`: a `<(…` or `>(…` that never closes.
+ * - `parameter-expansion`: a `${` that never closes.
+ * - `backtick`: a backtick region that never closes.
+ * - `arithmetic`: an arithmetic expression (`$((` or `$[`) that never
+ *   closes.
+ * - `stray-closer`: a `}` at nesting depth 0 with no matching `{`. The scan
+ *   reports it outside any quoted region, comment, or heredoc body. A
+ *   depth-0 `)` is host text instead. bash closes `case` patterns with `)`.
  *
- * Rejection kinds describe input the scan refuses outright rather than token
- * (both only ever cost a prompt, never an approval):
+ * Rejection kinds describe input the scan refuses outright. The scan never
+ * tokenizes such input. Both kinds only cost a prompt. Neither can grant an
+ * approval:
  *
  * - `nul-byte`: a raw NUL byte anywhere in the command. NUL is the scan's
- *   placeholder sentinel, so an input containing one could corrupt the
+ *   placeholder sentinel. An input that contains one could corrupt the
  *   masked-text round trip.
- * - `nesting-too-deep`: substitution payloads re-scanned beyond
- *   `MAX_PAYLOAD_SCAN_DEPTH` levels — generated input, not a human command.
+ * - `nesting-too-deep`: the scan re-scans substitution payloads beyond
+ *   `MAX_PAYLOAD_SCAN_DEPTH` levels. Such input is generated, not a human
+ *   command.
  */
 export type QuoteType =
 	| "posix-single"
@@ -54,18 +58,17 @@ export type QuoteType =
 /**
  * The result of parsing a command string.
  *
- * `commands` is the list of individual sub-commands produced by splitting on
- * unquoted newlines and chain operators. When `parseError` is non-null the
- * command string is syntactically malformed (an unterminated quote/heredoc, an
- * expansion delimiter or arithmetic expression that was opened but never
- * closed, a stray closer, a raw NUL byte, or substitution nesting beyond the
- * re-scan depth cap) and
- * `commands` contains the raw input as a single opaque token so callers can
+ * `commands` is the list of individual sub-commands. The splitter cuts on
+ * unquoted newlines and chain operators. When `parseError` is non-null, the
+ * command string is malformed. Causes: an unterminated quote or heredoc, an
+ * expansion delimiter or arithmetic expression that never closes, a stray
+ * closer, a raw NUL byte, or substitution nesting beyond the re-scan depth
+ * cap. `commands` then holds the raw input as one opaque token. Callers can
  * surface the error without splitting unsafe fragments.
  *
  * Callers that only need the sub-command list can destructure `{ commands }`.
- * Callers that need to distinguish a parse error from a normal single-command
- * result should also inspect `parseError`.
+ * A caller that must tell a parse error from a normal single-command result
+ * also inspects `parseError`.
  */
 export interface ParseResult {
 	commands: string[]
@@ -73,16 +76,16 @@ export interface ParseResult {
 }
 
 /**
- * Describes a structural delimiter the scan could not account for: a quoted,
- * heredoc, or expansion region that is never closed, or a closing delimiter at
- * depth 0 with no opener.
+ * The scan could not account for the delimiter this object describes. The
+ * delimiter is a quote, heredoc, or expansion region that never closes, or a
+ * `}` at depth 0 with no matching `{`.
  *
  * - `quoteType`: the kind of the offending construct.
- * - `openIndex`: the index in the scanned command string of the character that
- *   opened the region (for ANSI-C and locale quoting this points at the
- *   leading `$`; for heredocs at the first `<`; for a stray closer at the
- *   closer itself). This position lets a caller emit a located error instead
- *   of a generic message.
+ * - `openIndex`: the index, in the scanned command string, of the character
+ *   that opened the region. For ANSI-C and locale quoting it points at the
+ *   leading `$`. For heredocs it points at the first `<`. For a stray closer
+ *   it points at the closer itself. The position lets a caller report a
+ *   located error instead of a generic message.
  */
 export interface UnterminatedQuote {
 	quoteType: QuoteType
@@ -93,8 +96,9 @@ export interface UnterminatedQuote {
 
 /**
  * Build the human-readable error message for a structural parse failure.
- * Includes a short excerpt of the command around the offending character so
- * the agent has enough context to locate and fix the problem.
+ * The message includes a short excerpt of the command around the offending
+ * character. The excerpt gives the agent enough context to locate and fix the
+ * problem.
  */
 function unterminatedQuoteMessage(quoteType: QuoteType, openIndex: number, command: string): string {
 	const labels: Record<QuoteType, string> = {
@@ -125,20 +129,21 @@ function unterminatedQuoteMessage(quoteType: QuoteType, openIndex: number, comma
 }
 
 /**
- * Report the first structural problem in `command`, or `null` when every
- * quoted region, heredoc, and expansion delimiter is properly closed and no
+ * Report the first structural problem in `command`. Return `null` when every
+ * quoted region, heredoc, and expansion delimiter closes properly and no
  * closer appears without its opener.
  *
  * A regex cannot answer "can a shell parse this?" because shell syntax is
- * context-sensitive: a backslash escapes the next character outside single
- * quotes, `#` may begin a comment that should be ignored, a quote inside
- * double quotes is literal text, and nesting must be balanced. The shared
- * state-machine walk in `scanShellSyntax` mirrors POSIX tokenization so that
- * legitimate multi-line quoted arguments are accepted while genuinely
- * malformed input is detected.
+ * context-sensitive. Outside single quotes a backslash escapes the next
+ * character. A `#` may begin a comment that the parser must ignore. A quote
+ * inside double quotes is literal text. Nesting must be balanced. The shared
+ * state-machine walk in `scanShellSyntax` mirrors POSIX tokenization. It
+ * accepts legitimate multi-line quoted arguments and detects genuinely
+ * malformed input.
  *
- * Unbalanced delimiter characters inside ordinary quoted regions remain
- * parseable: a shell never looks at them, so neither does this check.
+ * A shell never looks at unbalanced delimiter characters inside ordinary
+ * quoted regions, so this check does not look at them either. They stay
+ * parseable.
  *
  * @internal
  */
@@ -165,45 +170,46 @@ const QUOTE_FRAME_KINDS: FrameKind[] = ["posix-single", "ansi-c", "double", "loc
  */
 const DOUBLE_QUOTE_ESCAPABLE = '$`"\\\n'
 
-/** An open region the scanner is inside of; one entry per unclosed delimiter. */
+/** An open region the scanner is inside. One entry per unclosed delimiter. */
 interface RegionFrame {
 	kind: FrameKind
 	/** Index of the first character of the opening delimiter. */
 	openIndex: number
 	/** The single character that closes this region. */
 	closer: string
-	/** Index just after the opening delimiter; start of the region's content. */
+	/** Index just after the opening delimiter. The region's content starts there. */
 	contentStart: number
 	/** Whether a backslash inside the region escapes the next character. */
 	escaped: boolean
 	/**
 	 * For command/process-substitution frames: the number of bare `(` grouping
-	 * parentheses opened inside the region and not yet closed. A subshell group
-	 * balances independently of the frame's own closer, so a `)` while this is
-	 * positive matches the group and must not pop the frame.
+	 * parentheses that are open inside the region. A subshell group balances
+	 * independently of the frame's own closer. While this counter is positive,
+	 * a `)` matches the group and must not pop the frame.
 	 */
 	groupDepth: number
 	/**
-	 * For parameter-expansion frames: every command substitution closed inside
-	 * the expansion, at any nesting depth. A parameter expansion masks its text
-	 * from the tokenizer but must not stop substitution extraction, because the
-	 * shell expands `${x:-$(cmd)}` exactly like `$(cmd)`.
+	 * For parameter-expansion frames: every command substitution the scan
+	 * closed inside the expansion, at any nesting depth. A parameter expansion
+	 * hides its text from the tokenizer. It must not stop substitution
+	 * extraction, because the shell expands `${x:-$(cmd)}` exactly like
+	 * `$(cmd)`.
 	 */
 	payloads: string[] | null
 }
 
 /**
- * Everything one scan produces: the masked host text, the structural error (if
- * any), and the masked-away constructs the tokenizer needs to restore or
- * recurse into.
+ * One scan fills this object. It holds the masked host text, the structural
+ * error if one exists, and the masked-away constructs. The tokenizer restores
+ * those constructs or recurses into them.
  */
 interface ScanOutcome {
 	/**
-	 * Host text with every quoted region, heredoc, parameter expansion,
-	 * arithmetic expression, variable, and redirection replaced by an opaque
-	 * placeholder word, and every command substitution replaced by a boundary
-	 * placeholder. It contains no active shell syntax, so `shell-quote` can
-	 * tokenize it safely.
+	 * The scan replaces every quoted region, heredoc, parameter expansion,
+	 * arithmetic expression, variable, and redirection with an opaque
+	 * placeholder word. It replaces every command substitution with a boundary
+	 * placeholder. The result contains no active shell syntax, so
+	 * `shell-quote` can tokenize it safely.
 	 */
 	host: string
 	error: UnterminatedQuote | null
@@ -228,19 +234,20 @@ interface ScanOutcome {
 }
 
 /**
- * Sentinel separating placeholder names in masked host text. The scan rejects
- * any input containing a raw NUL (`nul-byte`) up front, so a placeholder name
- * can never collide with command text (unlike a printable `__NAME_0__`
- * marker, which an input could contain literally).
+ * This sentinel separates placeholder names in masked host text. The scan
+ * rejects any input that contains a raw NUL (`nul-byte`) up front. A
+ * placeholder name can therefore never collide with command text. A printable
+ * `__NAME_0__` marker could collide, because an input can contain it
+ * literally.
  */
 const NUL = "\x00"
 
 /**
- * Cap on payload re-scan depth. Each substitution payload is re-scanned
- * through the full path, so an unbounded cap lets a few tens of KB of
- * generated input burn minutes of CPU (quadratic suffix re-scans) and finally
- * overflow the call stack; exceeding it fails closed instead. No hand-written
- * command nests a substitution 64 deep.
+ * Cap on payload re-scan depth. The scan re-scans every substitution payload
+ * through the full path. With no cap, a few tens of KB of generated input
+ * consumes minutes of CPU through quadratic suffix re-scans. The call stack
+ * finally overflows. The cap fails closed instead. No hand-written command
+ * nests a substitution 64 deep.
  */
 const MAX_PAYLOAD_SCAN_DEPTH = 64
 
@@ -258,76 +265,88 @@ function isIdentChar(char: string): boolean {
 }
 
 /**
- * One quote-aware, left-to-right scan of `text` that simultaneously tracks
- * quote state, delimiter depth, and heredoc state, emitting masked host text,
- * extracted substitution payloads, and a structural error from the same pass.
+ * Scan `text` once, from left to right, with quote awareness. The scan tracks
+ * quote state, delimiter depth, and heredoc state at the same time. One pass
+ * emits masked host text, extracted substitution payloads, and a structural
+ * error.
+ *
+ * Shell scope: the scan parses bash/POSIX-style shell syntax only. The
+ * reference shell on the Windows target is msys/Cygwin bash. The scan does
+ * not parse other shells as such. It reads their input with the same bash
+ * rules. PowerShell input shows two consequences. A backtick is PowerShell's
+ * escape character. The scan reads a backtick as a command-substitution
+ * opener. A backtick that never closes fails closed (`backtick`). `{ ... }`
+ * is a PowerShell script block. The scan applies bash brace rules. Balanced
+ * braces stay ordinary word content. An unmatched `}` at depth 0 fails closed
+ * (`stray-closer`).
  *
  * Invariants the rest of the file depends on:
  *
- * - Quoted regions (`'…'`, `"…"`, `$'…'`, `$"…"`) are opaque to extraction:
- *   their contents are masked whole and returned verbatim, and unbalanced
- *   delimiters inside them are never errors — a shell never parses them there.
- *   (A shell does expand `"$(cmd)"`, but extraction inside quoted regions is
- *   deliberately out of scope, so such payloads stay masked.)
- * - `$(…)`, backticks, `<(`, `>(` are extracted: on close, the raw inner text
- *   becomes a payload segment and the host keeps only an opaque boundary
- *   placeholder, so inner commands match the allow/deny lists on their own.
- *   Payloads are re-scanned, so nesting yields independent segments.
- * - `${…}` masks its text (restored verbatim into the host segment) but the
- *   scan descends into it: substitutions inside a parameter expansion are
- *   still extracted and balance-checked, including substitutions inside a
- *   heredoc body opened within the expansion, whose payloads route to the
- *   expansion's payload list.
- * - `$((…))` masks the expression as one host word and never balances as an
- *   extraction delimiter, but substitutions inside a closed `$((…))` are
- *   extracted and balance-checked, because the shell expands them there. An
- *   unclosed `$((` or `$[` fails closed (`arithmetic`): bash refuses the
- *   input, and masking the remainder to end of input could hide an unclosed
- *   `$(` riding inside it. Bare `$[…]`'s interior stays mask-only: never
- *   inspected for substitutions. Bare
- *   `(`…`)` grouping (subshell groups, array assignments) likewise stays host
- *   text: unclosed it is never an error, so a `)` matching an open bare `(` is
- *   not a stray closer either.
- * - Fail-closed rule: any of the four extraction delimiters opened that the
- *   scan cannot close is an error, as is an unclosed arithmetic opener
- *   (`$((`/`$[`), a stray `)` or `}` at depth 0, a raw NUL byte anywhere in
- *   the input, or payload re-scanning deeper than
- *   `MAX_PAYLOAD_SCAN_DEPTH`. A closer that does not match the open region's
- *   kind is literal content (shell-faithful); the still-open region then fails
- *   at end of input.
- * - Heredocs: the opener line through the terminator line mask as one opaque
- *   host word, so the heredoc stays a single segment no matter how many lines
- *   it spans. Lines end only at LF (a CR counts solely as the CR of a CRLF
- *   pair on the opener line): a CR-only-separated opener does not validate a
- *   heredoc, because bash would report such a construct unterminated. Body
- *   lines are matched against the delimiter with every CR removed because the
- *   msys/Cygwin read layer (the reference shell on the Windows target) strips
- *   CR before parsing -- every CR in the construct, the delimiter word and
- *   the terminator line included -- while POSIX bash keeps all of them as
- *   ordinary content. The two models can therefore place the terminator on
- *   different lines, and either direction of divergence is unsafe: an early
- *   close feeds the remaining body back into the scanner as live syntax (where
- *   it can open a new heredoc that masks commands the other model executes), a
- *   late close masks them outright. A CR anywhere in the region from the
- *   opener line through the closing terminator line means the two layers do
- *   not read the same bytes, so the parser cannot verify that both models
- *   close at the same line; such heredocs fail closed for review rather than
- *   guess which model decides the boundary, over-rejecting even uniformly-
- *   CRLF constructs whose models happen to agree -- the accepted cost of
- *   never picking a model. Only heredocs whose region is CR-free are parsed,
- *   and there both models read byte-identical text. An unquoted-delimiter body
- *   is
- *   expansion-active: substitutions
- *   opened inside it are extracted and must balance before the terminator. A
- *   quoted or backslash-escaped delimiter suppresses expansion entirely in the
- *   body (the shell does not expand those), so its body stays opaque and is
- *   never balance-checked. Bodies carry no comments and are not tokenized
- *   outside an expansion region: a `"` or `#` there is literal text, while
- *   quotes and word-initial `#` comments inside an expansion region follow the
- *   shell's rules there (a comment ends at the newline, not at the region end).
- *   The opener line's remainder
- *   (text after the delimiter word) is walked for substitutions even when the
- *   delimiter is quoted: quoting suppresses expansion in the body only, so
+ * - Quoted regions (`'…'`, `"…"`, `$'…'`, `$"…"`) are opaque to extraction.
+ *   The scan masks their contents whole and returns them verbatim. An
+ *   unbalanced delimiter inside one is never an error. A shell never parses
+ *   them there. A shell does expand `"$(cmd)"`. Extraction inside quoted
+ *   regions is deliberately out of scope, so such payloads stay masked.
+ * - The scan extracts `$(…)`, backticks, `<(`, and `>(`. When one closes, its
+ *   raw inner text becomes a payload segment. The host keeps only an opaque
+ *   boundary placeholder. The inner commands then match the allow/deny lists
+ *   on their own. The scan re-scans payloads, so nesting yields independent
+ *   segments.
+ * - `${…}` masks its text. The scan restores it verbatim into the host
+ *   segment. The scan still descends into it. Substitutions inside a parameter
+ *   expansion are still extracted and balance-checked. This includes
+ *   substitutions inside a heredoc body opened within the expansion. Those
+ *   payloads go to the expansion's payload list.
+ * - `$((…))` masks the expression as one host word. It never balances as an
+ *   extraction delimiter. The scan extracts substitutions inside a closed
+ *   `$((…))` and balance-checks them, because the shell expands them there. An
+ *   unclosed `$((` or `$[` fails closed (`arithmetic`). bash refuses the
+ *   input. Masking the remainder to end of input could hide an unclosed `$(`
+ *   inside it. The scan only masks the interior of a bare `$[…]`. It never
+ *   looks for substitutions there. Bare `(`…`)` grouping (subshell groups,
+ *   array assignments) also stays host text. An unclosed one is never an
+ *   error. A stray `)` is never an error either. bash closes `case` patterns
+ *   with `)`. The scan tracks a bare `{` so that brace expansion, `@{1}`
+ *   revspecs, and `find -exec {}` placeholders balance instead of erroring.
+ * - Fail-closed rule: an error results when the scan opens one of the four
+ *   extraction delimiters and cannot close it. An unclosed arithmetic opener
+ *   (`$((`/`$[`), a `}` at depth 0 with no matching `{`, and a raw NUL byte
+ *   anywhere in the input are errors too. So is payload re-scanning deeper
+ *   than `MAX_PAYLOAD_SCAN_DEPTH`. A closer that does not match the open
+ *   region's kind is literal content. That matches the shell. The still-open
+ *   region then fails at end of input.
+ * - Heredocs: the scan masks the opener line through the terminator line as
+ *   one opaque host word. A heredoc stays a single segment however many lines
+ *   it spans. Lines end only at a line feed (LF). A carriage return (CR)
+ *   counts only as the CR of a CR-and-LF pair (CRLF) on the opener line. A
+ *   CR-only-separated opener does not validate a heredoc. bash reports such a
+ *   construct as unterminated. The scan matches body lines against the
+ *   delimiter with every CR removed. The msys/Cygwin read layer strips CR
+ *   before parsing. That layer is the reference shell on the Windows target.
+ *   The strip reaches every CR in the construct, the delimiter word and the
+ *   terminator line included. POSIX bash keeps every CR as ordinary content.
+ *   The two models can place the terminator on different lines. Either
+ *   direction of divergence is unsafe. An early close hands the remaining
+ *   body back to the scanner as live syntax. There it can open a new heredoc
+ *   that masks commands the other model executes. A late close masks them
+ *   outright. A CR anywhere in the region from the opener line through the
+ *   closing terminator line means the two layers do not read the same bytes.
+ *   The parser cannot verify that both models close at the same line. Such
+ *   heredocs fail closed for review. The parser does not guess which model
+ *   decides the boundary. It over-rejects even a uniformly-CRLF construct
+ *   whose models happen to agree. That is the accepted cost of never picking
+ *   a model. The scan parses only heredocs whose region has no CR. There both
+ *   models read byte-identical text. An unquoted-delimiter body is
+ *   expansion-active. A substitution opened inside it is extracted and must
+ *   balance before the terminator. A quoted or backslash-escaped delimiter
+ *   suppresses expansion entirely in the body. The shell does not expand
+ *   those. Such a body stays opaque and is never balance-checked. A body
+ *   carries no comments and is not tokenized outside an expansion region. A
+ *   `"` or `#` there is literal text. Inside an expansion region, quotes and
+ *   word-initial `#` comments follow the shell's rules there. A comment ends
+ *   at the newline, not at the region end. The scan walks the opener line's
+ *   remainder (the text after the delimiter word) for substitutions even when
+ *   the delimiter is quoted. Quoting suppresses expansion in the body only.
  *   `cat <<'EOF' $(cmd)` still runs `cmd`.
  */
 function scanShellSyntax(text: string): ScanOutcome {
@@ -346,24 +365,31 @@ function scanShellSyntax(text: string): ScanOutcome {
 		arithmeticPayloads: [],
 	}
 	const stack: RegionFrame[] = []
-	// Open parameter-expansion frames on `stack`: lets `innermostParam` return
-	// without a stack walk while no expansion is open.
+	// Counts the parameter-expansion frames open on `stack`. While this count
+	// is 0, `innermostParam` returns without walking the stack.
 	let paramFramesOpen = 0
-	// Bare `(` grouping (subshell groups, array assignments) stays host text:
-	// it is not one of the extraction/fail-closed delimiters, so an unclosed
-	// `(` is never an error. Depth is tracked only so a `)` that matches an
-	// open bare `(` is not reported as a stray closer.
+	// Counts bare `(` grouping (subshell groups, array assignments). Grouping
+	// stays host text. It is not one of the extraction/fail-closed delimiters.
+	// An unclosed `(` is never an error. A `)` is never an error either, with
+	// or without an opener. The counter only tracks the grouping depth. Both
+	// `)` cases reach the host.
 	let parenDepth = 0
-	// Index just past the most recent expansion or quote region the scan closed
-	// at host level (including `$((…))`/`$[…]`), or -1. The shell ends the
-	// expansion at such a closer but not the surrounding word, so a `#` sitting
-	// exactly there is word content, never a comment start.
+	// A bare `{` (brace expansion, `@{1}` revspec, `find -exec {}` placeholder)
+	// also stays host text. The scan tracks the depth so that a `}` matching
+	// an open bare `{` is not reported as a stray closer. The balance tracking
+	// is deliberately coarse. This code has no shell-context reading of `{`,
+	// only a pair.
+	let braceDepth = 0
+	// Index just past the most recent expansion or quote region that the scan
+	// closed at host level, or -1. This includes `$((…))`/`$[…]`. The shell
+	// ends the expansion at such a closer but not the surrounding word. A `#`
+	// directly there is word content, never a comment start.
 	let expansionCloseEnd = -1
-	// Index just past the most recent `\c` escape pair the scan emitted at host
-	// level, or -1. To the shell the escaped character is an ordinary word
-	// character, so the word continues past the pair: a `#` sitting exactly at
-	// this index is word content even when the escaped character is whitespace
-	// or a metacharacter in the raw text.
+	// Index just past the most recent `\c` escape pair that the scan emitted
+	// at host level, or -1. To the shell, the escaped character is an ordinary
+	// word character. The word continues past the pair. A `#` directly at this
+	// index is word content, even when the escaped character is whitespace or
+	// a metacharacter in the raw text.
 	let escapedWordCharEnd = -1
 
 	const mark = (name: string): string => `${NUL}${name}${NUL}`
@@ -374,10 +400,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 		message: unterminatedQuoteMessage(kind, openIndex, text),
 	})
 
-	// Reject a raw NUL before any masking: NUL is this scan's placeholder
-	// sentinel, so an input containing one could degrade a masked placeholder
-	// into inert literal text and hide a substitution from the lists. Rejecting
-	// at the scan head also covers `findUnterminatedQuote`, which shares it.
+	// Reject a raw NUL before any masking. NUL is this scan's placeholder
+	// sentinel. An input containing one could degrade a masked placeholder
+	// into inert literal text. That would hide a substitution from the lists.
+	// Rejecting at the scan head also covers `findUnterminatedQuote`, which
+	// shares this scan.
 	const nulIndex = text.indexOf(NUL)
 	if (nulIndex !== -1) {
 		outcome.error = errorAt("nul-byte", nulIndex)
@@ -442,10 +469,10 @@ function scanShellSyntax(text: string): ScanOutcome {
 	}
 
 	/**
-	 * The innermost parameter-expansion frame on `frames`, if any. `paramOpen`
-	 * is the caller's count of open parameter-expansion frames: when it is 0
-	 * the scan returns without walking the stack, so deep non-expansion
-	 * nesting does not pay a stack scan per frame close.
+	 * Return the innermost parameter-expansion frame on `frames`, if any.
+	 * `paramOpen` is the caller's count of open parameter-expansion frames.
+	 * When it is 0, this function returns without walking the stack. Deep
+	 * non-expansion nesting then pays no stack scan per frame close.
 	 */
 	const innermostParam = (frames: RegionFrame[], paramOpen: number): RegionFrame | undefined => {
 		if (paramOpen === 0) {
@@ -460,10 +487,10 @@ function scanShellSyntax(text: string): ScanOutcome {
 	}
 
 	/**
-	 * Consume an entire heredoc at `i` (opener line, body, terminator). The
-	 * whole construct masks to one host word. Returns the index just past the
-	 * terminator text, or an error for an unterminated heredoc or an unbalanced
-	 * delimiter inside an expansion-active body.
+	 * Consume an entire heredoc at `i`: the opener line, the body, and the
+	 * terminator. The whole construct masks to one host word. Return the index
+	 * just past the terminator text. Return an error for an unterminated
+	 * heredoc or for an unbalanced delimiter inside an expansion-active body.
 	 */
 	const skipHeredoc = (i: number, frames: RegionFrame[]): { end: number } | { error: UnterminatedQuote } => {
 		const start = i
@@ -477,23 +504,25 @@ function scanShellSyntax(text: string): ScanOutcome {
 		}
 		const { delimiter, endIndex, quoted, wordPresent, malformed } = parseHeredocDelimiter(text, i)
 		if (malformed) {
-			// The delimiter word still has an open quote region at end of input.
-			// bash reads it as a multi-line word that can never match a body line,
-			// while the opener line's tail keeps executing as ordinary syntax --
-			// the body and everything after it are unaccountable, so fail closed.
+			// The delimiter word still has an open quote region at end of
+			// input. bash reads it as a multi-line word that can never match a
+			// body line. The opener line's tail keeps executing as ordinary
+			// syntax. The body and everything after it are unaccountable, so
+			// fail closed.
 			return { error: errorAt("heredoc", start) }
 		}
 		const payloads: string[] = []
-		// The only place a heredoc mask is emitted: every non-error outcome of
-		// skipHeredoc returns through here, so every masked span carries the same
-		// check. A CR byte inside [start, end) leaves the two read layers reading
-		// different bytes -- msys strips each CR before parsing, POSIX keeps it
-		// as ordinary content -- so a close one layer sees may not be the close
-		// the other sees, and a close only one layer can see would hand that
-		// model's remainder back to the scanner as live syntax. The parser cannot
-		// verify both layers close the construct the same way, so the heredoc
-		// fails closed rather than picking a model; a uniformly-CRLF construct
-		// whose layers happen to agree is over-rejected as the accepted cost.
+		// This is the only place a heredoc mask is emitted. Every non-error
+		// outcome of skipHeredoc returns through here, so every masked span
+		// carries the same check. A CR byte inside [start, end) leaves the two
+		// read layers reading different bytes. msys strips each CR before
+		// parsing, and POSIX keeps it as ordinary content. A close that one
+		// layer sees may not be the close the other sees. A close that only one
+		// layer sees would hand that model's remainder back to the scanner as
+		// live syntax. The parser cannot verify that both layers close the
+		// construct the same way. The heredoc fails closed instead of picking a
+		// model. A uniformly-CRLF construct whose layers happen to agree is
+		// over-rejected. That is the accepted cost.
 		const emitMask = (end: number): { end: number } | { error: UnterminatedQuote } => {
 			const region = text.slice(start, end)
 			if (region.includes("\r")) {
@@ -501,26 +530,27 @@ function scanShellSyntax(text: string): ScanOutcome {
 			}
 			const id = outcome.heredocs.push(region) - 1
 			outcome.heredocPayloads[id] = payloads
-			// Inside an expansion region the host is masked wholesale anyway; only
-			// top-level heredocs need a placeholder in the host text.
+			// Inside an expansion region, the host is masked wholesale anyway.
+			// Only top-level heredocs need a placeholder in the host text.
 			if (frames.length === 0) {
 				outcome.host += mark(`H${id}`)
 			}
 			return { end }
 		}
-		// The opener line's remainder after the delimiter is expanded by the shell
-		// even when the delimiter is quoted (quoting suppresses expansion in the
-		// body only), so walk it unconditionally; an error there fails the whole
-		// heredoc closed like a body error does.
+		// The shell expands the opener line's remainder after the delimiter,
+		// even when the delimiter is quoted. Quoting suppresses expansion in
+		// the body only. Walk the remainder unconditionally. An error there
+		// fails the whole heredoc closed, like a body error does.
 		const remainderEnd = endOfLine(endIndex)
 		const remainderError = walkBodyPayloads(endIndex, remainderEnd, payloads, 0)
 		if (remainderError) {
 			return { error: remainderError }
 		}
-		// The opener line must end at LF so the body starts on the next line.
-		// A CR is valid only as the CR of a CRLF pair: a lone CR is not a bash
-		// line terminator, and accepting one as the opener's end would validate
-		// CR-separated input the shell refuses as an unterminated heredoc.
+		// The opener line must end at LF so that the body starts on the next
+		// line. A CR is valid only as the CR of a CRLF pair. A lone CR is not a
+		// bash line terminator. Accepting one as the opener's end would
+		// validate CR-separated input that the shell refuses as an unterminated
+		// heredoc.
 		i = remainderEnd
 		if (text[i] === "\r") {
 			i++
@@ -533,32 +563,34 @@ function scanShellSyntax(text: string): ScanOutcome {
 		if (wordPresent) {
 			let found = false
 			const bodyStart = i
-			// Raw scan index at the terminator match: the mask-emission guard
-			// tests the region [start, rawIndex), before the back-step
-			// adjustments at the match shift the scan index off the terminator
-			// line's line ending.
+			// Raw scan index at the terminator match. The mask-emission guard
+			// tests the region [start, rawIndex). Use this index, not the scan
+			// index: at the match, the back-step adjustments shift the scan
+			// index off the terminator line's line ending.
 			let rawIndex = bodyStart
-			// The terminator search emulates the shell's read layer: a line
-			// runs to LF (or end of input). POSIX bash keeps every CR as
-			// ordinary content, while the msys/Cygwin read layer (the reference
-			// shell on the Windows target) strips every CR before parsing, so
-			// `EO<CR>F` arrives as the terminator `EOF` and closes the heredoc
-			// early there. The strip also reaches the delimiter word: a CRLF
-			// opener line leaves POSIX reading the delimiter `EOF<CR>` where
-			// msys reads `EOF`. A CR from the opener line through the closing
-			// terminator line leaves the two layers reading different bytes, so
-			// the close cannot be verified model-independent; every masked span
-			// is tested against this region by the mask-emission guard above, so
-			// such heredocs fail closed for review, over-rejecting even agreeing
-			// uniformly-CRLF constructs as the accepted cost. A CR-free region is
-			// byte-identical under both models, so it parses. Bash joins a
-			// backslash-newline pair before matching the delimiter, so an
-			// unquoted logical line whose stripped content ends in an odd
-			// number of backslashes flows into the next physical line. A
-			// quoted delimiter makes the backslash literal, so no joining
-			// happens (the CR strip is read-layer and unaffected by quoting).
-			// <<- strips leading tabs from the fully joined line afterwards,
-			// never from a physical line on its own.
+			// The terminator search emulates the shell's read layer. A line
+			// runs to LF, or to end of input. POSIX bash keeps every CR as
+			// ordinary content. The msys/Cygwin read layer strips every CR
+			// before parsing. That layer is the reference shell on the Windows
+			// target. `EO<CR>F` therefore arrives as the terminator `EOF` and
+			// closes the heredoc early there. The strip also reaches the
+			// delimiter word. After a CRLF opener line, POSIX reads the
+			// delimiter `EOF<CR>` where msys reads `EOF`. A CR from the opener
+			// line through the closing terminator line leaves the two layers
+			// reading different bytes. The close then cannot be verified in a
+			// model-independent way. The mask-emission guard above tests every
+			// masked span against this region, so such heredocs fail closed for
+			// review. This over-rejects even a uniformly-CRLF construct whose
+			// models happen to agree. That is the accepted cost. A CR-free
+			// region is byte-identical under both models, so it parses. bash
+			// joins a backslash-newline pair before it matches the delimiter.
+			// An unquoted logical line whose stripped content ends in an odd
+			// number of backslashes therefore flows into the next physical
+			// line. A quoted delimiter makes the backslash literal, so no
+			// joining happens. The CR strip happens in the read layer and
+			// quoting does not affect it. `<<-` strips leading tabs from the
+			// fully joined line afterwards. It never strips from a physical
+			// line on its own.
 			search: while (i < text.length) {
 				const groupStart = i
 				let candidate = ""
@@ -575,21 +607,23 @@ function scanShellSyntax(text: string): ScanOutcome {
 						continue
 					}
 					candidate += logicalLine
-					// <<- strips leading tabs from the fully joined logical line,
-					// after continuation joining and only once -- a tab that opens
-					// a continuation line stays inside the candidate, so an
-					// early-terminator match cannot hide live commands.
+					// `<<-` strips leading tabs from the fully joined logical
+					// line. The strip runs after continuation joining, and only
+					// once. A tab that opens a continuation line stays inside
+					// the candidate. An early-terminator match therefore cannot
+					// hide live commands.
 					const candidateText = stripTabs ? candidate.replace(/^\t+/, "") : candidate
 					if (candidateText === delimiter) {
 						rawIndex = i
 						found = true
 						bodyEnd = groupStart
-						// The match is on the CR-stripped logical line, so the
-						// raw line-ending byte the scan would have stopped at is
-						// back before the strip point: over the CR of a CRLF-
-						// terminated terminator line, and over a lone CR that is
-						// the whole raw terminator text (its stripped-empty line
-						// matches an empty delimiter right after a line break).
+						// The match is on the CR-stripped logical line. The raw
+						// line-ending byte that the scan would have stopped at
+						// sits back before the strip point. It is the CR of a
+						// CRLF-terminated terminator line. It is also a lone CR
+						// that is the whole raw terminator text: that line
+						// strips to empty and matches an empty delimiter right
+						// after a line break.
 						if (i > 0 && text[i] === "\n" && text[i - 1] === "\r") {
 							i--
 						}
@@ -605,7 +639,7 @@ function scanShellSyntax(text: string): ScanOutcome {
 				}
 			}
 			if (!found) {
-				// The body never ends: nothing after the opener can be trusted.
+				// The body never ends. Nothing after the opener can be trusted.
 				return { error: errorAt("heredoc", start) }
 			}
 			if (!quoted) {
@@ -615,46 +649,48 @@ function scanShellSyntax(text: string): ScanOutcome {
 				}
 			}
 			if (frames.length > 0) {
-				// Inside an expansion no H placeholder is emitted, so without this
-				// routing the collected payloads would never reach a re-scan. Hand
-				// them to the innermost parameter-expansion ancestor exactly as a
-				// directly nested substitution close does. A heredoc opened inside
-				// $(…)/backtick/<( has no such ancestor: the enclosing substitution's
-				// payload is re-scanned whole and recovers them there.
+				// Inside an expansion, no H placeholder is emitted. Without this
+				// routing, the collected payloads would never reach a re-scan.
+				// Hand them to the innermost parameter-expansion ancestor,
+				// exactly as a directly nested substitution close does. A
+				// heredoc opened inside $(…)/backtick/<( has no such ancestor.
+				// The enclosing substitution's payload is re-scanned whole and
+				// recovers them there.
 				innermostParam(frames, paramFramesOpen)?.payloads?.push(...payloads)
 			}
 			return emitMask(rawIndex)
 		}
-		// No delimiter token at all (a bare `<<`, or `<<` followed only by
-		// blanks, before end of line): bash rejects such input with a syntax
-		// error and never executes it, so the opener masks through end of input
-		// as one opaque word over a never-runnable construct. The mask is sound
-		// only while both read layers see the same bytes, so the region test at
-		// the mask-emission guard above fails the mask closed when a CR enters
-		// the span -- over-rejecting the CR-touched shapes whose layers happen to
-		// agree, as the accepted cost of keeping one region rule.
+		// No delimiter token appeared at all: a bare `<<`, or `<<` followed
+		// only by blanks, before end of line. bash rejects such input with a
+		// syntax error and never executes it. The opener therefore masks
+		// through end of input as one opaque word, over a construct that can
+		// never run. The mask is sound only while both read layers see the
+		// same bytes. The region test at the mask-emission guard above fails
+		// the mask closed when a CR enters the span. This over-rejects the
+		// CR-touched shapes whose layers happen to agree. That is the accepted
+		// cost of keeping one region rule.
 		return emitMask(text.length)
 	}
 
 	/**
-	 * Walk a heredoc body region `[start, end)` collecting command
-	 * substitutions the shell would expand there.
+	 * Walk the heredoc body region `[start, end)`. Collect the command
+	 * substitutions that the shell would expand there.
 	 *
-	 * Outside an expansion region this walk tracks only the expansion
-	 * delimiters and backslash escapes: a heredoc body is not tokenized, so a
+	 * Outside an expansion region, this walk tracks only the expansion
+	 * delimiters and backslash escapes. A heredoc body is not tokenized, so a
 	 * `"` or `#` in the body is literal text. Inside an expansion region the
-	 * shell does tokenize, so a quote there opens a region exactly as the main
-	 * scan treats it — the region masks the frame's closer and group tests, and
-	 * a region still open at the end of the body fails closed like any other
-	 * unclosed delimiter — while a word-initial `#` begins a comment that the
-	 * shell skips to end of line. A closer with no opener inside the body is
-	 * literal data (the shell prints it); a delimiter still open when the
-	 * terminator line is reached is a structural error — the shell would never
+	 * shell does tokenize. A quote there opens a region exactly as the main
+	 * scan treats it. The region masks the frame's closer and the group tests.
+	 * A region still open at the end of the body fails closed, like any other
+	 * unclosed delimiter. A word-initial `#` begins a comment, and the shell
+	 * skips it to end of line. A closer with no opener inside the body is
+	 * literal data, and the shell prints it. A delimiter still open when the
+	 * terminator line is reached is a structural error. The shell would never
 	 * finish expanding the body, so whatever follows it is unaccountable.
 	 *
-	 * `depth` bounds the recursion through nested `$((…))` interiors; beyond
-	 * `MAX_PAYLOAD_SCAN_DEPTH` the region fails closed instead of recursing into
-	 * generated input.
+	 * `depth` bounds the recursion through nested `$((…))` interiors. Beyond
+	 * `MAX_PAYLOAD_SCAN_DEPTH`, the region fails closed instead of recursing
+	 * into generated input.
 	 */
 	const walkBodyPayloads = (
 		start: number,
@@ -676,39 +712,43 @@ function scanShellSyntax(text: string): ScanOutcome {
 					i += 2
 					continue
 				}
-				// A `#` at the start of a word inside a `$(…)`/`<(` frame begins a
-				// comment the shell skips to end of line (body regions span lines,
-				// so the comment ends at the newline, not at the frame's end): a
-				// `)` riding inside the comment never closes the frame, and the
-				// continuation lines stay inside the same substitution. Quote and
-				// backtick frames keep `#` literal — their regions reach this test
-				// too — and so do parameter expansions (`${#var}` is the length
-				// operator), so only substitution frames take the comment. The
-				// word-boundary set is the top-level comment rule's whitespace
-				// plus the metacharacters that end a word: a missed comment lets
-				// its `)` slice the payload, so the boundary must be exact.
+				// A `#` at the start of a word inside a `$(…)`/`<(` frame
+				// begins a comment. The shell skips the comment to end of line.
+				// Body regions span lines, so the comment ends at the newline,
+				// not at the frame's end. A `)` inside the comment never closes
+				// the frame, and the continuation lines stay inside the same
+				// substitution. Quote and backtick frames keep `#` literal.
+				// Their regions reach this test too. Parameter expansions also
+				// keep it literal: `${#var}` is the length operator. Only
+				// substitution frames take the comment. The word-boundary set
+				// is the top-level comment rule's whitespace plus the
+				// metacharacters that end a word. A missed comment lets its `)`
+				// slice the payload, so the boundary must be exact.
 				if (
 					char === "#" &&
 					(top.kind === "command-substitution" || top.kind === "process-substitution") &&
 					/[\s;&()|<>]/.test(text[i - 1])
 				) {
-					// Clamp at the region end: a comment running past it leaves the
-					// frame open, and the still-open frame fails closed.
+					// Clamp at the region end. A comment that runs past it
+					// leaves the frame open, and the still-open frame fails
+					// closed.
 					i = Math.min(endOfLine(i), end)
 					continue
 				}
 				if (char === top.closer) {
 					if (top.groupDepth > 0) {
-						// This closer matches an inner grouping paren opened inside
-						// the region, not the region's own opener.
+						// This closer matches an inner grouping paren that
+						// opened inside the region. It does not match the
+						// region's own opener.
 						top.groupDepth--
 						i++
 						continue
 					}
 					const closed = frames.pop() as RegionFrame
 					if (QUOTE_FRAME_KINDS.includes(closed.kind)) {
-						// Quote regions are opaque: nothing inside them is extracted,
-						// and the enclosing frame resumes after the closing quote.
+						// Quote regions are opaque. Nothing inside them is
+						// extracted. The enclosing frame resumes after the
+						// closing quote.
 						i++
 						continue
 					}
@@ -720,10 +760,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 							innermostParam(frames, localParamOpen)?.payloads?.push(...(closed.payloads ?? []))
 						}
 					} else {
-						// Slice the inner text only where a consumer exists: a close
-						// nested with no parameter-expansion ancestor is recovered
-						// when the enclosing payload is re-scanned, so slicing every
-						// close eagerly would cost O(n²) on adversarial nesting.
+						// Slice the inner text only where a consumer exists. A
+						// nested close with no parameter-expansion ancestor is
+						// recovered when the enclosing payload is re-scanned.
+						// Slicing every close eagerly would cost O(n²) on
+						// adversarial nesting.
 						const paramAncestor = innermostParam(frames, localParamOpen)
 						if (frames.length === 0 || paramAncestor) {
 							const inner = text.slice(closed.contentStart, i).trim()
@@ -737,26 +778,28 @@ function scanShellSyntax(text: string): ScanOutcome {
 					i++
 					continue
 				}
-				// A quote frame is opaque except for its own closer and escapes; a
-				// backtick region is opaque except for its closer (backticks do not
-				// nest). Only expansion frames descend for nested constructs.
+				// A quote frame is opaque except for its own closer and its
+				// escapes. A backtick region is opaque except for its closer.
+				// Backticks do not nest. Only expansion frames descend for
+				// nested constructs.
 				if (QUOTE_FRAME_KINDS.includes(top.kind) || top.kind === "backtick") {
 					i++
 					continue
 				}
-				// A bare `(` inside a substitution region opens a subshell group the
-				// shell balances independently of the region's closer; only its
-				// depth matters here, so the group's `)` cannot slice the payload.
+				// A bare `(` inside a substitution region opens a subshell
+				// group. The shell balances that group independently of the
+				// region's closer. Only its depth matters here, so the group's
+				// `)` cannot slice the payload.
 				if ((top.kind === "command-substitution" || top.kind === "process-substitution") && char === "(") {
 					top.groupDepth++
 					i++
 					continue
 				}
-				// Inside an expansion frame a quote is shell syntax, not body text:
-				// the region it opens masks everything up to its closer, so a `)`
-				// or `(` inside quotes is neither a closer nor a group-opener. An
-				// unclosed region fails at the end of the walk like any other
-				// unclosed frame.
+				// Inside an expansion frame, a quote is shell syntax, not body
+				// text. The region it opens masks everything up to its closer.
+				// A `)` or `(` inside quotes is therefore neither a closer nor
+				// a group-opener. An unclosed region fails at the end of the
+				// walk, like any other unclosed frame.
 				const nestedQuote = openQuote(i)
 				if (nestedQuote) {
 					frames.push(nestedQuote)
@@ -785,12 +828,12 @@ function scanShellSyntax(text: string): ScanOutcome {
 				if (text[i + 1] === "(") {
 					if (text[i + 2] === "(") {
 						const arith = skipArithmetic(i)
-						// An unclosed opener fails closed: the shell refuses the
+						// An unclosed opener fails closed. The shell refuses the
 						// input, and masking the rest of the body would hide it.
 						if (!arith.closed) {
 							return errorAt("arithmetic", i)
 						}
-						// $((…)) is expansion-active: the shell performs the
+						// $((…)) is expansion-active. The shell performs the
 						// substitutions inside it, so they must balance and be
 						// collected.
 						const arithError = walkBodyPayloads(i + 3, arith.end - 2, collect, depth + 1)
@@ -828,12 +871,12 @@ function scanShellSyntax(text: string): ScanOutcome {
 				}
 				if (text[i + 1] === "[") {
 					const arith = skipArithmetic(i)
-					// An unclosed opener fails closed: the shell refuses the
+					// An unclosed opener fails closed. The shell refuses the
 					// input, and masking the rest of the body would hide it.
 					if (!arith.closed) {
 						return errorAt("arithmetic", i)
 					}
-					// $[…] is expansion-active exactly like $((…)): the shell
+					// $[…] is expansion-active, exactly like $((…)). The shell
 					// performs the substitutions inside it, so they must balance
 					// and be collected.
 					const arithError = walkBodyPayloads(i + 2, arith.end - 1, collect, depth + 1)
@@ -862,8 +905,8 @@ function scanShellSyntax(text: string): ScanOutcome {
 			i++
 		}
 		if (frames.length > 0) {
-			// Report the outermost unclosed delimiter: the first construct the
-			// shell could never finish expanding.
+			// Report the outermost unclosed delimiter. It is the first construct
+			// the shell could never finish expanding.
 			const outermost = frames[0]
 			return errorAt(outermost.kind, outermost.openIndex)
 		}
@@ -872,16 +915,16 @@ function scanShellSyntax(text: string): ScanOutcome {
 
 	/**
 	 * Consume a `$((…))` or `$[…]` arithmetic expression. `closed` reports
-	 * whether the closing delimiter was found; callers fail closed when it is
-	 * missing (bash refuses an unclosed opener), and only a closed
-	 * expression's interior is expansion-walked.
+	 * whether the scan found the closing delimiter. Callers fail closed when
+	 * it is missing, because bash refuses an unclosed opener. The scan walks
+	 * only a closed expression's interior for expansions.
 	 */
 	const skipArithmetic = (i: number): { end: number; closed: boolean } => {
 		if (text[i + 1] === "[") {
 			const close = text.indexOf("]", i + 2)
 			return close === -1 ? { end: text.length, closed: false } : { end: close + 1, closed: true }
 		}
-		// $(( … )): balance plain parens; an unbalanced scan runs to end of input.
+		// $(( … )) balances plain parens. An unbalanced scan runs to end of input.
 		let depth = 2 // the two opening parens
 		let j = i + 3
 		while (j < text.length && depth > 0) {
@@ -949,9 +992,10 @@ function scanShellSyntax(text: string): ScanOutcome {
 			}
 			if (char === top.closer) {
 				if (top.groupDepth > 0) {
-					// This closer matches an inner grouping paren opened inside the
-					// region, not the region's own opener: the subshell group
-					// balances before the substitution frame does.
+					// This closer matches an inner grouping paren that opened
+					// inside the region. It does not match the region's own
+					// opener. The subshell group balances before the
+					// substitution frame does.
 					top.groupDepth--
 					i++
 					continue
@@ -962,8 +1006,9 @@ function scanShellSyntax(text: string): ScanOutcome {
 					paramFramesOpen--
 				}
 				if (QUOTE_FRAME_KINDS.includes(closed.kind)) {
-					// Quote regions restore verbatim; at the top level they mask to a
-					// single opaque word so their contents can never tokenize as syntax.
+					// Quote regions restore verbatim. At the top level they mask
+					// to a single opaque word, so their contents can never
+					// tokenize as syntax.
 					if (stack.length === 0) {
 						const id = outcome.quotes.push(text.slice(closed.openIndex, closeEnd)) - 1
 						outcome.host += mark(`Q${id}`)
@@ -973,8 +1018,8 @@ function scanShellSyntax(text: string): ScanOutcome {
 				}
 				if (stack.length === 0) {
 					if (closed.kind === "parameter-expansion") {
-						// The expansion's text stays verbatim in the host segment; its
-						// inner substitutions are extracted independently.
+						// The expansion's text stays verbatim in the host segment.
+						// Its inner substitutions are extracted independently.
 						const id = outcome.params.push(text.slice(closed.openIndex, closeEnd)) - 1
 						outcome.paramPayloads[id] = closed.payloads ?? []
 						outcome.host += mark(`P${id}`)
@@ -984,11 +1029,12 @@ function scanShellSyntax(text: string): ScanOutcome {
 					}
 					expansionCloseEnd = closeEnd
 				} else {
-					// Nested inside an expansion region: a substitution inside a
-					// parameter expansion belongs to that expansion's payload list;
-					// anything deeper is recovered when the enclosing payload is
-					// re-scanned, so its inner text is sliced only where a consumer
-					// exists (otherwise deep nesting would cost O(n²)).
+					// The frame is nested inside an expansion region. A
+					// substitution inside a parameter expansion belongs to that
+					// expansion's payload list. Anything deeper is recovered
+					// when the enclosing payload is re-scanned. Slice its inner
+					// text only where a consumer exists. Otherwise deep nesting
+					// would cost O(n²).
 					const paramAncestor = innermostParam(stack, paramFramesOpen)
 					if (closed.kind === "parameter-expansion") {
 						paramAncestor?.payloads?.push(...(closed.payloads ?? []))
@@ -999,24 +1045,27 @@ function scanShellSyntax(text: string): ScanOutcome {
 				i = closeEnd
 				continue
 			}
-			// A quote frame is opaque except for its own closer and escapes; a
-			// backtick region is opaque except for its closer (backticks do not
-			// nest). Only expansion frames descend for nested constructs.
+			// A quote frame is opaque except for its own closer and its
+			// escapes. A backtick region is opaque except for its closer.
+			// Backticks do not nest. Only expansion frames descend for nested
+			// constructs.
 			if (QUOTE_FRAME_KINDS.includes(top.kind) || top.kind === "backtick") {
 				i++
 				continue
 			}
-			// A bare `(` inside a substitution region opens a subshell group the
-			// shell balances independently of the region's closer; tracking its
-			// depth keeps the group's `)` from popping the substitution frame.
-			// `(`/`)` inside a parameter expansion stay literal word characters.
+			// A bare `(` inside a substitution region opens a subshell group.
+			// The shell balances that group independently of the region's
+			// closer. Tracking its depth keeps the group's `)` from popping the
+			// substitution frame. `(`/`)` inside a parameter expansion stay
+			// literal word characters.
 			if ((top.kind === "command-substitution" || top.kind === "process-substitution") && char === "(") {
 				top.groupDepth++
 				i++
 				continue
 			}
-			// Inside an expansion region: balance nested constructs, never emit host
-			// text (the whole region is replaced by one placeholder when it closes).
+			// Inside an expansion region, balance nested constructs and never
+			// emit host text. When the region closes, it is replaced by one
+			// placeholder.
 			const nestedQuote = openQuote(i)
 			if (nestedQuote) {
 				stack.push(nestedQuote)
@@ -1027,9 +1076,10 @@ function scanShellSyntax(text: string): ScanOutcome {
 				if (text[i + 1] === "(") {
 					if (text[i + 2] === "(") {
 						const arith = skipArithmetic(i)
-						// Fail closed here rather than letting the outer region
-						// error at end of input: that would name the wrong opener
-						// and silently drop the arithmetic's interior payloads.
+						// Fail closed here instead of letting the outer region
+						// error at end of input. That would name the wrong
+						// opener and silently drop the arithmetic's interior
+						// payloads.
 						if (!arith.closed) {
 							outcome.error = errorAt("arithmetic", i)
 							return outcome
@@ -1040,9 +1090,9 @@ function scanShellSyntax(text: string): ScanOutcome {
 							outcome.error = arithError
 							return outcome
 						}
-						// The enclosing region is masked wholesale, so route the
-						// substitutions to the innermost expansion ancestor like a
-						// nested close does.
+						// The enclosing region is masked wholesale. Route the
+						// substitutions to the innermost expansion ancestor, like
+						// a nested close does.
 						innermostParam(stack, paramFramesOpen)?.payloads?.push(...arithPayloads)
 						i = arith.end
 						continue
@@ -1102,7 +1152,14 @@ function scanShellSyntax(text: string): ScanOutcome {
 				i += 2
 				continue
 			}
-			if (char === "<" && text[i + 1] === "<" && text[i + 2] !== "<") {
+			// Inside a parameter expansion, bash reads `<<` as an arithmetic
+			// shift, or as literal word text. It never reads it as a heredoc
+			// opener. There, the scan consumes `<<` as an ordinary character.
+			// Only command-substitution and process-substitution frames reach
+			// the heredoc scan. The shell tokenizes those as command contexts,
+			// and a heredoc opened there is real. Quote and backtick frames are
+			// opaque before this point.
+			if (char === "<" && text[i + 1] === "<" && text[i + 2] !== "<" && top.kind !== "parameter-expansion") {
 				const result = skipHeredoc(i, stack)
 				if ("error" in result) {
 					outcome.error = result.error
@@ -1115,22 +1172,23 @@ function scanShellSyntax(text: string): ScanOutcome {
 			continue
 		}
 
-		// Nothing is open: full scanning with host emission.
+		// Nothing is open. Scan fully and emit host text.
 		if (char === "\\") {
-			// A backslash escapes the next character; a quote after it is literal.
+			// A backslash escapes the next character. A quote after it is
+			// literal.
 			outcome.host += text.slice(i, i + 2)
 			escapedWordCharEnd = i + 2
 			i += 2
 			continue
 		}
 		if (char === "#" && i === expansionCloseEnd) {
-			// A `#` riding directly against the closer of an expansion or quote
-			// region continues the surrounding word: the shell ends the expansion
-			// at its closer but not the word, and starts a comment only at a word
-			// start. The tokenizer comments at any unquoted `#`, so the character
-			// goes through tokenization as an opaque placeholder (like the
-			// mid-word case below) and expands back verbatim, keeping the rest of
-			// the line parseable instead of dropping it as comment text.
+			// A `#` directly after the closer of an expansion or quote region
+			// continues the surrounding word. The shell ends the expansion at
+			// its closer but not the word. It starts a comment only at a word
+			// start. The tokenizer starts a comment at any unquoted `#`. Send
+			// the character through tokenization as an opaque placeholder, as
+			// the mid-word case below does. It expands back verbatim. The rest
+			// of the line stays parseable instead of dropping as comment text.
 			const id = outcome.variables.push("#") - 1
 			outcome.host += mark(`V${id}`)
 			i++
@@ -1138,28 +1196,28 @@ function scanShellSyntax(text: string): ScanOutcome {
 		}
 		if (char === "#" && (i === 0 || (/\s/.test(text[i - 1]) && i !== escapedWordCharEnd))) {
 			// Comment: pass the rest of the line through untouched. Quotes and
-			// delimiters inside a comment are not shell syntax; shell-quote drops
-			// the comment text when tokenizing. A `#` at the end of a `\c` escape
-			// pair is excluded even when the escaped character is whitespace: the
-			// escape makes it word content, so this `#` continues the word and the
-			// masking branch below handles it.
+			// delimiters inside a comment are not shell syntax. shell-quote drops
+			// the comment text when it tokenizes. This branch also excludes a `#`
+			// at the end of a `\c` escape pair, even when the escaped character
+			// is whitespace. The escape makes it word content, so that `#`
+			// continues the word and the masking branch below handles it.
 			const end = endOfLine(i)
 			outcome.host += text.slice(i, end)
 			i = end
 			continue
 		}
 		if (char === "#" && (!/[;&()|<>]/.test(text[i - 1]) || i === escapedWordCharEnd)) {
-			// A `#` inside a word is an ordinary character to the shell: a
+			// A `#` inside a word is an ordinary character to the shell. A
 			// comment starts only at a word start. The tokenizer starts a comment
-			// at any `#`, so a mid-word one goes through tokenization as an
-			// opaque placeholder and expands back verbatim, instead of dropping
-			// the rest of the line including a real separator riding after it.
-			// The character right after a `\c` escape pair is also word interior
-			// — an escaped character is a literal word character to the shell —
-			// so a `#` at that position rides the placeholder channel even when
+			// at any `#`. Send a mid-word `#` through tokenization as an opaque
+			// placeholder so it expands back verbatim. Otherwise it would drop
+			// the rest of the line, including a real separator after it. The
+			// character right after a `\c` escape pair is also word interior. An
+			// escaped character is a literal word character to the shell. A `#`
+			// at that position therefore uses the placeholder channel, even when
 			// the raw character before it is whitespace or a metacharacter. What
-			// reaches the tokenizer unmasked sits at a real word start (index 0,
-			// after whitespace, or after a bare metacharacter), where the shell
+			// reaches the tokenizer unmasked sits at a real word start: index 0,
+			// after whitespace, or after a bare metacharacter. There the shell
 			// starts a comment too.
 			const id = outcome.variables.push("#") - 1
 			outcome.host += mark(`V${id}`)
@@ -1167,8 +1225,8 @@ function scanShellSyntax(text: string): ScanOutcome {
 			continue
 		}
 		if (char === "<" && text[i + 1] === "<" && text[i + 2] === "<") {
-			// Herestring (<<<): single-line stdin redirect with no body or
-			// terminator; the word after it is an ordinary shell word.
+			// Herestring (<<<): a single-line stdin redirect with no body and no
+			// terminator. The word after it is an ordinary shell word.
 			outcome.host += "<<<"
 			i += 3
 			continue
@@ -1196,9 +1254,10 @@ function scanShellSyntax(text: string): ScanOutcome {
 			continue
 		}
 		if (char === "(") {
-			// Bare grouping/array-assignment paren: host text, never extracted,
-			// never an error (unclosed or not). The depth counter exists only so
-			// a matching `)` is not misread as a stray closer.
+			// A bare grouping or array-assignment paren is host text. It is
+			// never extracted, and it is never an error, closed or not. The
+			// depth counter exists only so that a matching `)` is not read as a
+			// stray closer.
 			parenDepth++
 			outcome.host += char
 			i++
@@ -1210,12 +1269,33 @@ function scanShellSyntax(text: string): ScanOutcome {
 			i++
 			continue
 		}
-		if (char === ")" || char === "}") {
-			// A closer at depth 0 with no opener: the shell would refuse this
-			// input, so fail closed instead of approving a partial decomposition.
+		if (char === "{") {
+			// A bare brace (brace expansion, `@{1}` revspec, `find -exec {}`
+			// placeholder) is host text. It is never extracted, and it is never
+			// an error. The depth counter exists only so that a matching `}` is
+			// not read as a stray closer.
+			braceDepth++
+			outcome.host += char
+			i++
+			continue
+		}
+		if (char === "}" && braceDepth > 0) {
+			braceDepth--
+			outcome.host += char
+			i++
+			continue
+		}
+		if (char === "}") {
+			// A `}` at depth 0 with no matching `{` stays fail-closed. The
+			// parser cannot tell a literal brace word from a decomposition whose
+			// opener it lost. An unaccountable closer therefore costs a prompt.
+			// Rejecting a literal `}` argument is the accepted cost.
 			outcome.error = errorAt("stray-closer", i)
 			return outcome
 		}
+		// A `)` at depth 0 is host text. bash closes `case` patterns with `)`.
+		// With the frame stack empty, a closer cannot hide a substitution: any
+		// `$(…)` after it is still extracted and allowlist-checked.
 		if (char === "`") {
 			stack.push({
 				kind: "backtick",
@@ -1239,15 +1319,15 @@ function scanShellSyntax(text: string): ScanOutcome {
 			if (text[i + 1] === "(") {
 				if (text[i + 2] === "(") {
 					const arith = skipArithmetic(i)
-					// An unclosed opener fails closed: masking the remainder
-					// to end of input would hide its text behind the host word.
+					// An unclosed opener fails closed. Masking the remainder to
+					// end of input would hide its text behind the host word.
 					if (!arith.closed) {
 						outcome.error = errorAt("arithmetic", i)
 						return outcome
 					}
-					// The shell performs command substitutions inside a
-					// $((…)) exactly like anywhere else, so they are extracted
-					// as independent segments and must balance.
+					// The shell performs command substitutions inside a $((…))
+					// exactly like anywhere else. Extract them as independent
+					// segments, and make them balance.
 					const arithPayloads: string[] = []
 					const arithError = walkBodyPayloads(i + 3, arith.end - 2, arithPayloads, 0)
 					if (arithError) {
@@ -1289,15 +1369,15 @@ function scanShellSyntax(text: string): ScanOutcome {
 			}
 			if (text[i + 1] === "[") {
 				const arith = skipArithmetic(i)
-				// An unclosed opener fails closed: masking the remainder
-				// to end of input would hide its text behind the host word.
+				// An unclosed opener fails closed. Masking the remainder to
+				// end of input would hide its text behind the host word.
 				if (!arith.closed) {
 					outcome.error = errorAt("arithmetic", i)
 					return outcome
 				}
-				// The shell performs command substitutions inside a $[…]
-				// exactly like anywhere else, so they are extracted as
-				// independent segments and must balance.
+				// The shell performs command substitutions inside a $[…] exactly
+				// like anywhere else. Extract them as independent segments, and
+				// make them balance.
 				const arithPayloads: string[] = []
 				const arithError = walkBodyPayloads(i + 2, arith.end - 1, arithPayloads, 0)
 				if (arithError) {
@@ -1342,8 +1422,8 @@ function scanShellSyntax(text: string): ScanOutcome {
 	}
 
 	if (stack.length > 0) {
-		// Delimiters still open at end of input: report the outermost one — the
-		// first construct the shell could never finish reading.
+		// Delimiters are still open at end of input. Report the outermost one.
+		// It is the first construct the shell could never finish reading.
 		const outermost = stack[0]
 		outcome.error = errorAt(outermost.kind, outermost.openIndex)
 	}
@@ -1352,27 +1432,28 @@ function scanShellSyntax(text: string): ScanOutcome {
 }
 
 /**
- * Parse a heredoc delimiter word starting at position `start` in `command`.
- * The word is walked with bash's quoting rules: a quote character opens a
- * quote region anywhere in the word (mid-word as well as at the start), a
- * quote region spans newlines until its closing quote, and a backslash
- * escapes the next character — inside double quotes only the characters in
- * `DOUBLE_QUOTE_ESCAPABLE`, outside quotes anything (backslash-newline drops
- * the newline as a line continuation everywhere). Quote removal produces the
- * bare word a terminator line must equal exactly.
+ * Parse a heredoc delimiter word. The word starts at position `start` in
+ * `command`. The walk applies bash's quoting rules. A quote character opens a
+ * quote region anywhere in the word, mid-word as well as at the start. A
+ * quote region spans newlines until its closing quote. A backslash escapes the
+ * next character. Inside double quotes, only the characters in
+ * `DOUBLE_QUOTE_ESCAPABLE` are escapable. Outside quotes, anything is. A
+ * backslash-newline pair drops the newline as a line continuation everywhere.
+ * Quote removal produces the bare word. A terminator line must equal that word
+ * exactly.
  *
  * Returns:
- * - `delimiter`: the word after quote removal (terminator text; empty for
- *   `<<''`, which bash terminates at the first blank body line).
+ * - `delimiter`: the word after quote removal. It is the terminator text. It
+ *   is empty for `<<''`, which bash terminates at the first blank body line.
  * - `endIndex`: index of the first character after the delimiter token.
- * - `quoted`: whether any quoting construct appeared -- a quoted/escaped
+ * - `quoted`: whether any quoting construct appeared. A quoted or escaped
  *   delimiter suppresses all expansion in the body.
- * - `wordPresent`: whether any delimiter token appeared at all (bare `<<`
- *   before end of line has none).
+ * - `wordPresent`: whether any delimiter token appeared at all. A bare `<<`
+ *   before end of line has none.
  * - `malformed`: whether the word reached end of input with a quote region
  *   still open. bash then reads the delimiter as a multi-line word that can
- *   never match a body line while the opener line's tail keeps executing as
- *   ordinary syntax, so no body can be accounted for.
+ *   never match a body line. The opener line's tail keeps executing as
+ *   ordinary syntax. No body can be accounted for.
  */
 function parseHeredocDelimiter(
 	command: string,
@@ -1396,10 +1477,11 @@ function parseHeredocDelimiter(
 			if (char === quote) {
 				quote = null
 			} else if (quote === '"' && char === "\\" && i + 1 < command.length) {
-				// Inside double quotes only `DOUBLE_QUOTE_ESCAPABLE` is
-				// escapable: the backslash drops before those characters and
-				// stays literal text of the word before anything else.
-				// Backslash-newline drops both (line continuation).
+				// Inside double quotes, only `DOUBLE_QUOTE_ESCAPABLE` is
+				// escapable. The backslash drops before those characters.
+				// Before anything else it stays literal text of the word. A
+				// backslash-newline pair drops both characters (line
+				// continuation).
 				if (command[i + 1] !== "\n") {
 					const next = command[i + 1]
 					delimiter += DOUBLE_QUOTE_ESCAPABLE.includes(next) ? next : char + next
@@ -1407,8 +1489,8 @@ function parseHeredocDelimiter(
 				i += 2
 				continue
 			} else {
-				// Inside a quote, newlines and blanks are ordinary word content:
-				// bash closes the word only at the matching quote.
+				// Inside a quote, newlines and blanks are ordinary word
+				// content. bash closes the word only at the matching quote.
 				delimiter += char
 			}
 			i++
@@ -1432,12 +1514,12 @@ function parseHeredocDelimiter(
 			i++
 			continue
 		}
-		// An unquoted space/tab/newline/CR ends the word: the msys read layer
-		// strips CR, so there the CR is line-ending content, not part of the
-		// delimiter word. Any CR-bounded delimiter word leaves its CR inside
-		// the construct's region, and skipHeredoc's region test at mask
-		// emission fails such a heredoc closed whether or not a terminator
-		// line matches.
+		// An unquoted space, tab, newline, or CR ends the word. The msys read
+		// layer strips CR, so there the CR is line-ending content, not part of
+		// the delimiter word. A CR-bounded delimiter word leaves its CR inside
+		// the construct's region. The region test at mask emission in
+		// skipHeredoc then fails such a heredoc closed, whether or not a
+		// terminator line matches.
 		if (char === " " || char === "\t" || char === "\n" || char === "\r") {
 			break
 		}
@@ -1454,7 +1536,7 @@ function parseHeredocDelimiter(
 	}
 }
 
-/** Look up the raw text a placeholder name stands for, or undefined. */
+/** Look up the raw text that a placeholder name stands for, or undefined. */
 function lookupPlaceholder(name: string, outcome: ScanOutcome, includeSubstitutions: boolean): string | undefined {
 	const index = Number(name.slice(1))
 	switch (name[0]) {
@@ -1471,8 +1553,9 @@ function lookupPlaceholder(name: string, outcome: ScanOutcome, includeSubstituti
 		case "A":
 			return outcome.arithmetic[index]
 		case "S":
-			// Substitutions are only restored inline on the crude-split fallback
-			// path; the normal path turns them into independent segments.
+			// The crude-split fallback path is the only path that restores
+			// substitutions inline. The normal path turns them into independent
+			// segments.
 			return includeSubstitutions ? outcome.substitutions[index] : undefined
 		default:
 			return undefined
@@ -1481,10 +1564,10 @@ function lookupPlaceholder(name: string, outcome: ScanOutcome, includeSubstituti
 
 /**
  * Replace every sentinel-delimited placeholder in `text` with its raw text.
- * Split on the sentinel rather than a regex: a placeholder name is everything
- * between two sentinels by construction. A raw NUL in the input is rejected up
- * front by the scan (see QuoteType "nul-byte"), so no input can carry a
- * sentinel to collide with here.
+ * Split on the sentinel rather than with a regex. By construction, a
+ * placeholder name is everything between two sentinels. The scan rejects a raw
+ * NUL in the input up front (see QuoteType "nul-byte"), so no input can carry
+ * a sentinel that collides with the ones used here.
  */
 function expandPlaceholders(text: string, outcome: ScanOutcome, includeSubstitutions: boolean): string {
 	if (!text.includes(NUL)) {
@@ -1506,47 +1589,48 @@ function expandPlaceholders(text: string, outcome: ScanOutcome, includeSubstitut
 }
 
 /**
- * Split a command string into individual sub-commands by
- * chaining operators (&&, ||, ;, |, or &) and unquoted newlines.
+ * Split a command string into individual sub-commands. The splitter cuts on
+ * chaining operators (&&, ||, ;, |, or &) and on unquoted newlines.
  *
  * One quote-aware scan (`scanShellSyntax`) does all structure analysis in a
- * single left-to-right pass; `shell-quote` then tokenizes the masked host text:
- * - Quoted strings stay opaque, including multi-line quoted strings, which is
- *   why only unquoted newlines split commands (the key invariant: newlines
- *   inside a quoted string are argument text, never separators).
- * - Every command substitution — `$(…)`, backticks, `<(…)`, `>(…)` — is
- *   extracted with balanced-paren awareness wherever it sits (nested, inside a
- *   `${…}` expansion, inside a process substitution, or inside a heredoc with
- *   an unquoted delimiter) and becomes its own segment, so each inner command
- *   matches the allow/deny lists on its own. Parameter-expansion and heredoc
- *   hosts keep their verbatim text as one segment.
+ * single left-to-right pass. `shell-quote` then tokenizes the masked host
+ * text:
+ * - Quoted strings stay opaque. That includes multi-line quoted strings. That
+ *   is why only unquoted newlines split commands. The key invariant: a newline
+ *   inside a quoted string is argument text, never a separator.
+ * - The scan extracts every command substitution with balanced-paren
+ *   awareness, wherever it sits: nested, inside a `${…}` expansion, inside a
+ *   process substitution, or inside a heredoc with an unquoted delimiter. Each
+ *   becomes its own segment, so each inner command matches the allow/deny
+ *   lists on its own. Parameter-expansion and heredoc hosts keep their
+ *   verbatim text as one segment.
  * - PowerShell-style redirections (2>&1), variables, and arithmetic stay
  *   inside their host word.
  *
- * Returns a `ParseResult` containing the list of sub-commands and an optional
- * `parseError` that is non-null when the input is unaccountable (an
- * unterminated quote or heredoc, an expansion delimiter or arithmetic
- * expression opened but never closed, a stray closer, a raw NUL byte, or
- * substitution nesting beyond the re-scan depth cap). When `parseError` is
- * set the `commands` array contains
- * the raw input as a single opaque token: a command whose structure the parser
- * cannot fully account for must cost a prompt, never a free pass built on a
- * partial decomposition.
+ * The result is a `ParseResult`. It contains the list of sub-commands and an
+ * optional `parseError`. The error is non-null when the input cannot be
+ * accounted for: an unterminated quote or heredoc, an expansion delimiter or
+ * arithmetic expression opened but never closed, a stray closer, a raw NUL
+ * byte, or substitution nesting beyond the re-scan depth cap. When
+ * `parseError` is set, the `commands` array contains the raw input as a single
+ * opaque token. A command whose structure the parser cannot fully account for
+ * must cost a prompt. It must not get a free pass built on a partial
+ * decomposition.
  */
 export function parseCommand(command: string): ParseResult {
-	// A NUL byte is not whitespace, so a NUL-bearing command still reaches the
-	// scan, where the nul-byte guard rejects it.
+	// A NUL byte is not whitespace. A NUL-bearing command therefore still
+	// reaches the scan, where the nul-byte guard rejects it.
 	if (!command?.trim()) {
 		return { commands: [], parseError: null }
 	}
 
-	// Run the shared state-machine scan once. It yields the masked host text,
-	// the extracted substitution payloads, and the structural-error descriptor
-	// in a single pass.
+	// Run the shared state-machine scan once. One pass yields the masked host
+	// text, the extracted substitution payloads, and the structural-error
+	// descriptor.
 	const outcome = scanShellSyntax(command)
 
 	// Reject syntactically malformed input. Return the raw input as a single
-	// opaque token so callers surface the error to the agent rather than
+	// opaque token. Callers then surface the error to the agent instead of
 	// splitting unsafe fragments that might be auto-approved in isolation.
 	if (outcome.error !== null) {
 		return { commands: [command], parseError: outcome.error }
@@ -1570,27 +1654,29 @@ export function parseCommand(command: string): ParseResult {
 /**
  * Tokenize one masked host line into segments.
  *
- * A chain operator flushes the current segment. A substitution placeholder also
- * flushes and takes the place of its payload's own segments — the payload is
- * re-scanned through the same path, so nested substitutions become independent
- * segments. Placeholders that do not force a split (quotes, parameter
- * expansions, heredocs, variables, redirections, arithmetic) join the current
- * word and are restored verbatim; a parameter expansion, heredoc, or closed
- * `$((…))` additionally queues its extracted inner substitutions, which flush
- * right after the host segment that still contains their verbatim text.
+ * A chain operator flushes the current segment. A substitution placeholder
+ * also flushes, and it takes the place of its payload's own segments. The
+ * payload is re-scanned through the same path, so nested substitutions become
+ * independent segments. Placeholders that do not force a split join the
+ * current word and are restored verbatim. Those are quotes, parameter
+ * expansions, heredocs, variables, redirections, and arithmetic. A parameter
+ * expansion, heredoc, or closed `$((…))` also queues its extracted inner
+ * substitutions. They flush right after the host segment that still contains
+ * their verbatim text.
  *
- * Structural errors found while recursing into payloads are recorded on
- * `outcome` (fail-closed); the caller checks it after every line. `depth`
- * counts payload re-entries and is capped by `scanPayloadSegments`.
+ * The scan records structural errors found while it recurses into payloads on
+ * `outcome` (fail-closed). The caller checks `outcome` after every line.
+ * `depth` counts payload re-entries, and `scanPayloadSegments` caps it.
  */
 function parseLine(line: string, outcome: ScanOutcome, depth: number): string[] {
 	let tokens: ShellToken[]
 	try {
 		tokens = parse(line) as ShellToken[]
 	} catch (error) {
-		// If shell-quote fails to parse, fall back to simple splitting. This path
-		// does not recurse into payloads; every placeholder restores to its raw
-		// (for substitutions: inner) text so callers never see internal markers.
+		// If shell-quote fails to parse, fall back to simple splitting. This
+		// path does not recurse into payloads. Every placeholder restores to
+		// its raw text (for substitutions: the inner text), so callers never
+		// see internal markers.
 		const message = error instanceof Error ? error.message : String(error)
 		console.warn("shell-quote parse error:", message, "for command:", line)
 
@@ -1632,9 +1718,9 @@ function parseLine(line: string, outcome: ScanOutcome, depth: number): string[] 
 			current.push(token)
 			continue
 		}
-		// A word carrying placeholders: reconstruct non-substitution placeholders
-		// for verbatim restoration, and treat substitution placeholders as segment
-		// boundaries.
+		// This word carries placeholders. Reconstruct the non-substitution
+		// placeholders for verbatim restoration. Treat substitution
+		// placeholders as segment boundaries.
 		const parts = token.split(NUL)
 		let buf = ""
 		for (let p = 0; p < parts.length; p++) {
@@ -1674,12 +1760,12 @@ function parseLine(line: string, outcome: ScanOutcome, depth: number): string[] 
 }
 
 /**
- * Re-scan an extracted substitution payload through the same scan + tokenize
- * path so nested substitutions become independent segments. Records structural
- * errors on `outcome` (the outer command then fails closed). Each re-entry
- * increments `depth`; past `MAX_PAYLOAD_SCAN_DEPTH` the command fails closed as
- * `nesting-too-deep` instead of re-scanning generated nesting until the call
- * stack overflows.
+ * Re-scan an extracted substitution payload through the same scan and
+ * tokenize path, so nested substitutions become independent segments. The scan
+ * records structural errors on `outcome`, and the outer command then fails
+ * closed. Each re-entry increments `depth`. Past `MAX_PAYLOAD_SCAN_DEPTH`, the
+ * command fails closed as `nesting-too-deep`. It does not re-scan generated
+ * nesting until the call stack overflows.
  */
 function scanPayloadSegments(raw: string, outcome: ScanOutcome, depth: number): string[] {
 	if (!raw.trim()) {

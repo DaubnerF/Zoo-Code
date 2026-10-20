@@ -116,14 +116,16 @@ export function findLongestPrefixMatch(command: string, prefixes: string[]): str
 /**
  * Command approval decision types.
  *
- * `malformed_command` is the fail-closed outcome: the parser could not fully account
- * for the command's structure (an unterminated quote or heredoc, an expansion
- * delimiter -- $(, ${, backtick, <( or >( -- or an arithmetic expression ($(( or
- * $[) opened but never closed, a stray ")" or "}" with no opener, a raw NUL byte,
- * or substitution nesting beyond the re-scan depth cap), so no approval may rest
- * on a partial decomposition.
- * Unbalanced delimiters inside quoted regions do not qualify: a shell never parses
- * them there.
+ * `malformed_command` is the fail-closed outcome. The parser cannot fully
+ * account for the command's structure. The parser reports it for an
+ * unterminated quote or heredoc. It also reports it for an expansion
+ * delimiter ($(), ${}, backtick, <( or >() or an arithmetic expression
+ * ($(( or $[) that never closes. A stray "}" with no matching "{", a raw
+ * NUL byte, and substitution nesting deeper than the re-scan depth cap
+ * also produce this outcome. No approval may use a partial decomposition
+ * of the command.
+ * A shell never parses delimiters inside quoted regions, so unbalanced
+ * delimiters there do not qualify.
  */
 export type CommandDecision = "auto_approve" | "auto_deny" | "ask_user" | "malformed_command"
 
@@ -145,13 +147,15 @@ export type CommandDecision = "auto_approve" | "auto_deny" | "ask_user" | "malfo
  * - `"auto_approve"`: All sub-commands are explicitly allowed and no dangerous patterns detected
  * - `"auto_deny"`: At least one sub-command is explicitly denied
  * - `"ask_user"`: Mixed or no matches found, requires user decision, or contains dangerous patterns
- * - `"malformed_command"`: The parser cannot fully account for the command's structure -- an
- *   unterminated quote or heredoc, an expansion delimiter ($(...), ${...}, backtick, <( or >())
- *   or arithmetic expression ($(( or $[) opened but never closed, a stray ")" or "}" with no
- *   opener, a raw NUL byte, or substitution
- *   nesting beyond the parser's re-scan depth cap. A command whose structure is unproven must
- *   never be approved on a partial decomposition. Delimiter characters inside quoted regions are
- *   exempt: a shell never parses them there, so unbalanced ones stay parseable.
+ * - `"malformed_command"`: The parser cannot fully account for the command's
+ *   structure. Causes: an unterminated quote or heredoc, an expansion
+ *   delimiter ($(...), ${...}, backtick, <( or >()) or arithmetic expression
+ *   ($(( or $[) that never closes, a stray "}" with no matching "{", a raw
+ *   NUL byte, or substitution nesting deeper than the parser's re-scan depth
+ *   cap. The parser must not approve a command whose structure is unproven
+ *   based on a partial decomposition. A shell never parses delimiter
+ *   characters inside quoted regions, so unbalanced delimiters there stay
+ *   parseable.
  *
  * **Examples:**
  * ```typescript
@@ -229,18 +233,19 @@ export function getCommandDecisionDetailed(
 	}
 
 	// Parse into sub-commands (split by &&, ||, ;, |). parseCommand also
-	// detects unaccountable input -- unterminated quotes or heredocs, expansion
-	// delimiters ($(), ${}, backticks, <( , >() or arithmetic expressions
-	// ($(( , $[) opened but never closed, a stray closer, a raw NUL byte, or
-	// too-deep substitution nesting) -- and
-	// returns a non-null parseError in that case.
+	// detects input it cannot account for. That covers unterminated quotes
+	// or heredocs, expansion delimiters ($(), ${}, backticks, <( or >() or
+	// arithmetic expressions ($(( or $[) that never close, a stray closer,
+	// a raw NUL byte, and substitution nesting that is too deep. In that
+	// case parseCommand returns a non-null parseError.
 	const { commands: subCommands, parseError } = parseCommand(command)
 
-	// Reject commands whose structure the parser could not fully account for.
-	// The shell would report a parse error on such input; in a compound command
-	// it may partially execute the well-formed prefix before aborting. Returning
-	// a distinct decision lets callers surface a useful message to the agent
-	// rather than silently presenting the command for user approval.
+	// Reject commands whose structure the parser cannot fully account for.
+	// The shell reports a parse error for such input. In a compound command
+	// the shell may partially execute the well-formed prefix before it
+	// stops. A distinct decision lets callers show the agent a useful
+	// message. It also avoids presenting the command silently for user
+	// approval.
 	if (parseError !== null) {
 		return { decision: "malformed_command", offendingCommand: command, parseError: parseError.message }
 	}

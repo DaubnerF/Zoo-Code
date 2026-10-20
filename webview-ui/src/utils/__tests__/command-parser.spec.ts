@@ -183,9 +183,9 @@ describe("extractPatternsFromCommand", () => {
 	})
 
 	it("should extract only the leading command from an unclosed command substitution", () => {
-		// Fail-closed: when the parser cannot close a $( … ) it opened, the whole
-		// input stays one opaque token, so nothing interior to the malformed
-		// expansion can surface as an auto-approvable pattern.
+		// The parser fails closed here. It cannot close the $( … ) it opened,
+		// so it keeps the whole input as one opaque token. Nothing inside the
+		// malformed expansion can then surface as a pattern the lists approve.
 		const patterns = extractPatternsFromCommand("echo $(date\nfoo")
 		expect(patterns).toEqual(["echo"])
 		expect(patterns).not.toContain("date")
