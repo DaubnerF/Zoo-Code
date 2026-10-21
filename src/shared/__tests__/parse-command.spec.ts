@@ -784,7 +784,7 @@ describe("parseCommand", () => {
 			// opener, so the closer must stay host text.
 			const { commands, parseError } = parseCommand("case x in a) foo ;; esac")
 			expect(parseError).toBeNull()
-			expect(commands.length).toBe(1)
+			expect(commands).toEqual(["case x in a ) foo ;; esac"])
 		})
 
 		it("still extracts a substitution behind a depth-0 closer and fails on an unmatched brace", () => {
@@ -913,8 +913,8 @@ describe("parseCommand", () => {
 		it("fails closed on an unclosed $(( that would swallow a later statement", () => {
 			// Routing the masked remainder to the host instead would split the
 			// input into two segments. Each segment could then match the
-			// allowlist. bash rejects the input outright, so failing closed only
-			// costs a prompt.
+			// allowlist. bash rejects the input outright, so failing closed costs
+			// a tool error, never an approval.
 			const swallowed = "echo $((1 )\nevilcmd arg"
 			const { commands, parseError } = parseCommand(swallowed)
 			expect(commands).toEqual([swallowed])

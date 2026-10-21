@@ -110,7 +110,7 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		// With x unset, bash expands the alternate word and runs `rm a`. bash
 		// substitutes a device path for it. The inner command must match the
 		// lists on its own. Allowing `echo` must not approve the payload.
-		expect(getCommandDecision("echo ${x:-<(rm a)}", ["echo"])).not.toBe("auto_approve")
+		expect(getCommandDecision("echo ${x:-<(rm a)}", ["echo"])).toBe("ask_user")
 	})
 
 	it("does not auto-approve a nested substitution riding outer allowlist entries", () => {
@@ -285,7 +285,7 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("find . -exec rm {} \\;", ["find"], [])).toBe("auto_approve")
 		expect(getCommandDecision("mkdir -p src/{a,b}", ["mkdir"], [])).toBe("auto_approve")
 		expect(getCommandDecision("git show HEAD@{1}", ["git"], [])).toBe("auto_approve")
-		expect(getCommandDecision("echo )", ["echo"], [])).not.toBe("malformed_command")
+		expect(getCommandDecision("echo )", ["echo"], [])).toBe("auto_approve")
 	})
 
 	it("fails closed on an unclosed arithmetic opener even when the first word is allowed", () => {

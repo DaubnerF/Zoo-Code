@@ -30,8 +30,8 @@ export type ShellToken = string | { op: string } | { command: string }
  *   depth-0 `)` is host text instead. bash closes `case` patterns with `)`.
  *
  * Rejection kinds describe input the scan refuses outright. The scan never
- * tokenizes such input. Both kinds only cost a prompt. Neither can grant an
- * approval:
+ * tokenizes such input. Neither kind can grant an approval: the tool call
+ * fails with an error instead of reaching the approval prompt:
  *
  * - `nul-byte`: a raw NUL byte anywhere in the command. NUL is the scan's
  *   placeholder sentinel. An input that contains one could corrupt the
@@ -1288,8 +1288,9 @@ function scanShellSyntax(text: string): ScanOutcome {
 		if (char === "}") {
 			// A `}` at depth 0 with no matching `{` stays fail-closed. The
 			// parser cannot tell a literal brace word from a decomposition whose
-			// opener it lost. An unaccountable closer therefore costs a prompt.
-			// Rejecting a literal `}` argument is the accepted cost.
+			// opener it lost. An unaccountable closer never reaches approval: the
+			// tool call fails with an error. Rejecting a literal `}` argument is
+			// the accepted cost.
 			outcome.error = errorAt("stray-closer", i)
 			return outcome
 		}
@@ -1614,8 +1615,8 @@ function expandPlaceholders(text: string, outcome: ScanOutcome, includeSubstitut
  * byte, or substitution nesting beyond the re-scan depth cap. When
  * `parseError` is set, the `commands` array contains the raw input as a single
  * opaque token. A command whose structure the parser cannot fully account for
- * must cost a prompt. It must not get a free pass built on a partial
- * decomposition.
+ * must never reach approval: the tool call fails with an error instead. It
+ * must not get a free pass built on a partial decomposition.
  */
 export function parseCommand(command: string): ParseResult {
 	// A NUL byte is not whitespace. A NUL-bearing command therefore still
