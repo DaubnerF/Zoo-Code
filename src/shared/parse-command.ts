@@ -199,6 +199,22 @@ interface RegionFrame {
 }
 
 /**
+ * One open region in the heredoc opener-line remainder walk. Mirrors just the
+ * closer-balancing state of `RegionFrame`: enough to know when a top-level
+ * region closes, which decides whether a following `#` continues the word.
+ * `backtick` marks the opaque backtick kind: a backtick region balances only
+ * against its own closer, never against a nested opener.
+ */
+interface RemainderFrame {
+	/** The single character that closes this region. */
+	closer: string
+	/** Bare `(` grouping opened inside a `)`-closing region, not yet closed. */
+	groupDepth: number
+	/** Whether this is the opaque backtick kind. */
+	backtick: boolean
+}
+
+/**
  * One scan fills this object. It holds the masked host text, the structural
  * error if one exists, and the masked-away constructs. The tokenizer restores
  * those constructs or recurses into them.
@@ -221,7 +237,7 @@ interface ScanOutcome {
 	params: string[]
 	/** For each parameter expansion: raw inner substitutions to extract. */
 	paramPayloads: string[][]
-	/** Raw text (opener line through terminator) of each heredoc. */
+	/** Raw text (redirect operator and delimiter word through terminator) of each heredoc. */
 	heredocs: string[]
 	/** For each heredoc with an unquoted delimiter: body substitutions. */
 	heredocPayloads: string[][]
@@ -315,9 +331,13 @@ function isIdentChar(char: string): boolean {
  *   than `MAX_PAYLOAD_SCAN_DEPTH`. A closer that does not match the open
  *   region's kind is literal content. That matches the shell. The still-open
  *   region then fails at end of input.
- * - Heredocs: the scan masks the opener line through the terminator line as
- *   one opaque host word. A heredoc stays a single segment however many lines
- *   it spans. Lines end only at a line feed (LF). A carriage return (CR)
+ * - Heredocs: the scan masks the redirect operator and delimiter word, the
+ *   body, and the terminator line as one opaque host word. The masked
+ *   construct stays a single segment
+ *   however many lines it spans. The text after the delimiter word on the
+ *   opener line is live host text: it stays out of the mask and splits at
+ *   operator characters like any other host text. Lines end only at a line
+ *   feed (LF). A carriage return (CR)
  *   counts only as the CR of a CR-and-LF pair (CRLF) on the opener line. A
  *   CR-only-separated opener does not validate a heredoc. bash reports such a
  *   construct as unterminated. The scan matches body lines against the
@@ -488,9 +508,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 
 	/**
 	 * Consume an entire heredoc at `i`: the opener line, the body, and the
-	 * terminator. The whole construct masks to one host word. Return the index
-	 * just past the terminator text. Return an error for an unterminated
-	 * heredoc or for an unbalanced delimiter inside an expansion-active body.
+	 * terminator. The redirect operator and delimiter word through the
+	 * terminator mask to one host word; the opener-line remainder after the
+	 * delimiter word stays live host text. Return the index just past the
+	 * terminator text. Return an error for an unterminated heredoc or for an
+	 * unbalanced delimiter inside an expansion-active body.
 	 */
 	const skipHeredoc = (i: number, frames: RegionFrame[]): { end: number } | { error: UnterminatedQuote } => {
 		const start = i
@@ -511,29 +533,209 @@ function scanShellSyntax(text: string): ScanOutcome {
 			// fail closed.
 			return { error: errorAt("heredoc", start) }
 		}
+		if (!wordPresent && endIndex < text.length && text[endIndex] !== "\n" && text[endIndex] !== "\r") {
+			// The blank-skipping loop consumed every blank, so an unclaimed
+			// character here is a metacharacter: bash reads it as an operator
+			// token where the delimiter word belongs, and rejects the whole
+			// command before executing anything. The no-word mask below is the
+			// policy for `<<` plus blanks only; this shape fails closed.
+			return { error: errorAt("heredoc", start) }
+		}
 		const payloads: string[] = []
 		// This is the only place a heredoc mask is emitted. Every non-error
 		// outcome of skipHeredoc returns through here, so every masked span
-		// carries the same check. A CR byte inside [start, end) leaves the two
-		// read layers reading different bytes. msys strips each CR before
-		// parsing, and POSIX keeps it as ordinary content. A close that one
-		// layer sees may not be the close the other sees. A close that only one
-		// layer sees would hand that model's remainder back to the scanner as
-		// live syntax. The parser cannot verify that both layers close the
-		// construct the same way. The heredoc fails closed instead of picking a
-		// model. A uniformly-CRLF construct whose layers happen to agree is
-		// over-rejected. That is the accepted cost.
+		// carries the same check. A CR byte anywhere in the construct from the
+		// opener through the terminator leaves the two read layers reading
+		// different bytes. msys strips each CR before parsing, and POSIX keeps
+		// it as ordinary content. A close that one layer sees may not be the
+		// close the other sees. A close that only one layer sees would hand
+		// that model's remainder back to the scanner as live syntax. The parser
+		// cannot verify that both layers close the construct the same way. The
+		// heredoc fails closed instead of picking a model. The check spans the
+		// whole construct, opener-line remainder included, even though the
+		// remainder masks out below. A uniformly-CRLF construct whose layers
+		// happen to agree is over-rejected. That is the accepted cost.
+		/**
+		 * Append the opener-line remainder `[from, to)` to the host text. These
+		 * bytes are live syntax that the outer scan loop never revisits, so the
+		 * walk applies that loop's live-text policy here: a mid-word `#`
+		 * becomes an opaque placeholder (the tokenizer would otherwise start a
+		 * comment there and drop the rest of the line, hiding live commands), a
+		 * word-initial `#` passes through as the comment bash sees, a `#`
+		 * directly after the closer of an expansion or process substitution
+		 * continues the word and takes the placeholder, and a backslash escape
+		 * pair stays verbatim. Quote characters pass through too; the walk only
+		 * tracks the regions so a quoted `#` stays literal.
+		 */
+		const emitRemainder = (from: number, to: number): void => {
+			let i = from
+			// Index just past the most recent `\c` escape pair, or -1. The
+			// escaped character is word content to the shell, so a `#` directly
+			// after the pair continues the word.
+			let escapedEnd = -1
+			let quote: "'" | '"' | null = null
+			// Mirrors the scan loop's expansion state: the closers this walk
+			// must balance before a top-level region ends, and the index just
+			// past the most recent top-level region closer. The shell ends the
+			// region at its closer but not the surrounding word, so a `#`
+			// directly at that index is word content, never a comment start.
+			// An unclosed region cannot reach this walk: `walkBodyPayloads`
+			// has already balance-checked the remainder and fails the heredoc
+			// closed on a region left open.
+			const frames: RemainderFrame[] = []
+			let closerEnd = -1
+			while (i < to) {
+				const char = text[i]
+				if (char === "\\" && quote !== "'") {
+					// Inside single quotes a backslash is literal, so only an
+					// unquoted or double-quoted backslash pairs with the next
+					// character.
+					outcome.host += text.slice(i, i + 2)
+					escapedEnd = i + 2
+					i += 2
+					continue
+				}
+				if (char === "'" || char === '"') {
+					if (quote === null) {
+						quote = char
+					} else if (quote === char) {
+						quote = null
+					}
+					outcome.host += char
+					i++
+					continue
+				}
+				if (quote === null) {
+					const top = frames[frames.length - 1]
+					if (top?.backtick) {
+						// A backtick region is opaque except for its closer:
+						// backticks do not nest and the shell re-scans nothing
+						// inside that would rebalance it.
+						if (char === "`") {
+							frames.pop()
+							if (frames.length === 0) {
+								closerEnd = i + 1
+							}
+						}
+						outcome.host += char
+						i++
+						continue
+					}
+					if (top && char === top.closer) {
+						if (top.groupDepth > 0) {
+							// This closer matches an inner grouping paren, not
+							// the region's own opener.
+							top.groupDepth--
+						} else {
+							frames.pop()
+							if (frames.length === 0) {
+								closerEnd = i + 1
+							}
+						}
+						outcome.host += char
+						i++
+						continue
+					}
+					if (top?.closer === ")" && char === "(") {
+						// A bare `(` inside a `)`-closing region opens a group
+						// the shell balances before the region's closer, so the
+						// group's `)` cannot end the region. `(`/`)` inside a
+						// `}`- or `]`-closing region stay literal.
+						top.groupDepth++
+						outcome.host += char
+						i++
+						continue
+					}
+					if (char === "$" && (text[i + 1] === "(" || text[i + 1] === "{" || text[i + 1] === "[")) {
+						// A `$((` region starts with one inner group pending, so
+						// it closes past its second `)`, like the loop's
+						// arithmetic end.
+						// Stryker disable next-line StringLiteral: either literal's erasure only leaves `doubleArith` false, and the walk re-counts the second `(` as an ordinary group paren at the same depth, so no reachable remainder emits different host bytes or splits.
+						const doubleArith = text[i + 1] === "(" && text[i + 2] === "("
+						const closer = text[i + 1] === "(" ? ")" : text[i + 1] === "[" ? "]" : "}"
+						frames.push({ closer, groupDepth: doubleArith ? 1 : 0, backtick: false })
+						outcome.host += char
+						outcome.host += text[i + 1]
+						if (doubleArith) {
+							outcome.host += text[i + 2]
+						}
+						i += doubleArith ? 3 : 2
+						continue
+					}
+					if (char === "`") {
+						frames.push({ closer: "`", groupDepth: 0, backtick: true })
+						outcome.host += char
+						i++
+						continue
+					}
+					if ((char === "<" || char === ">") && text[i + 1] === "(") {
+						frames.push({ closer: ")", groupDepth: 0, backtick: false })
+						outcome.host += `${char}(`
+						i += 2
+						continue
+					}
+				}
+				if (char === "#" && quote === null) {
+					if (i === closerEnd) {
+						// A `#` directly after a region closer continues the
+						// word: the shell ends the region at its closer but not
+						// the word, and starts a comment only at a word start.
+						// The placeholder keeps the rest of the line
+						// tokenizable, as the mid-word case below does.
+						const id = outcome.variables.push("#") - 1
+						outcome.host += mark(`V${id}`)
+						i++
+						continue
+					}
+					const wordStart = i === from || /\s/.test(text[i - 1]) || /[;&()|<>]/.test(text[i - 1])
+					if (wordStart && i !== escapedEnd) {
+						// A comment starts only at a word start. The tokenizer
+						// and bash agree here: both drop the text from the `#`
+						// to end of line.
+						outcome.host += text.slice(i, to)
+						return
+					}
+					// Mid-word `#`: an ordinary character to the shell, a
+					// comment start to the tokenizer. Mask it to an opaque
+					// placeholder so the rest of the line survives tokenization.
+					const id = outcome.variables.push("#") - 1
+					outcome.host += mark(`V${id}`)
+					i++
+					continue
+				}
+				outcome.host += char
+				i++
+			}
+		}
 		const emitMask = (end: number): { end: number } | { error: UnterminatedQuote } => {
-			const region = text.slice(start, end)
-			if (region.includes("\r")) {
+			const fullSpan = text.slice(start, end)
+			if (fullSpan.includes("\r")) {
 				return { error: errorAt("heredoc", start) }
 			}
+			// The shell expands the text after the delimiter word on the opener
+			// line. That remainder is live syntax, not opaque body: the mask
+			// covers the redirect operator and delimiter word through the
+			// terminator, while the opener-line remainder stays out of the
+			// region and reaches the host text through the same masking the scan
+			// applies to live text. A no-word opener masks through end of input
+			// instead. The metacharacter guard in `skipHeredoc` fails a no-word
+			// opener whose break was metacharacter-caused closed before any mask
+			// is emitted, so the openers reaching this mask are `<<` plus blanks:
+			// their line remainder is nothing but those blanks.
+			const region = wordPresent ? text.slice(start, endIndex) + text.slice(remainderEnd, end) : fullSpan
 			const id = outcome.heredocs.push(region) - 1
 			outcome.heredocPayloads[id] = payloads
 			// Inside an expansion region, the host is masked wholesale anyway.
-			// Only top-level heredocs need a placeholder in the host text.
+			// Only top-level heredocs need a placeholder in the host text. The
+			// emission appends the opener-line remainder as live host text; the
+			// split at chain operators happens later, when `parseLine`
+			// tokenizes. Inside a frame, the payload re-scan runs this emission
+			// at top level.
 			if (frames.length === 0) {
 				outcome.host += mark(`H${id}`)
+				if (wordPresent) {
+					emitRemainder(endIndex, remainderEnd)
+				}
 			}
 			return { end }
 		}
@@ -542,6 +744,58 @@ function scanShellSyntax(text: string): ScanOutcome {
 		// the body only. Walk the remainder unconditionally. An error there
 		// fails the whole heredoc closed, like a body error does.
 		const remainderEnd = endOfLine(endIndex)
+		// bash joins a backslash-newline pair before tokenizing, even inside
+		// double quotes. An odd unquoted backslash run at the end of the
+		// remainder therefore joins the rest of the opener line's syntax onto
+		// the first body line, while the remainder cut here stops blindly at
+		// that newline. The remainder cannot account for the joined bytes, so
+		// the heredoc fails closed. Inside single quotes a backslash is
+		// literal and no joining happens, so the guard stays silent there.
+		if (wordPresent) {
+			let backslashRun = 0
+			while (remainderEnd - 1 - backslashRun >= endIndex && text[remainderEnd - 1 - backslashRun] === "\\") {
+				backslashRun++
+			}
+			if (backslashRun % 2 === 1) {
+				// Decide whether the backslash run opens the join: walk the
+				// remainder's quote state up to the run. Only a single-quote
+				// region keeps the backslash literal.
+				let quote: "'" | '"' | null = null
+				let j = endIndex
+				while (j < remainderEnd - backslashRun) {
+					const char = text[j]
+					if (quote === "'") {
+						if (char === "'") {
+							quote = null
+						}
+						j++
+						continue
+					}
+					if (quote === '"') {
+						if (char === "\\") {
+							j += 2
+							continue
+						}
+						if (char === '"') {
+							quote = null
+						}
+						j++
+						continue
+					}
+					if (char === "\\") {
+						j += 2
+						continue
+					}
+					if (char === "'" || char === '"') {
+						quote = char
+					}
+					j++
+				}
+				if (quote !== "'") {
+					return { error: errorAt("heredoc", start) }
+				}
+			}
+		}
 		const remainderError = walkBodyPayloads(endIndex, remainderEnd, payloads, 0)
 		if (remainderError) {
 			return { error: remainderError }
@@ -660,15 +914,16 @@ function scanShellSyntax(text: string): ScanOutcome {
 			}
 			return emitMask(rawIndex)
 		}
-		// No delimiter token appeared at all: a bare `<<`, or `<<` followed
-		// only by blanks, before end of line. bash rejects such input with a
-		// syntax error and never executes it. The opener therefore masks
-		// through end of input as one opaque word, over a construct that can
-		// never run. The mask is sound only while both read layers see the
-		// same bytes. The region test at the mask-emission guard above fails
-		// the mask closed when a CR enters the span. This over-rejects the
-		// CR-touched shapes whose layers happen to agree. That is the accepted
-		// cost of keeping one region rule.
+		// No delimiter token appeared, and the break was not metacharacter-caused
+		// -- the metacharacter guard above already fails those shapes closed: a
+		// bare `<<`, or `<<` followed only by blanks, before end of line. bash
+		// rejects such input with a syntax error and never executes it. The
+		// opener therefore masks through end of input as one opaque word, over a
+		// construct that can never run. The mask is sound only while both read
+		// layers see the same bytes. The region test at the mask-emission guard
+		// above fails the mask closed when a CR enters the span. This
+		// over-rejects the CR-touched shapes whose layers happen to agree. That
+		// is the accepted cost of keeping one region rule.
 		return emitMask(text.length)
 	}
 
@@ -1515,13 +1770,22 @@ function parseHeredocDelimiter(
 			i++
 			continue
 		}
-		// An unquoted space, tab, newline, or CR ends the word. The msys read
-		// layer strips CR, so there the CR is line-ending content, not part of
-		// the delimiter word. A CR-bounded delimiter word leaves its CR inside
-		// the construct's region. The region test at mask emission in
-		// skipHeredoc then fails such a heredoc closed, whether or not a
-		// terminator line matches.
-		if (char === " " || char === "\t" || char === "\n" || char === "\r") {
+		// An unquoted blank, line ending, or shell metacharacter ends the word.
+		// bash tokenizes `cat <<E|grep x` as the delimiter word `E` followed by
+		// a live operator, exactly like `cat <<E | grep x`. The msys read layer
+		// strips CR, so there the CR is line-ending content, not part of the
+		// delimiter word. A CR-bounded delimiter word leaves its CR inside the
+		// construct's region. The region test at mask emission in skipHeredoc
+		// then fails such a heredoc closed, whether or not a terminator line
+		// matches. A `(` or `)` breaks the word only at word start. bash
+		// recognizes a metacharacter only at token start; glued after a
+		// nonempty word token it is a syntax error, never a separator. Breaking
+		// there would turn input bash rejects into an approvable heredoc whose
+		// live remainder swallows the parenthesized text without splitting it.
+		// A metacharacter at word start leaves the word empty, and the no-word
+		// path then accounts for the opener instead.
+		const breakSet = i === start ? " \t\n\r|&;()<>" : " \t\n\r|&;<>"
+		if (breakSet.includes(char)) {
 			break
 		}
 		delimiter += char

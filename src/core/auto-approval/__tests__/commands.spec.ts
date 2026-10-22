@@ -139,6 +139,110 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("cat <<EOF $(whoami)\nbody\nEOF", ["cat"])).toBe("ask_user")
 	})
 
+	it("does not auto-approve a denied command chained after a heredoc delimiter", () => {
+		// bash pipes the heredoc into `rm x`: the text after the delimiter word
+		// is live syntax, so `rm` must match the denylist on its own instead of
+		// riding the heredoc head's allowlist match.
+		expect(getCommandDecision("echo $(cat <<E | rm x\nhi\nE\n)", ["cat", "echo"], ["rm"])).toBe("auto_deny")
+		// The same rejection at the top level, without the surrounding expansion.
+		expect(getCommandDecision("cat <<E | rm x\nhi\nE", ["cat", "echo"], ["rm"])).toBe("auto_deny")
+		// An unlisted right-hand command costs a prompt, never an approval.
+		expect(getCommandDecision("echo $(cat <<E | grep x\nhi\nE\n)", ["cat", "echo"], [])).toBe("ask_user")
+	})
+
+	it("does not auto-approve a denied command after a mid-word # in the opener remainder", () => {
+		// bash treats the `#` inside `f#g` as an ordinary character and still
+		// pipes into `rm x`. The remainder masking keeps the tail visible to
+		// the lists instead of letting a comment swallow it.
+		expect(getCommandDecision("echo $(cat <<E f#g | rm x\nhi\nE\n)", ["cat", "echo"], ["rm"])).toBe("auto_deny")
+	})
+
+	it("does not auto-approve a denied command glued to the heredoc delimiter", () => {
+		// bash ends the delimiter word at `|`, so the body never terminates and
+		// `rm x` runs live. The parser cannot account for the construct and
+		// reports it malformed, which costs a rejection, never an approval.
+		expect(getCommandDecision("echo $(cat <<E|rm x\nhi\nE|rm\n)", ["cat", "echo"], ["rm"])).toBe(
+			"malformed_command",
+		)
+	})
+
+	it("auto-approves a heredoc pipeline whose every stage is allowlisted (no over-reject)", () => {
+		// A split the denylist never sees must not over-fire: an operator-free
+		// opener and an all-allowlisted right-hand command both stay approved.
+		expect(getCommandDecision("echo $(cat <<E\nhi\nE\n)", ["cat", "echo"], [])).toBe("auto_approve")
+		expect(getCommandDecision("echo $(cat <<E | grep x\nhi\nE\n)", ["cat", "echo", "grep"], [])).toBe(
+			"auto_approve",
+		)
+	})
+
+	it("denies a command chained after a # glued to a substitution closer", () => {
+		// bash keeps `$(ls)#x` as one word, so the chained `rm y` executes.
+		// The closer-aware remainder keeps it visible to the denylist instead
+		// of swallowing the tail as comment text.
+		expect(getCommandDecision("echo $(cat <<E $(ls)#x ; rm y\nhi\nE\n)", ["cat", "echo", "ls"], ["rm"])).toBe(
+			"auto_deny",
+		)
+	})
+
+	it("denies a command chained after a # glued to a process-substitution closer", () => {
+		// `<(...)` continues the word exactly like `$(...)`.
+		expect(getCommandDecision("echo $(cat <<E <(ls)#x ; rm y\nhi\nE\n)", ["cat", "echo", "ls"], ["rm"])).toBe(
+			"auto_deny",
+		)
+	})
+
+	it("denies a command glued directly after a # that follows a substitution closer", () => {
+		// The operator needs no blanks: bash still runs `rm y`, so the denylist
+		// must see it.
+		expect(getCommandDecision("echo $(cat <<E $(ls)#x|rm y\nhi\nE\n)", ["cat", "echo", "ls"], ["rm"])).toBe(
+			"auto_deny",
+		)
+	})
+
+	it("rejects a delimiter glued to a subshell paren instead of approving it", () => {
+		// bash refuses `cat <<E(rm x)` as a syntax error. The parser must fail
+		// the construct closed like the base parser, never approve input whose
+		// parenthesized remainder hides commands from the lists.
+		expect(getCommandDecision("cat <<E(rm x)\nhi\nE", ["cat", "echo"], ["rm"])).toBe("malformed_command")
+	})
+
+	it("fails closed on a word-start pipe with no delimiter word", () => {
+		// bash reads `|` as the operator token where the delimiter word
+		// belongs and rejects the command outright. The no-word mask must not
+		// turn that syntax error into an approved opaque word. The deny head
+		// never reaches the lists: the whole command is rejected.
+		expect(getCommandDecision("cat <<|rm x\nhi\nE", ["cat", "echo", "ls"], ["rm"])).toBe("malformed_command")
+	})
+
+	it("fails closed on a word-start paren with no delimiter word", () => {
+		// `(` is the same operator-token shape as the pipe: bash rejects the
+		// command before executing anything, so the mask must not approve it.
+		expect(getCommandDecision("cat <<(x)\nhi\nE", ["cat", "echo", "ls"], ["rm"])).toBe("malformed_command")
+	})
+
+	it("denies a command chained after a # riding a group-frame closer", () => {
+		// bash balances the `(ls)` group before the `$( … )` closer, so the
+		// glued `#` continues the word and `rm y` really executes. It must
+		// reach the denylist as its own segment instead of being swallowed as
+		// comment text by a frame that popped at the group's closer.
+		expect(getCommandDecision("cat <<E $( (ls) )#x ; rm y\nhi\nE", ["cat", "echo", "ls"], ["rm"])).toBe("auto_deny")
+	})
+
+	it("auto-approves the blanks-only no-word mask (posture control)", () => {
+		// `<<` followed only by blanks before end of line is the shape the
+		// no-word mask is the accepted policy for: bash never executes it, so
+		// the mask's approval is not a policy over-approximation gap.
+		expect(getCommandDecision("cat << \nEOF\nrm -rf /\n", ["cat", "echo", "ls"], ["rm"])).toBe("auto_approve")
+	})
+
+	it("auto-approves a word-initial comment after a spaced substitution closer", () => {
+		// A blank before the `#` is a real word start: bash starts a comment
+		// there and never runs the tail, so approval stays bash-faithful.
+		expect(getCommandDecision("echo $(cat <<E $(ls) #x ; rm y\nhi\nE\n)", ["cat", "echo", "ls"], ["rm"])).toBe(
+			"auto_approve",
+		)
+	})
+
 	it("asks user when a heredoc body with an unquoted delimiter contains a substitution", () => {
 		// The shell expands $(whoami) inside an unquoted-delimiter heredoc body.
 		// The inner command must therefore match the lists, even though the
@@ -347,6 +451,64 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		// as a separate command. The parser rejects the input as malformed, so
 		// no partial decomposition can auto-approve it.
 		expect(getCommandDecision("cat <<'X\r\n'; rm -rf /\nX\r\n", ["cat"])).toBe("malformed_command")
+	})
+
+	it("does not approve a deny command joined onto the opener line by a backslash", () => {
+		// `'a'` closes before the trailing backslash, so bash joins the body's
+		// `; rm -rf /` line onto the opener line as live syntax the remainder
+		// cut never sees. The heredoc fails closed, and the deny payload never
+		// reaches tokenization: an allowlisted `cat` must not carry it.
+		expect(getCommandDecision("cat <<E 'a'\\\n; rm -rf /\nE\n", ["cat"], [])).not.toBe("auto_approve")
+		expect(getCommandDecision("cat <<E 'a'\\\n; rm -rf /\nE\n", ["cat"], ["rm"])).toBe("malformed_command")
+	})
+
+	it("fails closed on deny commands joined by backslash runs the remainder quote walk must track", () => {
+		// Two more crafted joins reach the same decision through different walk
+		// branches. `\'` keeps the `'` escaped, so the run there is unquoted;
+		// `"a\"b'` ends with an open single quote that the double-quote branch
+		// must step over. Both joins must fail closed before the deny payload
+		// tokenizes. `"a"b'` additionally pins the accept side: an open single
+		// quote at the run keeps the guard silent, and a walk that loses that
+		// state rejects this ordinary heredoc instead of approving it.
+		expect(getCommandDecision("cat <<E a\\'\\\n; rm -rf /\nE\n", ["cat"], [])).not.toBe("auto_approve")
+		expect(getCommandDecision("cat <<E a\\'\\\n; rm -rf /\nE\n", ["cat"], ["rm"])).toBe("malformed_command")
+		expect(getCommandDecision('cat <<E "a\\"b\'\\\n; rm -rf /\nE\n', ["cat"], [])).not.toBe("auto_approve")
+		expect(getCommandDecision('cat <<E "a\\"b\'\\\n; rm -rf /\nE\n', ["cat"], ["rm"])).toBe("malformed_command")
+		expect(getCommandDecision('cat <<E "a"b\'\\\n; rm -rf /\nE\n', ["cat"], [])).toBe("auto_approve")
+	})
+
+	it("decides opener-remainder quote, procsub-chain, and redirect shapes by their decomposition", () => {
+		// Decision-layer mirror of the remainder-walk pins: a quote region
+		// only closes on its own character, so the cross-quoted remainders
+		// drop the `#c` tail inside the still-open region and leave a
+		// heredoc whose every command is allowlisted; the closer-boundary
+		// shapes keep `#c` as word content and stay approved; a `>(…)`
+		// chain makes its payloads match the lists on their own, so an
+		// unlisted payload costs a prompt; and a plain `>`/`<` redirect
+		// stays host text that never masks a command from the lists.
+		expect(getCommandDecision("cat <<E \"a'b'#c\nbody\nE\n", ["cat"], ["rm"])).toBe("auto_approve")
+		expect(getCommandDecision('cat <<E \'a"b"#c\nbody\nE\n', ["cat"], ["rm"])).toBe("auto_approve")
+		expect(getCommandDecision('cat <<E "a\'b"#c\nbody\nE\n', ["cat"], ["rm"])).toBe("auto_approve")
+		expect(getCommandDecision("cat <<E 'a\"b'#c\nbody\nE\n", ["cat"], ["rm"])).toBe("auto_approve")
+		expect(getCommandDecision("cat <<E >(a)>(b)#c\nbody\nE\n", ["cat"], [])).toBe("ask_user")
+		expect(getCommandDecision("cat <<E >out\nbody\nE\n", ["cat"], ["rm"])).toBe("auto_approve")
+		expect(getCommandDecision("cat <<E <in\nbody\nE\n", ["cat"], ["rm"])).toBe("auto_approve")
+	})
+
+	it("decides a # riding an inner frame closer by the comment bash starts at it", () => {
+		// While an outer frame stays open, a `#` at an inner closer is frame
+		// content and bash comments the `; rm -rf /]d` tail, so an allowlisted
+		// head carries nothing the deny list names. Marking the closer at the
+		// inner pop instead keeps " #c" in the host and fabricates
+		// "rm -rf /]d" as its own segment, flipping the decision to a deny.
+		// The counterpart with the `#` at the pop that empties the frames
+		// keeps `rm -rf /` live, so it must cost the deny and the prompt.
+		expect(getCommandDecision("cat <<E $[a$(b)#c; rm -rf /]d\nbody\nE\n", ["cat", "b"], ["rm"])).toBe(
+			"auto_approve",
+		)
+		expect(getCommandDecision("cat <<E $[a$(b)#c; rm -rf /]d\nbody\nE\n", ["cat", "b"], [])).toBe("auto_approve")
+		expect(getCommandDecision("cat <<E $[a$(b)]#c; rm -rf /\nbody\nE\n", ["cat", "b"], ["rm"])).toBe("auto_deny")
+		expect(getCommandDecision("cat <<E $[a$(b)]#c; rm -rf /\nbody\nE\n", ["cat", "b"], [])).toBe("ask_user")
 	})
 
 	it("does not reject a subshell group inside a command substitution as malformed", () => {

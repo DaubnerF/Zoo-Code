@@ -52,8 +52,12 @@ describe("extractPatternsFromCommand", () => {
 	})
 
 	it("should handle null/undefined", () => {
-		expect(extractPatternsFromCommand(null as any)).toEqual([])
-		expect(extractPatternsFromCommand(undefined as any)).toEqual([])
+		// The runtime guard under test (`command?.trim()`) is exactly what
+		// makes a non-string caller value safe. Route the nullish values
+		// through one typed choke point instead of an untyped cast.
+		const asString = (value: unknown): string => value as string
+		expect(extractPatternsFromCommand(asString(null))).toEqual([])
+		expect(extractPatternsFromCommand(asString(undefined))).toEqual([])
 	})
 
 	it("should handle scripts", () => {
@@ -173,6 +177,17 @@ describe("extractPatternsFromCommand", () => {
 			expect(patterns).toContain("echo")
 			expect(patterns).not.toContain("EOF")
 			expect(patterns).not.toContain("hello")
+		})
+
+		it("extracts split segments from a heredoc pipeline inside a substitution", () => {
+			// The parser splits this input into single-line segments: the
+			// heredoc token, `echo`, and `rm x`. The extractor takes its
+			// full-token path for single-line segments, so the pipeline's
+			// right-hand `rm` surfaces instead of hiding inside one opaque
+			// multi-line token.
+			const input = "echo $(cat <<E | rm x\nhi\nE\n)"
+			const patterns = extractPatternsFromCommand(input)
+			expect(patterns).toEqual(["cat", "echo", "rm", "rm x"])
 		})
 	})
 

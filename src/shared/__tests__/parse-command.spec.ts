@@ -684,19 +684,668 @@ describe("parseCommand", () => {
 		it("extracts a substitution after the delimiter on a heredoc opener line", () => {
 			// The opener line's remainder is expanded regardless of delimiter quoting:
 			// bash runs the substitution sitting between the delimiter and the newline.
-			const input = "cat <<EOF $(whoami)\nbody\nEOF"
-			const { commands, parseError } = parseCommand(input)
+			const { commands, parseError } = parseCommand("cat <<EOF $(whoami)\nbody\nEOF")
 			expect(parseError).toBeNull()
-			expect(commands).toEqual([input, "whoami"])
+			// The remainder is live host text: the masked region keeps the
+			// delimiter word, body, and terminator, and the substitution is
+			// reassembled by the tokenizer and routed to its own segment.
+			expect(commands).toEqual(["cat <<EOF\nbody\nEOF $ ( whoami )", "whoami"])
 		})
 
 		it("extracts opener-line substitutions for quoted and <<- delimiters too", () => {
 			// Quoting suppresses expansion in the body only, never on the opener
 			// line, so <<'EOF' and <<- carry the same remainder obligation as <<.
-			const quoted = "cat <<'EOF' $(whoami)\nbody\nEOF"
-			expect(parseCommand(quoted).commands).toEqual([quoted, "whoami"])
-			const dash = "cat <<-EOF\t$(whoami)\nbody\nEOF"
-			expect(parseCommand(dash).commands).toEqual([dash, "whoami"])
+			expect(parseCommand("cat <<'EOF' $(whoami)\nbody\nEOF").commands).toEqual([
+				"cat <<'EOF'\nbody\nEOF $ ( whoami )",
+				"whoami",
+			])
+			expect(parseCommand("cat <<-EOF\t$(whoami)\nbody\nEOF").commands).toEqual([
+				"cat <<-EOF\nbody\nEOF $ ( whoami )",
+				"whoami",
+			])
+		})
+
+		it("splits a chain operator after the delimiter out of the heredoc segment", () => {
+			// The text after the delimiter word is live syntax: bash pipes the
+			// heredoc into `rm x`, so the operator's right-hand command must
+			// match the lists on its own instead of riding the heredoc head.
+			const { commands, parseError } = parseCommand("echo $(cat <<E | rm x\nhi\nE\n)")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "cat <<E\nhi\nE", "rm x"])
+			// The split respects quoting: a `|` inside the argument stays word text.
+			const quoted = parseCommand('echo $(cat <<E | grep "a|b"\nhi\nE\n)')
+			expect(quoted.parseError).toBeNull()
+			expect(quoted.commands).toEqual(["echo", "cat <<E\nhi\nE", "grep a|b"])
+		})
+
+		it("keeps an operator-free opener remainder in one segment (no over-split)", () => {
+			// Without an operator the remainder is just more words of the
+			// opener's command; the heredoc stays a single segment.
+			expect(parseCommand("cat <<E arg\nhi\nE").commands).toEqual(["cat <<E\nhi\nE arg"])
+			// The same split applies at the top level: a second pipeline stage
+			// after the delimiter must not share the heredoc head's word.
+			expect(parseCommand("cat <<E | rm x\nhi\nE").commands).toEqual(["cat <<E\nhi\nE", "rm x"])
+		})
+
+		it("keeps a mid-word # in the opener remainder from swallowing the tail", () => {
+			// bash treats a mid-word `#` as an ordinary character. The tokenizer
+			// would drop everything after it as comment text. The remainder
+			// emission masks that `#` like the live-text scan does, so the
+			// `rm x` after the pipe reaches a segment of its own.
+			const input = "echo $(cat <<E f#g | rm x\nhi\nE\n)"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "cat <<E\nhi\nE f#g", "rm x"])
+		})
+
+		it("keeps a word-initial # remainder as the comment bash sees", () => {
+			// At a word start the tokenizer and bash agree: the `#` opens a
+			// comment that runs to end of line, and nothing after it executes.
+			const { commands, parseError } = parseCommand("cat <<E # note\nhi\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nhi\nE"])
+		})
+
+		it("fails closed on an odd backslash run at the end of the opener remainder", () => {
+			// bash joins the `\`+LF pair, so `| rm x` executes from the opener
+			// line. The remainder cut stops at that LF, so it cannot account
+			// for the joined bytes. The heredoc fails closed instead of
+			// approving a command the decomposition never surfaced.
+			const input = "echo $(cat <<E \\\n| rm x\nhi\nE\n)"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("ends the delimiter word at an unquoted operator so the tail splits", () => {
+			// bash tokenizes `cat <<EOF|grep y` as the word `EOF` plus a live
+			// pipe, exactly like the spaced idiom. The terminator comparison
+			// must use `EOF`, not `EOF|grep`, so the well-terminated body
+			// closes and the tail splits into its own segment.
+			const input = "cat <<EOF|grep y\nhi\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\nhi\nEOF", "grep y"])
+		})
+
+		it("fails closed when a glued-operator delimiter hides the real terminator", () => {
+			// bash takes `E` as the delimiter word for `cat <<E|rm x`, so the
+			// body runs to end of input: the line `E|rm` never terminates it
+			// and `rm x` executes live. The parser must not match that line as
+			// a terminator, so the construct fails closed.
+			const input = "echo $(cat <<E|rm x\nhi\nE|rm\n)"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("keeps a # glued to a command-substitution closer from swallowing the tail", () => {
+			// bash ends `$(ls)` but not the word: the `#` is mid-word content
+			// and `; rm y` stays live. A word-initial reading would drop the
+			// tail as comment text, so the closer takes the placeholder channel.
+			const { commands, parseError } = parseCommand("echo $(cat <<E $(ls)#x ; rm y\nhi\nE\n)")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "cat <<E\nhi\nE $ ( ls ) #x", "ls", "rm y"])
+		})
+
+		it("keeps a # glued to a command-substitution closer at the top level too", () => {
+			// The same closer rule without the surrounding expansion: the deny
+			// head after the operator must reach its own segment.
+			const { commands, parseError } = parseCommand("cat <<E $(ls)#x ; rm y\nhi\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nhi\nE $ ( ls ) #x", "ls", "rm y"])
+		})
+
+		it("keeps a # glued to a process-substitution closer from swallowing the tail", () => {
+			// `<(...)` closes a word-continuing region exactly like `$(...)`.
+			const { commands, parseError } = parseCommand("echo $(cat <<E <(ls)#x ; rm y\nhi\nE\n)")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "cat <<E\nhi\nE <( ls ) #x", "ls", "rm y"])
+		})
+
+		it("keeps a # glued to a substitution closer working against a glued pipe", () => {
+			// The operator needs no surrounding blanks: bash still runs the
+			// right-hand command, so it must split into its own segment.
+			const { commands, parseError } = parseCommand("echo $(cat <<E $(ls)#x|rm y\nhi\nE\n)")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "cat <<E\nhi\nE $ ( ls ) #x", "ls", "rm y"])
+		})
+
+		it("keeps a # glued to a backtick closer from swallowing the tail", () => {
+			// The backtick region closes the expansion but not the word, like
+			// every other closer, in the split and the glued-operator shape.
+			const split = parseCommand("echo $(cat <<E `ls`#x ; rm y\nhi\nE\n)")
+			expect(split.parseError).toBeNull()
+			expect(split.commands).toEqual(["echo", "cat <<E\nhi\nE `ls`#x", "ls", "rm y"])
+			const glued = parseCommand("echo $(cat <<E `ls`#x|rm y\nhi\nE\n)")
+			expect(glued.parseError).toBeNull()
+			expect(glued.commands).toEqual(["echo", "cat <<E\nhi\nE `ls`#x", "ls", "rm y"])
+		})
+
+		it("keeps a # glued to a parameter or arithmetic closer from swallowing the tail", () => {
+			// `${x}` and `$((1))` end an expansion, not the word: bash treats
+			// the `#` as ordinary content and runs the tail. The arithmetic
+			// frame must close at its second `)`, never the first.
+			const param = parseCommand("cat <<E ${x}#y ; rm z\nhi\nE")
+			expect(param.parseError).toBeNull()
+			expect(param.commands).toEqual(["cat <<E\nhi\nE #y", "rm z"])
+			const arith = parseCommand("cat <<E $((1))#y ; rm z\nhi\nE")
+			expect(arith.parseError).toBeNull()
+			expect(arith.commands).toEqual(["cat <<E\nhi\nE $ ( ( 1 ) ) #y", "rm z"])
+		})
+
+		it("keeps a # glued to a closed quote in the remainder on the placeholder path", () => {
+			// Quotes pass through the walk unmasked, so the quote-then-`#`
+			// word keeps the behavior the escaped-hash control established:
+			// the tail survives tokenization.
+			const dq = parseCommand('echo $(cat <<E "a"#x ; rm y\nhi\nE\n)')
+			expect(dq.parseError).toBeNull()
+			expect(dq.commands).toEqual(["echo", "cat <<E\nhi\nE a#x", "rm y"])
+			const sq = parseCommand("echo $(cat <<E 'a'#x ; rm y\nhi\nE\n)")
+			expect(sq.parseError).toBeNull()
+			expect(sq.commands).toEqual(["echo", "cat <<E\nhi\nE a#x", "rm y"])
+		})
+
+		it("keeps a spaced # after a closer in the remainder as the comment bash sees", () => {
+			// A blank before the `#` puts it at a real word start: bash starts
+			// a comment there and never runs the tail. The closer rule must not
+			// widen past a `#` directly after the closer.
+			const { commands, parseError } = parseCommand("echo $(cat <<E $(ls) #x ; rm y\nhi\nE\n)")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "cat <<E\nhi\nE $ ( ls )", "ls"])
+		})
+
+		it("fails closed on a delimiter glued to a subshell paren", () => {
+			// bash refuses `cat <<E(rm x)`: a `(` after a completed word token
+			// is a syntax error, never a delimiter break. The word keeps the
+			// parens, no body line matches it, and the construct fails closed
+			// exactly like the base parser instead of approving unexecutable
+			// input whose remainder hides the parenthesized text unsplit.
+			const input = "cat <<E(rm x)\nhi\nE"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a delimiter glued to a subshell paren inside a substitution", () => {
+			// The embedding expansion changes nothing: the opener line is
+			// still bash-illegal at the glued `(`.
+			const input = "echo $(cat <<E(rm x)\nhi\nE\n)"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed on a delimiter glued to a subshell paren through a tab", () => {
+			// A tab after the glued parens is still inside the illegal token.
+			const input = "cat <<E(rm x)\t\nhi\nE"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("splits a spaced parenthesized remainder as before (no over-reject)", () => {
+			// A blank before the `(` ends the delimiter word the way bash's
+			// token boundary does: the heredoc closes and the group reaches
+			// the host text unsplit, approved at base and now alike.
+			const { commands, parseError } = parseCommand("cat <<E (rm x)\nhi\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nhi\nE ( rm x )"])
+		})
+
+		it("keeps braces and mid-word parens as delimiter word characters", () => {
+			// `{` is no metacharacter: `E{rm x;}` is one word whose body never
+			// terminates. A `(` after a nonempty word is illegal in bash, so
+			// `x=1(y)` keeps the paren inside the word and the heredoc closes
+			// at `E` with the remainder as live host text.
+			const glued = parseCommand("cat <<E{rm x;}\nhi\nE")
+			expect(glued.commands).toEqual(["cat <<E{rm x;}\nhi\nE"])
+			expect(glued.parseError?.quoteType).toBe("heredoc")
+			const midword = parseCommand("cat <<E x=1(y)\nhi\nE")
+			expect(midword.parseError).toBeNull()
+			expect(midword.commands).toEqual(["cat <<E\nhi\nE x=1 ( y )"])
+		})
+
+		it("fails closed on a delimiter glued to a closing paren", () => {
+			// `)` is a metacharacter only at token start; glued after the word
+			// `E` it is a syntax error in bash, so the word keeps it, the body
+			// never terminates, and the base rejection is restored.
+			const input = "cat <<E)rm x\nhi\nE"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when a metacharacter starts the delimiter word", () => {
+			// A `(` or `)` can only start a metacharacter, never a word: with
+			// the word absent, the opener breaks on the metacharacter and the
+			// no-word metacharacter guard fails the construct closed. bash needs a
+			// word token after the redirection operator and rejects this input
+			// outright, so no rejection here can cost an executable command. A body
+			// line that matches the metacharacter word (the terminator-matching
+			// variant of each shape) fails closed too: the guard cannot tell the
+			// body apart, and bash never executes this input either way.
+			const cases: string[] = ["cat <<(x)\nhi\n(x)", "cat <<(x)\nhi\nE", "cat <<)x\nhi\nE"]
+			for (const input of cases) {
+				const { commands, parseError } = parseCommand(input)
+				expect(commands).toEqual([input])
+				expect(parseError?.quoteType).toBe("heredoc")
+			}
+		})
+
+		it("fails closed on every word-start operator shape", () => {
+			// One assert per word-start metacharacter in the delimiter break
+			// set, including the `<<-` and spaced-`<` variants. bash ends the
+			// absent word at the operator token and rejects the whole command
+			// before executing anything, so each shape fails closed with the
+			// raw input.
+			const cases: string[] = [
+				"cat <<|rm x\nhi\nE",
+				"cat <<&rm x\nhi\nE",
+				"cat <<;rm x\nhi\nE",
+				"cat <<(x)\nhi\nE",
+				"cat <<)x\nhi\nE",
+				"cat <<>f\nhi\nE",
+				"cat << <f\nhi\nE",
+				"cat <<-|rm x\nhi\nE",
+			]
+			for (const input of cases) {
+				const { commands, parseError } = parseCommand(input)
+				expect(commands).toEqual([input])
+				expect(parseError?.quoteType).toBe("heredoc")
+			}
+		})
+
+		it("fails closed on a word-start operator inside a substitution frame", () => {
+			// The expansion-frame call site shares the guard: a heredoc opened
+			// inside `$(…)` with an operator instead of a delimiter word fails
+			// closed the same way. The guard fires at the opener, so a body
+			// line matching the metacharacter word never reaches the
+			// terminator search.
+			for (const input of ["echo $(cat <<(x)\nhi\nE\n)", "echo $(cat <<(x)\nhi\n(x)\n)"]) {
+				const { commands, parseError } = parseCommand(input)
+				expect(commands).toEqual([input])
+				expect(parseError?.quoteType).toBe("heredoc")
+			}
+		})
+
+		it("keeps # a delimiter word character and controls the no-word paths", () => {
+			// `#` never enters the delimiter break sets: the word keeps it, so
+			// a non-matching body fails like any unmatched delimiter and a
+			// matching body closes -- unchanged by the metacharacter guard.
+			const unmatched = parseCommand("cat <<#x\nhi\nE")
+			expect(unmatched.commands).toEqual(["cat <<#x\nhi\nE"])
+			expect(unmatched.parseError?.quoteType).toBe("heredoc")
+			const matched = parseCommand("cat <<#x\nhi\n#x")
+			expect(matched.parseError).toBeNull()
+			expect(matched.commands).toEqual(["cat <<#x\nhi\n#x"])
+			// End-of-input control for the guard's boundary clause: with no
+			// line ending at all the opener still fails closed, whether the
+			// guard or the opener-line check reports it.
+			const atEof = parseCommand("cat <<")
+			expect(atEof.commands).toEqual(["cat <<"])
+			expect(atEof.parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("splits a chain after a group closer glued to # in the opener remainder", () => {
+			// bash balances the inner `(ls)` group before the `$( … )` closer,
+			// so the closer ends the region, the glued `#` takes the
+			// placeholder, and `rm y` stays live. Dropping the group tracking
+			// pops the frame at the inner `)`, lands the closer early, and lets
+			// the `#` read as a word-initial comment that swallows the tail.
+			const { commands, parseError } = parseCommand("cat <<E $( (ls) )#x ; rm y\nhi\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nhi\nE $ ( ( ls ) ) #x", "( ls )", "rm y"])
+		})
+	})
+
+	describe("heredoc opener-remainder walk and backslash-run guard", () => {
+		// The text after the delimiter word on the opener line is live syntax
+		// the outer scan never revisits: a dedicated walk applies the comment,
+		// region, and escape policy to it, and a trailing backslash-run guard
+		// decides whether an odd unquoted run joins the body onto the opener
+		// line. Each pin below walks a branch of one of the two mechanisms and
+		// pins bytes only that branch produces.
+
+		it("emits an escaped # in the opener remainder verbatim", () => {
+			// The escape-pair branch forwards `\<char>` whole, so the `#` is
+			// word content and no comment starts. Shortening or reversing the
+			// emitted pair shifts every later index, which the exact host
+			// bytes here catch.
+			const { commands, parseError } = parseCommand("cat <<E \\#x\nbody\nE\n")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE #x"])
+		})
+
+		it("keeps a # directly after an escaped blank on the placeholder path", () => {
+			// The escape pair ends one index past the blank, so the `#`
+			// continues the word and takes the opaque placeholder instead of
+			// opening a comment. Moving the tracked escape end two bytes
+			// earlier makes the `#` word-initial and drops the `#b` tail.
+			const { commands, parseError } = parseCommand("cat <<E a\\ #b\nbody\nE\n")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE a #b"])
+		})
+
+		it("treats a backtick region in the opener remainder as opaque until its closer", () => {
+			// Backticks do not nest: the walk treats the region as opaque until
+			// the closer, and the closer ends the frame. The extracted payload
+			// plus the split host bytes pin the frame's open, opacity, and
+			// close together.
+			const { commands, parseError } = parseCommand("cat <<E `a#b`\nbody\nE\n")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE `a", "a#b"])
+		})
+
+		it("starts the opener-remainder comment at a # after a bare (", () => {
+			// A bare `(` with no region open is host grouping, so the `#` sits
+			// at a word start and opens the comment bash sees: the host stops
+			// right after the paren. Inspecting the character after the `#`
+			// instead of before it reads the `#` as mid-word and keeps the
+			// tail.
+			const { commands, parseError } = parseCommand("cat <<E x(#y\nbody\nE\n")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE x ("])
+		})
+
+		const guardRows: Array<{ name: string; input: string; commands: string[]; error: "heredoc" | null }> = [
+			{
+				name: "fails closed on an odd unquoted backslash run",
+				input: "cat <<E x\\\nbody\nE\n",
+				commands: ["cat <<E x\\\nbody\nE\n"],
+				error: "heredoc",
+			},
+			{
+				name: "joins nothing after an even unquoted run and closes at the terminator",
+				input: "cat <<E x\\\\\nbody\nE\nbody2\nE\n",
+				commands: ["cat <<E\nbody\nE x\\", "body2", "E"],
+				error: null,
+			},
+			{
+				name: "keeps a single-quoted backslash literal at the run",
+				input: "cat <<E 'x\\\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE x"],
+				error: null,
+			},
+			{
+				name: "fails closed on an odd run inside double quotes",
+				input: 'cat <<E "x\\\nbody\nE\n',
+				commands: ['cat <<E "x\\\nbody\nE\n'],
+				error: "heredoc",
+			},
+			{
+				name: "fails closed on an odd run after a closed double quote",
+				input: 'cat <<E "a"\\\nbody\nE\n',
+				commands: ['cat <<E "a"\\\nbody\nE\n'],
+				error: "heredoc",
+			},
+			{
+				name: "fails closed on an odd run after an escaped backslash inside double quotes",
+				input: 'cat <<E "\\\\"\\\nbody\nE\n',
+				commands: ['cat <<E "\\\\"\\\nbody\nE\n'],
+				error: "heredoc",
+			},
+			{
+				name: "fails closed on an odd run after a closed single quote",
+				input: "cat <<E 'a'\\\nbody\nE\n",
+				commands: ["cat <<E 'a'\\\nbody\nE\n"],
+				error: "heredoc",
+			},
+			{
+				name: "keeps a run covered by an open single quote silent",
+				input: "cat <<E 'a\\\\\\\nbody\nE\nbody2\nE\n",
+				commands: ["cat <<E\nbody\nE a\\", "body2", "E"],
+				error: null,
+			},
+			{
+				name: "fails closed on an odd run after an escaped double quote",
+				input: 'cat <<E \\"\\\nbody\nE\n',
+				commands: ['cat <<E \\"\\\nbody\nE\n'],
+				error: "heredoc",
+			},
+			{
+				// `\'` keeps the following `'` escaped, so the run is unquoted
+				// and joins the body's `; rm -rf /` line onto the opener. The
+				// guard's unquoted escape-advance branch decides this; losing
+				// it reads the run as single-quoted and accepts the join.
+				name: "fails closed on an odd run after an escaped single quote",
+				input: "cat <<E a\\'\\\n; rm -rf /\nE\n",
+				commands: ["cat <<E a\\'\\\n; rm -rf /\nE\n"],
+				error: "heredoc",
+			},
+			{
+				// The `\"` pairs inside the double quote, the following `'`
+				// starts a single-quote region that the double-quote branch's
+				// advance never skips, and the run joins the deny line. Walking
+				// the `'` as double-quote content accepts the construct.
+				name: "fails closed on an odd run started after a double-quoted region ends in an open single quote",
+				input: 'cat <<E "a\\"b\'\\\n; rm -rf /\nE\n',
+				commands: ['cat <<E "a\\"b\'\\\n; rm -rf /\nE\n'],
+				error: "heredoc",
+			},
+			{
+				// `"a"` closes, then `b'` opens a single quote that stays open
+				// into the run: the guard must see the single-quote state at
+				// the run and stay silent. A walk that skips the post-quote
+				// bare text enters the wrong branch and rejects this opener.
+				name: "keeps an open single quote silent over the run after a closed double quote",
+				input: 'cat <<E "a"b\'\\\n; rm -rf /\nE\n',
+				commands: ["cat <<E\n; rm -rf /\nE ab "],
+				error: null,
+			},
+			{
+				// Host parens with no region open are ordinary text; only a
+				// real `$` opener pushes a frame. Reading every character as a
+				// potential opener (or any `$` as one) rebalances the frames
+				// here and shifts the masked comment bytes.
+				name: "keeps bare host parens in the remainder as ordinary text",
+				input: "cat <<E x()#y\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE x ( )"],
+				error: null,
+			},
+			{
+				// A `$` followed by a plain letter is not an opener: it stays
+				// ordinary text and only the real `$(a)` region masks. An
+				// opener test that ignores the next character pushes a phantom
+				// frame for `$x` and rewrites the word-continuation `#`.
+				name: "keeps a $ before a plain letter ordinary in the remainder",
+				input: "cat <<E $x$(a)#y\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $ ( a ) #y", "a"],
+				error: null,
+			},
+			{
+				// The `#` sits directly at the region closer, so it continues
+				// the word as a placeholder and the `; rm y` tail stays live
+				// syntax the decomposition surfaces. Losing the closer index
+				// reads the `#` as a comment start and swallows the tail.
+				name: "continues the word at a # directly after a region closer",
+				input: "cat <<E $a$(b)#; rm y\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $ ( b ) #", "b", "rm y"],
+				error: null,
+			},
+			{
+				// Inside the `(`-closing frame, the `[` frame's own `]` closer
+				// is the only one that pops it: the `)` in between is a group
+				// paren. Swapping the `[` detection for the wrong closer (or
+				// dropping it) ends the outer region at the inner `)` and
+				// changes every byte after it.
+				name: "keeps a [ frame inside a ( frame closed only by its ]",
+				input: "cat <<E $(a$[b)c]d)#x\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $ ( a$[b ) c]d ) #x", "a$[b)c]d"],
+				error: null,
+			},
+			{
+				// A `{` frame closes at its `}`, so the following `$(b)` opens
+				// and closes as its own region and the `#` after its closer
+				// continues the word. A closer picked as `)` or `]` for the
+				// `{` frame never pops it, changing the masked bytes and the
+				// split.
+				name: "closes a { frame at its } closer in the remainder",
+				input: "cat <<E ${a}$(b)#c\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $ ( b ) #c", "b"],
+				error: null,
+			},
+			{
+				// Symmetric to the `{` frame row: the `[` frame's closer is
+				// `]`, and mis-picking `}` or `)` rebalances the following
+				// `$(b)` region. The masked host bytes plus the split payload
+				// pin the exact closer character.
+				name: "closes a [ frame at its ] closer in the remainder",
+				input: "cat <<E $[a]$(b)#c\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $[a]$ ( b ) #c", "b"],
+				error: null,
+			},
+			{
+				// Unmatched host parens before a region stay ordinary text;
+				// the walk's frame bookkeeping starts at the `$(`. Reading the
+				// double-paren detection from the wrong index here (or the
+				// wrong distance) treats the leading `((` differently and
+				// shifts every following host byte.
+				name: "keeps unmatched host parens around a region live in the remainder",
+				input: "cat <<E ((x$(b))#y\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE ( ( x$ ( b ) )", "b"],
+				error: null,
+			},
+			{
+				// Two nested `(`-closing frames pop one at a time on the two
+				// `)`, so the `#` after the outer closer continues the word.
+				// A frame that consumes both closers (or a group depth started
+				// for a non-`$((` opener) leaves the frames unbalanced and
+				// rewrites the tail.
+				name: "closes nested ( frames one at a time in the remainder",
+				input: "cat <<E $(a$(b))#y\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $ ( a$ ( b ) ) #y", "a", "b"],
+				error: null,
+			},
+			{
+				// Only the opener's own character closes a quote region, so
+				// the inner apostrophes stay double-quote content and the
+				// region never closes. The `#` inside the open region is
+				// ordinary content and the tail rides the quotes into the
+				// dropped bytes. Any walk whose quote state diverges here
+				// leaves `#c` in the emitted host instead of dropping it.
+				name: "keeps an inner apostrophe from closing a double-quoted remainder region",
+				input: "cat <<E \"a'b'#c\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE ab"],
+				error: null,
+			},
+			{
+				// Symmetric to the double-quote row: a `"` inside a
+				// single-quote region is literal, the region stays open, and
+				// the `#` inside it is never a mask or comment decision the
+				// walk takes. Closing on the wrong character keeps `#c`.
+				name: "keeps an inner double quote from closing a single-quoted remainder region",
+				input: 'cat <<E \'a"b"#c\nbody\nE\n',
+				commands: ["cat <<E\nbody\nE ab"],
+				error: null,
+			},
+			{
+				// The closer test compares against the opener's character:
+				// the closing `"` ends the region and the `#` riding at the
+				// close continues the word as a placeholder, so the tail
+				// survives. A walk that ends the region at the inner
+				// apostrophe re-opens it at the closer and swallows `#c`.
+				name: "continues the word at a # after a closed double quote",
+				input: 'cat <<E "a\'b"#c\nbody\nE\n',
+				commands: ["cat <<E\nbody\nE a'b#c"],
+				error: null,
+			},
+			{
+				// Symmetric closer-boundary row on a single-quote region:
+				// only `'` closes `'`. Mis-testing the character leaves the
+				// walk in the wrong quote state at the `#` and drops `#c`.
+				name: "continues the word at a # after a closed single quote",
+				input: "cat <<E 'a\"b'#c\nbody\nE\n",
+				commands: ['cat <<E\nbody\nE a"b#c'],
+				error: null,
+			},
+			{
+				// `>(…)` pushes a `)`-closing frame exactly like `<(…)`, so
+				// the chain's final `)` is a region closer and the `#`
+				// directly at it continues the word. A walk that never opens
+				// the frame reads the `#` after a bare `)` as word-initial
+				// and drops `#c` as a comment.
+				name: "keeps a # after a chained >(…) closer as word content",
+				input: "cat <<E >(a)>(b)#c\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE > ( a ) > ( b ) #c", "a", "b"],
+				error: null,
+			},
+			{
+				// `>` only opens a process-substitution frame when `(`
+				// follows immediately; here it is an ordinary redirect that
+				// the walk forwards as host text. A walk that opens the
+				// frame regardless of the next character swallows the
+				// target's first character into the frame bytes.
+				name: "keeps a plain > redirect out of the process-substitution frame",
+				input: "cat <<E >out\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE > out"],
+				error: null,
+			},
+			{
+				// The `<` counterpart: without an immediately following `(`
+				// the redirect stays ordinary text. The frame-misfire bytes
+				// differ from these pins in the character right after `<`.
+				name: "keeps a plain < redirect out of the process-substitution frame",
+				input: "cat <<E <in\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE < in"],
+				error: null,
+			},
+			{
+				// The `#` rides the inner `$(b)` pop while the outer `$[ ]`
+				// frame stays open, so it is ordinary frame content and bash
+				// drops the `; rm -rf /]d` tail as a comment. Marking the
+				// closer at an inner pop instead keeps " #c" in the host and
+				// exposes the tail as a fabricated word segment.
+				name: "keeps a # riding an inner closer inside an open outer frame as frame content",
+				input: "cat <<E $[a$(b)#c; rm -rf /]d\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $[a$ ( b )", "b"],
+				error: null,
+			},
+			{
+				// Same class without the deny tail: the `#c` stays inside the
+				// still-open `$[ ]` frame and the `]d` bytes ride the frame's
+				// masked host. Closer bookkeeping fired on the inner pop
+				// emits " #c" into the emitted bytes instead.
+				name: "keeps a # riding an inner closer out of the host bytes of an open outer frame",
+				input: "cat <<E $[a$(b)#c]d\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $[a$ ( b )", "b"],
+				error: null,
+			},
+			{
+				// The `#` rides the pop that empties the frames: the word
+				// continues, the glued `#c` takes the placeholder, and
+				// `; rm -rf /` stays live syntax the decomposition surfaces.
+				// Only the pop leaving no frames marks the closer; inner
+				// pops must not, or this tail reads as a comment.
+				name: "marks the closer only on the pop that empties the frames",
+				input: "cat <<E $[a$(b)]#c; rm -rf /\nbody\nE\n",
+				commands: ["cat <<E\nbody\nE $[a$ ( b ) ]#c", "b", "rm -rf /"],
+				error: null,
+			},
+		]
+
+		it.each(guardRows)("$name", ({ input, commands, error }) => {
+			// The quote-tracking walk decides whether the trailing odd run
+			// opens a join: only a single-quote region keeps the backslash
+			// literal. Each row pins one state or advance branch of the walk;
+			// the double-quote and escape rows additionally pin the walk's
+			// advance steps, which a stalled step would hang on.
+			const result = parseCommand(input)
+			expect(result.commands).toEqual(commands)
+			expect(result.parseError?.quoteType ?? null).toBe(error)
+		})
+
+		it("fails closed on the crafted closed-quote backslash join", () => {
+			// `'a'` closes before the run, so the trailing backslash joins the
+			// body's `; rm -rf /` line onto the opener line as live syntax.
+			// The remainder cut stops at its own newline and cannot account
+			// for the joined bytes, so the heredoc fails closed. A walk that
+			// loses the single-quote state accepts the construct instead and
+			// masks the joined line out of the decomposition.
+			const input = "cat <<E 'a'\\\n; rm -rf /\nE\n"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
 		})
 	})
 
@@ -1263,7 +1912,14 @@ describe("parseCommand", () => {
 			// the same quote gating.
 			const { commands, parseError } = parseCommand('cat <<EOF $( (echo ")") ; curl evil)\nbody\nEOF')
 			expect(parseError).toBeNull()
-			expect(commands).toEqual(['cat <<EOF $( (echo ")") ; curl evil)\nbody\nEOF', '( echo ")" )', "curl evil"])
+			// The remainder stays live host text, so the frame's tail also
+			// splits as host segments on top of the routed payload segments.
+			expect(commands).toEqual([
+				"cat <<EOF\nbody\nEOF $ ( ( echo ) )",
+				'( echo ")" )',
+				"curl evil",
+				"curl evil )",
+			])
 		})
 	})
 
