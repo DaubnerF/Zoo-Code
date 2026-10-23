@@ -1083,6 +1083,22 @@ function scanShellSyntax(text: string): ScanOutcome {
 				if (text[i + 1] === "(") {
 					if (text[i + 2] === "(") {
 						const arith = skipArithmetic(i)
+						if (arith.commandSubstitution) {
+							// bash reads this opener as `$(` plus a group, not
+							// arithmetic. The loop re-reads the group's `(` as
+							// a group paren, like the adjacent `$(` push.
+							frames.push({
+								kind: "command-substitution",
+								openIndex: i,
+								closer: ")",
+								contentStart: i + 2,
+								escaped: true,
+								groupDepth: 0,
+								payloads: null,
+							})
+							i += 2
+							continue
+						}
 						// An unclosed opener fails closed. The shell refuses the
 						// input, and masking the rest of the body would hide it.
 						if (!arith.closed) {
@@ -1172,9 +1188,14 @@ function scanShellSyntax(text: string): ScanOutcome {
 	 * Consume a `$((…))` or `$[…]` arithmetic expression. `closed` reports
 	 * whether the scan found the closing delimiter. Callers fail closed when
 	 * it is missing, because bash refuses an unclosed opener. The scan walks
-	 * only a closed expression's interior for expansions.
+	 * only a closed expression's interior for expansions. `commandSubstitution`
+	 * marks a `$((` that bash does not read as arithmetic at all: arithmetic
+	 * syntax requires the two closers to be adjacent (`))`), so when the
+	 * depth-1 `)` is not immediately followed by another `)`, bash reads `$(`
+	 * plus a subshell group instead. Such callers must open a
+	 * command-substitution frame rather than mask the region as arithmetic.
 	 */
-	const skipArithmetic = (i: number): { end: number; closed: boolean } => {
+	const skipArithmetic = (i: number): { end: number; closed: boolean; commandSubstitution?: boolean } => {
 		if (text[i + 1] === "[") {
 			const close = text.indexOf("]", i + 2)
 			return close === -1 ? { end: text.length, closed: false } : { end: close + 1, closed: true }
@@ -1187,6 +1208,12 @@ function scanShellSyntax(text: string): ScanOutcome {
 				depth++
 			} else if (text[j] === ")") {
 				depth--
+				// Inside valid arithmetic the depth-1 `)` is by construction
+				// the first character of the `))` token. Anything else is a
+				// command substitution whose group closes at this `)`.
+				if (depth === 1 && text[j + 1] !== ")") {
+					return { end: i + 2, closed: false, commandSubstitution: true }
+				}
 			}
 			j++
 		}
@@ -1331,6 +1358,22 @@ function scanShellSyntax(text: string): ScanOutcome {
 				if (text[i + 1] === "(") {
 					if (text[i + 2] === "(") {
 						const arith = skipArithmetic(i)
+						if (arith.commandSubstitution) {
+							// bash reads this opener as `$(` plus a group, not
+							// arithmetic. The loop re-reads the group's `(` as
+							// a group paren, like the adjacent `$(` push.
+							stack.push({
+								kind: "command-substitution",
+								openIndex: i,
+								closer: ")",
+								contentStart: i + 2,
+								escaped: true,
+								groupDepth: 0,
+								payloads: null,
+							})
+							i += 2
+							continue
+						}
 						// Fail closed here instead of letting the outer region
 						// error at end of input. That would name the wrong
 						// opener and silently drop the arithmetic's interior
@@ -1575,6 +1618,23 @@ function scanShellSyntax(text: string): ScanOutcome {
 			if (text[i + 1] === "(") {
 				if (text[i + 2] === "(") {
 					const arith = skipArithmetic(i)
+					if (arith.commandSubstitution) {
+						// bash reads this opener as `$(` plus a group, not
+						// arithmetic. The loop re-reads the group's `(` as a
+						// group paren, like the adjacent `$(` push, so the
+						// group's command is extracted independently.
+						stack.push({
+							kind: "command-substitution",
+							openIndex: i,
+							closer: ")",
+							contentStart: i + 2,
+							escaped: true,
+							groupDepth: 0,
+							payloads: null,
+						})
+						i += 2
+						continue
+					}
 					// An unclosed opener fails closed. Masking the remainder to
 					// end of input would hide its text behind the host word.
 					if (!arith.closed) {

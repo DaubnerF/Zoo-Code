@@ -1563,11 +1563,13 @@ describe("parseCommand", () => {
 			// Routing the masked remainder to the host instead would split the
 			// input into two segments. Each segment could then match the
 			// allowlist. bash rejects the input outright, so failing closed costs
-			// a tool error, never an approval.
+			// a tool error, never an approval. The lone depth-1 closer makes bash
+			// read the opener as a command substitution, so the unclosed frame
+			// that swallows the later line is reported as one.
 			const swallowed = "echo $((1 )\nevilcmd arg"
 			const { commands, parseError } = parseCommand(swallowed)
 			expect(commands).toEqual([swallowed])
-			expect(parseError?.quoteType).toBe("arithmetic")
+			expect(parseError?.quoteType).toBe("command-substitution")
 			// The matching control input keeps its extraction behavior.
 			const control = "echo $(( $(evil) ))"
 			expect(parseCommand(control).commands).toEqual([control, "evil"])
@@ -1584,10 +1586,13 @@ describe("parseCommand", () => {
 		})
 
 		it("fails closed on an unclosed $(( inside a heredoc body", () => {
+			// A lone depth-1 closer converts the opener to a command
+			// substitution; unclosed at the body end, the frame fails closed
+			// under its own kind.
 			const input = "cat <<EOF\n$((1 )\nEOF"
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
-			expect(parseError?.quoteType).toBe("arithmetic")
+			expect(parseError?.quoteType).toBe("command-substitution")
 		})
 
 		it("fails closed on an unclosed $[ at top level and inside a heredoc body", () => {
@@ -1660,8 +1665,10 @@ describe("parseCommand", () => {
 			const input = "echo hi # )\ncat <<'EOF'\n$(x\nEOF"
 			const { commands, parseError } = parseCommand(input)
 			expect(parseError).toBeNull()
-			expect(commands[0]).toBe("echo hi")
-			expect(commands[commands.length - 1]).toContain("$(x")
+			// The comment's stray `)` is dropped with the comment; the quoted
+			// delimiter makes the body opaque, so `$(x` stays inside the
+			// heredoc host word and is never extracted.
+			expect(commands).toEqual(["echo hi", "cat <<'EOF'\n$(x\nEOF"])
 		})
 	})
 
@@ -1822,7 +1829,9 @@ describe("parseCommand", () => {
 		it("extracts a nested substitution through an enclosing group", () => {
 			const { commands, parseError } = parseCommand("echo $( (echo $(whoami)) )")
 			expect(parseError).toBeNull()
-			expect(commands).toContain("whoami")
+			// The group's text is sliced at the nested substitution's closer,
+			// so the group's shell-word remnants flank the payload segment.
+			expect(commands).toEqual(["echo", "( echo", "whoami", ")"])
 		})
 
 		it("fails closed on a group left unclosed inside a substitution", () => {
@@ -1832,6 +1841,51 @@ describe("parseCommand", () => {
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
 			expect(parseError?.quoteType).toBe("command-substitution")
+		})
+
+		it("extracts the group of a mis-nested $(( … ) … ) as its own segment", () => {
+			// bash reads a `$((` whose depth-1 closer is not doubled as a
+			// command substitution containing a subshell group, and runs the
+			// group's command. The payload must surface as its own segment
+			// instead of hiding inside the host word the way arithmetic does.
+			const { commands, parseError } = parseCommand("echo $((rm -rf /) )")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "( rm -rf / )"])
+		})
+
+		it("keeps closed $(( … )) and $[ … ] arithmetic masked", () => {
+			// Non-regression controls: the closer-adjacency guard must not
+			// touch well-formed arithmetic, where the depth-1 closer is the
+			// first character of the `))` token by construction.
+			expect(parseCommand("echo $((1+2))").commands).toEqual(["echo $((1+2))"])
+			expect(parseCommand("echo $(( (1) ))").commands).toEqual(["echo $(( (1) ))"])
+			expect(parseCommand("echo $[1+2]").commands).toEqual(["echo $[1+2]"])
+			expect(findUnterminatedQuote("echo $(( x")?.quoteType).toBe("arithmetic")
+		})
+
+		it("extracts a mis-nested $(( … ) … ) group from an unquoted heredoc body", () => {
+			// The body walk re-routes the opener the same way the main scan
+			// does, so a group hidden behind an allowlisted `cat` still gets
+			// its own segment.
+			const input = "cat <<EOF\n$((rm -rf /) )\nEOF"
+			const { commands, parseError } = parseCommand(input)
+			expect(parseError).toBeNull()
+			expect(commands).toEqual([input, "( rm -rf / )"])
+		})
+
+		it("routes a nested mis-nested $(( through the frame and fails unclosed forms closed", () => {
+			const { commands, parseError } = parseCommand("echo $( $((rm -rf /) ) )")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo", "( rm -rf / )"])
+			// Without any depth-1 closer the opener stays arithmetic, as before.
+			const unclosed = parseCommand("echo $((rm -rf /")
+			expect(unclosed.commands).toEqual(["echo $((rm -rf /"])
+			expect(unclosed.parseError?.quoteType).toBe("arithmetic")
+			// With a closer that never doubles, the converted frame is the
+			// outermost construct that cannot close.
+			const halfClosed = parseCommand("echo $((rm -rf /) ")
+			expect(halfClosed.commands).toEqual(["echo $((rm -rf /) "])
+			expect(halfClosed.parseError?.quoteType).toBe("command-substitution")
 		})
 
 		it("extracts a grouped substitution whole from an unquoted heredoc body", () => {
@@ -2424,7 +2478,9 @@ describe("parseCommand", () => {
 			const input = 'echo $("x)'
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
-			expect(parseError).not.toBeNull()
+			// End of input reports the outermost frame: the substitution that
+			// can never close because its quoted payload swallowed the closer.
+			expect(parseError?.quoteType).toBe("command-substitution")
 		})
 
 		it("honours a backslash-escaped character inside a double-quoted delimiter", () => {

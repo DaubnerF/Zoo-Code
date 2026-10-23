@@ -514,8 +514,18 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	it("does not reject a subshell group inside a command substitution as malformed", () => {
 		// `$( (echo safe) )` is ordinary syntax that bash runs. A top-level
 		// bare `(` stays host grouping, as segmentation worked before this
-		// change. The decision must not be malformed_command either way.
-		expect(getCommandDecision("$( (echo safe) )", ["echo"])).not.toBe("malformed_command")
+		// change. The extracted group starts with `(`, so it matches neither
+		// list and the decision is `ask_user`, never `malformed_command`.
+		expect(getCommandDecision("$( (echo safe) )", ["echo"])).toBe("ask_user")
+	})
+
+	it("does not auto-approve the group of a mis-nested $(( … ) … )", () => {
+		// bash runs the group inside `echo $((rm -rf /) )`, so the group must
+		// be checked on its own instead of riding the allowlisted `echo`.
+		// The extracted group starts with `(`, so neither list prefix matches
+		// it; the decision is `ask_user`, never `auto_approve`.
+		expect(getCommandDecision("echo $((rm -rf /) )", ["echo"], ["rm"])).toBe("ask_user")
+		expect(getCommandDecision("echo $((rm -rf /) )", ["echo"], [])).toBe("ask_user")
 	})
 
 	it("asks user for the payload of a >() process substitution", () => {
