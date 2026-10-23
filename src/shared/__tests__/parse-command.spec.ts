@@ -1267,7 +1267,7 @@ describe("parseCommand", () => {
 				// and drops `#c` as a comment.
 				name: "keeps a # after a chained >(…) closer as word content",
 				input: "cat <<E >(a)>(b)#c\nbody\nE\n",
-				commands: ["cat <<E\nbody\nE > ( a ) > ( b ) #c", "a", "b"],
+				commands: ["cat <<E\nbody\nE >( a ) >( b ) #c", "a", "b"],
 				error: null,
 			},
 			{
