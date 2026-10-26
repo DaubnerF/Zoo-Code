@@ -139,6 +139,24 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("cat <<EOF $(whoami)\nbody\nEOF", ["cat"])).toBe("ask_user")
 	})
 
+	it("does not auto-approve a substitution hidden inside an opener-line parameter expansion", () => {
+		// bash expands `$(zap x)` inside `${x:-$(zap x)}` on the opener line and
+		// runs it. The extraction surfaces `zap x` as its own segment, so an
+		// allowlist covering the host must not carry the hidden command: the
+		// unlisted `zap x` costs a prompt.
+		expect(getCommandDecision("cat <<E ${x:-$(zap x)}\nbody\nE", ["echo", "cat", "true"], ["rm"])).toBe("ask_user")
+	})
+
+	it("fails closed on an opener-line quote that carries live syntax past the newline", () => {
+		// bash carries the `'` open across the newline and closes it at `b'`, so
+		// `; zap x` runs as live syntax the remainder cut cannot account for.
+		// The parser rejects the input as malformed: an allowlisted `cat` must
+		// not carry the hidden command.
+		expect(getCommandDecision("cat <<E 'a\nb'; zap x\nhi\nE", ["echo", "cat", "true"], ["rm"])).toBe(
+			"malformed_command",
+		)
+	})
+
 	it("does not auto-approve a denied command chained after a heredoc delimiter", () => {
 		// bash pipes the heredoc into `rm x`: the text after the delimiter word
 		// is live syntax, so `rm` must match the denylist on its own instead of

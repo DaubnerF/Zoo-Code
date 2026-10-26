@@ -1,7 +1,7 @@
 import { findUnterminatedQuote, parseCommand } from "../parse-command"
 
-// Toggle that lets a single test force shell-quote's parse() to throw so the
-// parser's fallback branch can be exercised deterministically.
+// Toggle that lets a test force shell-quote's parse() to throw so the
+// parser's tokenizer-rejection path can be exercised deterministically.
 let forceShellQuoteFailure = false
 
 vi.mock("shell-quote", async (importOriginal) => {
@@ -190,16 +190,28 @@ describe("parseCommand", () => {
 			forceShellQuoteFailure = false
 		})
 
-		// When shell-quote throws, the parser falls back to a crude operator
-		// split and must still restore every masked placeholder -- including the
-		// ANSI-C single-quote bucket -- so callers never see internal markers.
-		it("restores ANSI-C quoted placeholders in the fallback path", () => {
+		// When shell-quote throws, the parser cannot account for the line's
+		// structure, so the whole command fails closed: no decomposition (and
+		// therefore no approval) can rest on a split the tokenizer rejected.
+		it("fails closed instead of crude-splitting when the tokenizer throws", () => {
 			forceShellQuoteFailure = true
 
-			const { commands: result } = parseCommand("sh -c $'echo hi' && echo done")
-			expect(result).toEqual(["sh -c $'echo hi'", "echo done"])
-			expect(result.join(" ")).not.toContain("SQUOTE")
-			expect(result.join(" ")).not.toContain("__")
+			const input = "sh -c $'echo hi' && echo done"
+			const { commands: result, parseError } = parseCommand(input)
+			expect(result).toEqual([input])
+			expect(parseError?.quoteType).toBe("tokenize-failure")
+		})
+
+		it("never surfaces a substitution hidden behind a tokenizer throw as a segment", () => {
+			forceShellQuoteFailure = true
+
+			// Splitting on operators would not recurse into payloads — a
+			// substitution's inner text would ride its host word: a hidden
+			// command could match the host's allowlist prefix and auto-approve.
+			const input = "echo $(evil)"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("tokenize-failure")
 		})
 	})
 
@@ -705,6 +717,25 @@ describe("parseCommand", () => {
 			])
 		})
 
+		it("extracts a substitution from a parameter expansion on the opener line", () => {
+			// bash expands `$(zap x)` inside `${x:-$(zap x)}` on the opener line
+			// and runs it. The remainder walk masks the expansion to a
+			// placeholder the tokenizer can read, so the inner command still
+			// surfaces as its own segment and the host keeps its verbatim text.
+			const { commands, parseError } = parseCommand("cat <<E ${x:-$(zap x)}\nbody\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE ${x:-$(zap x)}", "zap x"])
+		})
+
+		it("restores a plain parameter expansion on the opener line verbatim", () => {
+			// A `${…}` without substitutions costs nothing extra: the masked
+			// placeholder restores to one segment carrying the expansion text,
+			// exactly like a top-level parameter expansion.
+			const { commands, parseError } = parseCommand("cat <<E ${z}\nbody\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE ${z}"])
+		})
+
 		it("splits a chain operator after the delimiter out of the heredoc segment", () => {
 			// The text after the delimiter word is live syntax: bash pipes the
 			// heredoc into `rm x`, so the operator's right-hand command must
@@ -752,6 +783,17 @@ describe("parseCommand", () => {
 			// for the joined bytes. The heredoc fails closed instead of
 			// approving a command the decomposition never surfaced.
 			const input = "echo $(cat <<E \\\n| rm x\nhi\nE\n)"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when a remainder quote spans the newline into the body", () => {
+			// bash carries the `'` open across the newline, closes it at `b'`,
+			// and runs `; zap x` as live syntax. The remainder cut stops at the
+			// newline, so the masked body never accounts for those bytes: the
+			// heredoc fails closed instead of approving a hidden command.
+			const input = "cat <<E 'a\nb'; zap x\nhi\nE"
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
 			expect(parseError?.quoteType).toBe("heredoc")
@@ -824,11 +866,13 @@ describe("parseCommand", () => {
 
 		it("keeps a # glued to a parameter or arithmetic closer from swallowing the tail", () => {
 			// `${x}` and `$((1))` end an expansion, not the word: bash treats
-			// the `#` as ordinary content and runs the tail. The arithmetic
-			// frame must close at its second `)`, never the first.
+			// the `#` as ordinary content and runs the tail. The parameter
+			// expansion carries its verbatim text as the masked placeholder
+			// restores it; the arithmetic frame must close at its second `)`,
+			// never the first.
 			const param = parseCommand("cat <<E ${x}#y ; rm z\nhi\nE")
 			expect(param.parseError).toBeNull()
-			expect(param.commands).toEqual(["cat <<E\nhi\nE #y", "rm z"])
+			expect(param.commands).toEqual(["cat <<E\nhi\nE ${x}#y", "rm z"])
 			const arith = parseCommand("cat <<E $((1))#y ; rm z\nhi\nE")
 			expect(arith.parseError).toBeNull()
 			expect(arith.commands).toEqual(["cat <<E\nhi\nE $ ( ( 1 ) ) #y", "rm z"])
@@ -967,6 +1011,114 @@ describe("parseCommand", () => {
 				expect(commands).toEqual([input])
 				expect(parseError?.quoteType).toBe("heredoc")
 			}
+		})
+
+		const delimiterBreakRows: Array<{
+			name: string
+			input: string
+			commands: string[]
+			error: "heredoc" | null
+		}> = [
+			{
+				name: "fails closed on | starting the delimiter word",
+				input: "cat <<|x\nb\n|x",
+				commands: ["cat <<|x\nb\n|x"],
+				error: "heredoc",
+			},
+			{
+				name: "fails closed on & starting the delimiter word",
+				input: "cat <<&x\nb\n&x",
+				commands: ["cat <<&x\nb\n&x"],
+				error: "heredoc",
+			},
+			{
+				name: "fails closed on ; starting the delimiter word",
+				input: "cat <<;x\nb\n;x",
+				commands: ["cat <<;x\nb\n;x"],
+				error: "heredoc",
+			},
+			{
+				name: "fails closed on < starting the delimiter word",
+				input: "cat << <x\nb\nE",
+				commands: ["cat << <x\nb\nE"],
+				error: "heredoc",
+			},
+			{
+				name: "fails closed on > starting the delimiter word",
+				input: "cat <<>x\nb\n>x",
+				commands: ["cat <<>x\nb\n>x"],
+				error: "heredoc",
+			},
+			{
+				name: "ends the delimiter word at a glued | and splits the tail",
+				input: "cat <<E|x\nb\nE",
+				commands: ["cat <<E\nb\nE", "x"],
+				error: null,
+			},
+			{
+				name: "ends the delimiter word at a glued & and splits the tail",
+				input: "cat <<E&x\nb\nE",
+				commands: ["cat <<E\nb\nE", "x"],
+				error: null,
+			},
+			{
+				name: "ends the delimiter word at a glued ; and splits the tail",
+				input: "cat <<E;x\nb\nE",
+				commands: ["cat <<E\nb\nE", "x"],
+				error: null,
+			},
+			{
+				name: "ends the delimiter word at a glued < redirect",
+				input: "cat <<E<x\nb\nE",
+				commands: ["cat <<E\nb\nE < x"],
+				error: null,
+			},
+			{
+				name: "ends the delimiter word at a glued > redirect",
+				input: "cat <<E>x\nb\nE",
+				commands: ["cat <<E\nb\nE > x"],
+				error: null,
+			},
+		]
+
+		const singleQuoteEscapeRows: Array<{
+			name: string
+			input: string
+			commands: string[]
+			error: "heredoc" | null
+		}> = [
+			{
+				name: "keeps a backslash literal inside a single-quoted remainder region",
+				input: "cat <<E 'a\\'#x ; rm x\nbody\nE",
+				commands: ["cat <<E\nbody\nE a\\#x", "rm x"],
+				error: null,
+			},
+		]
+
+		it.each(singleQuoteEscapeRows)("$name", ({ input, commands, error }) => {
+			// Inside single quotes bash reads a backslash as literal, so `'a\'`
+			// closes at the second `'` and `; rm x` stays live syntax. The walk's
+			// `quote !== "'"` exemption owns that reading: dropping it makes the
+			// walk consume `\'` as an escape pair, carry the single-quote region
+			// across the newline, and fold `; rm x` into one masked word.
+			const result = parseCommand(input)
+			expect(result.commands).toEqual(commands)
+			expect(result.parseError?.quoteType ?? null).toBe(error)
+		})
+
+		it.each(delimiterBreakRows)("$name", ({ input, commands, error }) => {
+			// Each metacharacter in the delimiter break sets ends the word at
+			// both positions. At word start the empty word plus the operator
+			// token is the shape bash rejects, so the opener fails closed.
+			// Glued after the word the operator is live syntax: the body
+			// closes at the terminator and the tail becomes a host segment (or
+			// redirect word text for `<`/`>`, which the tokenizer keeps with the
+			// word). Erasing an operator from either set absorbs it into the
+			// delimiter word: the start row loses its rejection and the glued
+			// row's terminator never matches, so one row per operator goes red.
+			const result = parseCommand(input)
+			expect(result.commands).toEqual(commands)
+			expect(result.parseError?.quoteType ?? null).toBe(error)
 		})
 
 		it("keeps # a delimiter word character and controls the no-word paths", () => {
@@ -1177,12 +1329,12 @@ describe("parseCommand", () => {
 			{
 				// A `{` frame closes at its `}`, so the following `$(b)` opens
 				// and closes as its own region and the `#` after its closer
-				// continues the word. A closer picked as `)` or `]` for the
-				// `{` frame never pops it, changing the masked bytes and the
-				// split.
+				// continues the word. The expansion travels verbatim with its
+				// placeholder. A closer picked as `)` or `]` for the `{` frame
+				// never pops it, changing the masked bytes and the split.
 				name: "closes a { frame at its } closer in the remainder",
 				input: "cat <<E ${a}$(b)#c\nbody\nE\n",
-				commands: ["cat <<E\nbody\nE $ ( b ) #c", "b"],
+				commands: ["cat <<E\nbody\nE ${a}$ ( b ) #c", "b"],
 				error: null,
 			},
 			{
@@ -2368,13 +2520,17 @@ describe("parseCommand", () => {
 			expect(commands).toEqual(["echo $? $$ $! x"])
 		})
 
-		it("restores arithmetic and heredoc placeholders in the shell-quote fallback path", () => {
+		it("fails closed on masked placeholders when the tokenizer throws", () => {
 			forceShellQuoteFailure = true
 			try {
-				const { commands } = parseCommand("echo $((1+1)) && cat <<EOF\nbody\nEOF")
-				// Every masked placeholder must round-trip to its raw text so the
-				// fallback never surfaces internal markers.
-				expect(commands).toEqual(["echo $((1+1))", "cat <<EOF\nbody\nEOF"])
+				const input = "echo $((1+1)) && cat <<EOF\nbody\nEOF"
+				const { commands, parseError } = parseCommand(input)
+				// The masked host text carries no active shell syntax, so a
+				// tokenizer rejection means the decomposition cannot account for
+				// this line. The raw input stays one opaque token: no fragment of
+				// a partial split can be approved in isolation.
+				expect(commands).toEqual([input])
+				expect(parseError?.quoteType).toBe("tokenize-failure")
 				expect(commands.join("")).not.toContain("\x00")
 			} finally {
 				forceShellQuoteFailure = false
@@ -2893,14 +3049,17 @@ describe("parseCommand", () => {
 			expect(parseError?.quoteType).toBe("nesting-too-deep")
 		})
 
-		it("restores a substitution placeholder on the crude-split fallback path", () => {
+		it("fails closed on a substitution placeholder when the tokenizer throws", () => {
 			forceShellQuoteFailure = true
 			try {
-				const { commands } = parseCommand("echo $(whoami) && cat <<EOF\nbody\nEOF")
-				// The fallback has no payload re-scan, so the masked substitution
-				// is restored inline into its host word instead of dropped, and
-				// the heredoc placeholder round-trips to its raw text.
-				expect(commands).toEqual(["echo whoami", "cat <<EOF\nbody\nEOF"])
+				const input = "echo $(whoami) && cat <<EOF\nbody\nEOF"
+				const { commands, parseError } = parseCommand(input)
+				// An operator split would restore the masked substitution's
+				// inner text inline, letting the substitution's command ride a
+				// word that could match its host's allowlist prefix — so a
+				// tokenizer rejection fails the whole command closed.
+				expect(commands).toEqual([input])
+				expect(parseError?.quoteType).toBe("tokenize-failure")
 				expect(commands.join("")).not.toContain("\x00")
 			} finally {
 				forceShellQuoteFailure = false

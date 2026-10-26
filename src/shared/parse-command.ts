@@ -39,6 +39,9 @@ export type ShellToken = string | { op: string } | { command: string }
  * - `nesting-too-deep`: the scan re-scans substitution payloads beyond
  *   `MAX_PAYLOAD_SCAN_DEPTH` levels. Such input is generated, not a human
  *   command.
+ * - `tokenize-failure`: the tokenizer rejected the masked host text. The
+ *   masked text carries no active shell syntax, so a rejection means the
+ *   scan's decomposition does not account for the input.
  */
 export type QuoteType =
 	| "posix-single"
@@ -54,6 +57,7 @@ export type QuoteType =
 	| "stray-closer"
 	| "nul-byte"
 	| "nesting-too-deep"
+	| "tokenize-failure"
 
 /**
  * The result of parsing a command string.
@@ -115,6 +119,7 @@ function unterminatedQuoteMessage(quoteType: QuoteType, openIndex: number, comma
 		"stray-closer": `closing delimiter '${command[openIndex] ?? ""}' with no matching opener`,
 		"nul-byte": "NUL byte (control characters cannot appear in a shell command)",
 		"nesting-too-deep": `substitution nesting deeper than ${MAX_PAYLOAD_SCAN_DEPTH} levels`,
+		"tokenize-failure": "shell tokenizer rejected the masked command",
 	}
 	const problem =
 		quoteType === "stray-closer" || quoteType === "nul-byte" || quoteType === "nesting-too-deep"
@@ -565,7 +570,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 		 * directly after the closer of an expansion or process substitution
 		 * continues the word and takes the placeholder, and a backslash escape
 		 * pair stays verbatim. Quote characters pass through too; the walk only
-		 * tracks the regions so a quoted `#` stays literal.
+		 * tracks the regions so a quoted `#` stays literal. A top-level `${…}`
+		 * region is the exception: the tokenizer throws on expansion bytes it
+		 * cannot expand, so the region's bytes are diverted out of the host and
+		 * the host carries the region's `P` placeholder instead, the same
+		 * masking the main loop applies to parameter expansions.
 		 */
 		const emitRemainder = (from: number, to: number): void => {
 			let i = from
@@ -584,13 +593,24 @@ function scanShellSyntax(text: string): ScanOutcome {
 			// closed on a region left open.
 			const frames: RemainderFrame[] = []
 			let closerEnd = -1
+			// Index of the `$` of the open top-level `${` region, or -1. Raw
+			// `${` bytes make the tokenizer throw (`Bad substitution`), which
+			// hands the caller a tokenizer rejection instead of a decomposition
+			// that silently drops the substitutions the expansion closed, like
+			// `$(zap x)` inside `${x:-$(zap x)}`. While this region is open its
+			// bytes stay out of the host; the matching `}` turns the region's raw
+			// text into a `P` placeholder. The region's inner substitutions are
+			// already in `payloads` through the `walkBodyPayloads` pre-walk.
+			let maskedStart = -1
 			while (i < to) {
 				const char = text[i]
 				if (char === "\\" && quote !== "'") {
 					// Inside single quotes a backslash is literal, so only an
 					// unquoted or double-quoted backslash pairs with the next
 					// character.
-					outcome.host += text.slice(i, i + 2)
+					if (maskedStart === -1) {
+						outcome.host += text.slice(i, i + 2)
+					}
 					escapedEnd = i + 2
 					i += 2
 					continue
@@ -601,7 +621,9 @@ function scanShellSyntax(text: string): ScanOutcome {
 					} else if (quote === char) {
 						quote = null
 					}
-					outcome.host += char
+					if (maskedStart === -1) {
+						outcome.host += char
+					}
 					i++
 					continue
 				}
@@ -617,7 +639,9 @@ function scanShellSyntax(text: string): ScanOutcome {
 								closerEnd = i + 1
 							}
 						}
-						outcome.host += char
+						if (maskedStart === -1) {
+							outcome.host += char
+						}
 						i++
 						continue
 					}
@@ -626,13 +650,24 @@ function scanShellSyntax(text: string): ScanOutcome {
 							// This closer matches an inner grouping paren, not
 							// the region's own opener.
 							top.groupDepth--
+							if (maskedStart === -1) {
+								outcome.host += char
+							}
 						} else {
 							frames.pop()
-							if (frames.length === 0) {
-								closerEnd = i + 1
+							if (maskedStart !== -1 && frames.length === 0) {
+								const id = outcome.params.push(text.slice(maskedStart, i + 1)) - 1
+								outcome.host += mark(`P${id}`)
+								maskedStart = -1
+							} else {
+								if (frames.length === 0) {
+									closerEnd = i + 1
+								}
+								if (maskedStart === -1) {
+									outcome.host += char
+								}
 							}
 						}
-						outcome.host += char
 						i++
 						continue
 					}
@@ -642,7 +677,9 @@ function scanShellSyntax(text: string): ScanOutcome {
 						// group's `)` cannot end the region. `(`/`)` inside a
 						// `}`- or `]`-closing region stay literal.
 						top.groupDepth++
-						outcome.host += char
+						if (maskedStart === -1) {
+							outcome.host += char
+						}
 						i++
 						continue
 					}
@@ -654,28 +691,43 @@ function scanShellSyntax(text: string): ScanOutcome {
 						const doubleArith = text[i + 1] === "(" && text[i + 2] === "("
 						const closer = text[i + 1] === "(" ? ")" : text[i + 1] === "[" ? "]" : "}"
 						frames.push({ closer, groupDepth: doubleArith ? 1 : 0, backtick: false })
-						outcome.host += char
-						outcome.host += text[i + 1]
-						if (doubleArith) {
-							outcome.host += text[i + 2]
+						if (closer === "}" && frames.length === 1) {
+							maskedStart = i
+						} else if (maskedStart === -1) {
+							outcome.host += char
+							outcome.host += text[i + 1]
+							if (doubleArith) {
+								outcome.host += text[i + 2]
+							}
 						}
 						i += doubleArith ? 3 : 2
 						continue
 					}
 					if (char === "`") {
 						frames.push({ closer: "`", groupDepth: 0, backtick: true })
-						outcome.host += char
+						if (maskedStart === -1) {
+							outcome.host += char
+						}
 						i++
 						continue
 					}
 					if ((char === "<" || char === ">") && text[i + 1] === "(") {
 						frames.push({ closer: ")", groupDepth: 0, backtick: false })
-						outcome.host += `${char}(`
+						if (maskedStart === -1) {
+							outcome.host += `${char}(`
+						}
 						i += 2
 						continue
 					}
 				}
 				if (char === "#" && quote === null) {
+					if (maskedStart !== -1) {
+						// A `#` inside the masked expansion region is region
+						// text, like the length operator in `${#var}`. It
+						// travels with the placeholder, never as a comment.
+						i++
+						continue
+					}
 					if (i === closerEnd) {
 						// A `#` directly after a region closer continues the
 						// word: the shell ends the region at its closer but not
@@ -703,7 +755,9 @@ function scanShellSyntax(text: string): ScanOutcome {
 					i++
 					continue
 				}
-				outcome.host += char
+				if (maskedStart === -1) {
+					outcome.host += char
+				}
 				i++
 			}
 		}
@@ -744,56 +798,56 @@ function scanShellSyntax(text: string): ScanOutcome {
 		// the body only. Walk the remainder unconditionally. An error there
 		// fails the whole heredoc closed, like a body error does.
 		const remainderEnd = endOfLine(endIndex)
-		// bash joins a backslash-newline pair before tokenizing, even inside
-		// double quotes. An odd unquoted backslash run at the end of the
-		// remainder therefore joins the rest of the opener line's syntax onto
-		// the first body line, while the remainder cut here stops blindly at
-		// that newline. The remainder cannot account for the joined bytes, so
-		// the heredoc fails closed. Inside single quotes a backslash is
-		// literal and no joining happens, so the guard stays silent there.
+		// The quote state of the remainder `[from, to)`, with the same semantics
+		// the remainder walk applies: outside single quotes a backslash pairs
+		// with the next character, and only a matching quote character closes an
+		// open region.
+		const quoteStateAt = (from: number, to: number): "'" | '"' | null => {
+			let quote: "'" | '"' | null = null
+			let j = from
+			while (j < to) {
+				const char = text[j]
+				if (char === "\\" && quote !== "'") {
+					j += 2
+					continue
+				}
+				if (quote === null) {
+					if (char === "'" || char === '"') {
+						quote = char
+					}
+				} else if (char === quote) {
+					quote = null
+				}
+				j++
+			}
+			return quote
+		}
 		if (wordPresent) {
+			// bash joins a backslash-newline pair before tokenizing, even inside
+			// double quotes. An odd unquoted backslash run at the end of the
+			// remainder therefore joins the rest of the opener line's syntax onto
+			// the first body line, while the remainder cut here stops blindly at
+			// that newline. The remainder cannot account for the joined bytes, so
+			// the heredoc fails closed. Inside single quotes a backslash is
+			// literal and no joining happens, so the guard stays silent there.
 			let backslashRun = 0
 			while (remainderEnd - 1 - backslashRun >= endIndex && text[remainderEnd - 1 - backslashRun] === "\\") {
 				backslashRun++
 			}
-			if (backslashRun % 2 === 1) {
-				// Decide whether the backslash run opens the join: walk the
-				// remainder's quote state up to the run. Only a single-quote
-				// region keeps the backslash literal.
-				let quote: "'" | '"' | null = null
-				let j = endIndex
-				while (j < remainderEnd - backslashRun) {
-					const char = text[j]
-					if (quote === "'") {
-						if (char === "'") {
-							quote = null
-						}
-						j++
-						continue
-					}
-					if (quote === '"') {
-						if (char === "\\") {
-							j += 2
-							continue
-						}
-						if (char === '"') {
-							quote = null
-						}
-						j++
-						continue
-					}
-					if (char === "\\") {
-						j += 2
-						continue
-					}
-					if (char === "'" || char === '"') {
-						quote = char
-					}
-					j++
-				}
-				if (quote !== "'") {
-					return { error: errorAt("heredoc", start) }
-				}
+			if (backslashRun % 2 === 1 && quoteStateAt(endIndex, remainderEnd - backslashRun) !== "'") {
+				return { error: errorAt("heredoc", start) }
+			}
+			// bash carries a quote opened on the opener line across the newline.
+			// When that quote closes on a later line, the bytes after its closer
+			// are live syntax on a line this cut already masks as body, hidden
+			// from the decomposition, so the heredoc fails closed. The cut test
+			// is the next same-kind quote byte after the remainder; reading an
+			// escaped closer as a close only over-rejects. A quote that never
+			// closes again is bash's own syntax error: bash reads one unterminated
+			// word and executes nothing, so those openers stay acceptable.
+			const residualQuote = quoteStateAt(endIndex, remainderEnd)
+			if (residualQuote !== null && text.indexOf(residualQuote, remainderEnd) !== -1) {
+				return { error: errorAt("heredoc", start) }
 			}
 		}
 		const remainderError = walkBodyPayloads(endIndex, remainderEnd, payloads, 0)
@@ -1862,7 +1916,7 @@ function parseHeredocDelimiter(
 }
 
 /** Look up the raw text that a placeholder name stands for, or undefined. */
-function lookupPlaceholder(name: string, outcome: ScanOutcome, includeSubstitutions: boolean): string | undefined {
+function lookupPlaceholder(name: string, outcome: ScanOutcome): string | undefined {
 	const index = Number(name.slice(1))
 	switch (name[0]) {
 		case "Q":
@@ -1878,10 +1932,11 @@ function lookupPlaceholder(name: string, outcome: ScanOutcome, includeSubstituti
 		case "A":
 			return outcome.arithmetic[index]
 		case "S":
-			// The crude-split fallback path is the only path that restores
-			// substitutions inline. The normal path turns them into independent
-			// segments.
-			return includeSubstitutions ? outcome.substitutions[index] : undefined
+			// A substitution placeholder never reaches restoration: the tokenize
+			// path consumes it as a segment boundary and routes its payload
+			// through the re-scan, and a tokenizer rejection fails the whole
+			// command closed before any restoration runs.
+			return undefined
 		default:
 			return undefined
 	}
@@ -1894,7 +1949,7 @@ function lookupPlaceholder(name: string, outcome: ScanOutcome, includeSubstituti
  * NUL in the input up front (see QuoteType "nul-byte"), so no input can carry
  * a sentinel that collides with the ones used here.
  */
-function expandPlaceholders(text: string, outcome: ScanOutcome, includeSubstitutions: boolean): string {
+function expandPlaceholders(text: string, outcome: ScanOutcome): string {
 	if (!text.includes(NUL)) {
 		return text
 	}
@@ -1905,7 +1960,7 @@ function expandPlaceholders(text: string, outcome: ScanOutcome, includeSubstitut
 			out += parts[p]
 			continue
 		}
-		const value = lookupPlaceholder(parts[p], outcome, includeSubstitutions)
+		const value = lookupPlaceholder(parts[p], outcome)
 		if (value !== undefined) {
 			out += value
 		}
@@ -1998,17 +2053,21 @@ function parseLine(line: string, outcome: ScanOutcome, depth: number): string[] 
 	try {
 		tokens = parse(line) as ShellToken[]
 	} catch (error) {
-		// If shell-quote fails to parse, fall back to simple splitting. This
-		// path does not recurse into payloads. Every placeholder restores to
-		// its raw text (for substitutions: the inner text), so callers never
-		// see internal markers.
+		// The masked host text carries no active shell syntax, so a tokenizer
+		// rejection means the decomposition cannot account for this line.
+		// Splitting on operators here would not recurse into payloads — a
+		// substitution's inner text would ride its host word, letting a hidden
+		// command ride the host's allowlist match to an approval. Fail closed
+		// on the shared error channel: the caller re-checks `outcome` after
+		// every line and returns the raw input as one opaque token.
 		const message = error instanceof Error ? error.message : String(error)
 		console.warn("shell-quote parse error:", message, "for command:", line)
-
-		return line
-			.split(/(?:&&|\|\||;|\||&)/)
-			.map((cmd) => expandPlaceholders(cmd.trim(), outcome, true))
-			.filter((cmd) => cmd.length > 0)
+		outcome.error = {
+			quoteType: "tokenize-failure",
+			openIndex: 0,
+			message: `Malformed command: shell tokenizer rejected the command -- ${message}.`,
+		}
+		return []
 	}
 
 	const commands: string[] = []
@@ -2017,7 +2076,7 @@ function parseLine(line: string, outcome: ScanOutcome, depth: number): string[] 
 
 	const flush = (): void => {
 		if (current.length > 0) {
-			commands.push(expandPlaceholders(current.join(" "), outcome, false))
+			commands.push(expandPlaceholders(current.join(" "), outcome))
 			current = []
 		}
 		for (const raw of pendingPayloads) {
