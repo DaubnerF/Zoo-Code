@@ -144,7 +144,15 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		// runs it. The extraction surfaces `zap x` as its own segment, so an
 		// allowlist covering the host must not carry the hidden command: the
 		// unlisted `zap x` costs a prompt.
-		expect(getCommandDecision("cat <<E ${x:-$(zap x)}\nbody\nE", ["echo", "cat", "true"], ["rm"])).toBe("ask_user")
+		const command = "cat <<E ${x:-$(zap x)}\nbody\nE"
+		expect(getCommandDecision(command, ["echo", "cat", "true"], ["rm"])).toBe("ask_user")
+		// The converse: the hidden command is decided on its own extraction, so
+		// allowlisting `zap` — not just the host — is what earns approval.
+		expect(getCommandDecision(command, ["cat", "zap"])).toBe("auto_approve")
+
+		const denied = getCommandDecisionDetailed(command, ["cat"], ["zap"])
+		expect(denied.decision).toBe("auto_deny")
+		expect(denied.offendingCommand).toBe("zap x")
 	})
 
 	it("fails closed on an opener-line quote that carries live syntax past the newline", () => {
