@@ -191,6 +191,20 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 
 		expect(result.decision).toBe("ask_user")
 		expect(result.offendingCommand).toBe("zap x")
+
+		// The split decision-layer-wide: an allowlisted right-hand stage approves
+		// the whole pipeline, a denylisted one denies it, and the bare decision
+		// agrees with the detailed one on every stage set.
+		expect(getCommandDecisionDetailed("echo a |& echo b", ["echo"], [])).toEqual({ decision: "auto_approve" })
+
+		const denied = getCommandDecisionDetailed("echo a |& zap x", ["echo"], ["zap"])
+		expect(denied.decision).toBe("auto_deny")
+		expect(denied.offendingCommand).toBe("zap x")
+		expect(denied.matchedPattern).toBe("zap")
+
+		expect(getCommandDecision("echo a |& echo b", ["echo"], [])).toBe("auto_approve")
+		expect(getCommandDecision("echo a |& zap x", ["echo"], ["zap"])).toBe("auto_deny")
+		expect(getCommandDecision("echo a |& zap x", ["echo"], [])).toBe("ask_user")
 	})
 
 	it("does not auto-approve a denied command glued to the heredoc delimiter", () => {
