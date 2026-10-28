@@ -736,6 +736,18 @@ describe("parseCommand", () => {
 			expect(commands).toEqual(["cat <<E\nbody\nE ${z}"])
 		})
 
+		it("keeps a nested parameter expansion on the opener line inside its region", () => {
+			// The inner `${b}` closer must not end the outer `${a:-…}` region:
+			// the `;` lives inside the expansion, never reaches bash as an
+			// operator, and the whole word stays in the one host segment. The
+			// mask onset belongs to the outermost region only; an onset set at
+			// the nested region drops the outer region's opener bytes from the
+			// restored host text, which this exact-text pin catches.
+			const { commands, parseError } = parseCommand("cat <<E ${a:-${b};zap x}\nb\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nb\nE ${a:-${b};zap x}"])
+		})
+
 		it("splits a chain operator after the delimiter out of the heredoc segment", () => {
 			// The text after the delimiter word is live syntax: bash pipes the
 			// heredoc into `rm x`, so the operator's right-hand command must
@@ -758,6 +770,20 @@ describe("parseCommand", () => {
 			expect(parseCommand("cat <<E | rm x\nhi\nE").commands).toEqual(["cat <<E\nhi\nE", "rm x"])
 		})
 
+		it("splits a |& pipe operator into its own segment", () => {
+			// bash pipes stdout and stderr of `echo a` into `zap x`: `|&` is one
+			// operator token, so the right-hand command reaches its own segment
+			// instead of riding the left-hand word's allowlist match.
+			const { commands, parseError } = parseCommand("echo a |& zap x")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["echo a", "zap x"])
+			// A delimiter word glued to `|&` ends at the `|` like the other
+			// operators, so the terminator still matches and the tail splits.
+			const glued = parseCommand("cat <<EOF|&grep y\nhi\nEOF")
+			expect(glued.parseError).toBeNull()
+			expect(glued.commands).toEqual(["cat <<EOF\nhi\nEOF", "grep y"])
+		})
+
 		it("keeps a mid-word # in the opener remainder from swallowing the tail", () => {
 			// bash treats a mid-word `#` as an ordinary character. The tokenizer
 			// would drop everything after it as comment text. The remainder
@@ -775,6 +801,31 @@ describe("parseCommand", () => {
 			const { commands, parseError } = parseCommand("cat <<E # note\nhi\nE")
 			expect(parseError).toBeNull()
 			expect(commands).toEqual(["cat <<E\nhi\nE"])
+		})
+
+		it("parses an opener comment containing an apostrophe", () => {
+			// bash discards a word-start comment before scanning for quotes, so
+			// the apostrophe in the comment text never opens a region: the
+			// opener line is `cat <<EOF` plus a discarded comment.
+			const { commands, parseError } = parseCommand("cat <<EOF # don't\ndon't\nEOF")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<EOF\ndon't\nEOF"])
+			// A comment glued to the delimiter discards the same way; the onset
+			// must stop AT the `#` so the comment's leading quote is never read
+			// as a residual quote pairing with the body's apostrophe.
+			const glued = parseCommand("cat <<E #'don't\nbody'\nE")
+			expect(glued.parseError).toBeNull()
+			expect(glued.commands).toEqual(["cat <<E\nbody'\nE"])
+		})
+
+		it("parses an opener comment whose apostrophe precedes a body apostrophe", () => {
+			// The same discarded comment on a longer opener: the quote-state
+			// check may only read the live prefix before the comment onset, or
+			// the comment's apostrophe pairs with the body's and fails an
+			// opener bash runs.
+			const { commands, parseError } = parseCommand("git commit -F - <<EOF # don't\nfix: it's\nEOF")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["git commit -F - <<EOF\nfix: it's\nEOF"])
 		})
 
 		it("fails closed on an odd backslash run at the end of the opener remainder", () => {
@@ -797,6 +848,135 @@ describe("parseCommand", () => {
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
 			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("fails closed when a double-quoted remainder spans the newline into the body", () => {
+			// The guard is quote-kind agnostic: bash carries `"` across the
+			// newline exactly like `'`, closes it on a later line, and runs the
+			// bytes after its closer as live syntax.
+			const input = 'cat <<E "a\nb"; zap x\nhi\nE'
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+		})
+
+		it("accepts an opener quote that never closes again", () => {
+			// A quote with no later closer is bash's own syntax error: bash
+			// reads one unterminated word and executes nothing, so nothing is
+			// hidden and the opener stays parseable.
+			const { commands, parseError } = parseCommand("cat <<E 'a\nbody\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE a"])
+		})
+
+		it("fails closed when a quote opened before an opener comment spans the newline", () => {
+			// The comment skip starts only at a word-start `#`: the `'` before
+			// it is live syntax bash carries across the newline, closing at `b'`
+			// so `; zap x` runs. Skipping the comment tail must not discard the
+			// quote state opened before it.
+			const input = "cat <<E 'a # b\nc'; zap x\nhi\nE"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+			// Quoting the word around the `#` restores the accept side: the
+			// comment onset must respect quoting, so `# ` inside `'a # b'` is
+			// word content, the live `'` closes on the body's `b'`, and the
+			// tail after it still splits into its own segment.
+			const quoted = parseCommand("cat <<E 'a # b'; zap x\nb'ody\nE")
+			expect(quoted.parseError).toBeNull()
+			expect(quoted.commands).toEqual(["cat <<E\nb'ody\nE a # b", "zap x"])
+			// The same shape with `"`: the residual quote is double-quoted, and
+			// the onset scan must track that quoting kind too.
+			const dq = parseCommand('cat <<E "a # b"; zap x\nb"ody\nE')
+			expect(dq.parseError).toBeNull()
+			expect(dq.commands).toEqual(['cat <<E\nb"ody\nE a # b', "zap x"])
+		})
+
+		it("keeps a double-quoted opener region open across an apostrophe before a #", () => {
+			// bash closes a `"` region only at another `"`: the apostrophe is
+			// word content, so the `#` stays inside the region, never opens a
+			// comment, and the substitution after it stays live syntax that
+			// reaches its own segment. An onset scan that closes the region on
+			// the other quote kind sees a comment at the `#` and drops the tail.
+			const { commands, parseError } = parseCommand('cat <<E "a\' # $(zap x)"\nbody\nE')
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE a' # $(zap x)", "zap x"])
+			// The same shape carrying a denied head: the denylist can only reject
+			// what the decomposition surfaces, so the substitution after the
+			// in-region `#` must still split into its own segment.
+			const denied = parseCommand('cat <<E "a\' # $(rm x)"\nbody\nE')
+			expect(denied.parseError).toBeNull()
+			expect(denied.commands).toEqual(["cat <<E\nbody\nE a' # $(rm x)", "rm x"])
+			// The reverse kind pair pins the same rule from the other side: a `"`
+			// inside `'...'` is literal word content, so the `#` there is also
+			// never a comment onset and the tail still surfaces.
+			const sq = parseCommand("cat <<E 'a\" # $(zap x)'\nbody\nE")
+			expect(sq.parseError).toBeNull()
+			expect(sq.commands).toEqual(['cat <<E\nbody\nE a" # $(zap x)', "zap x"])
+		})
+
+		it("keeps an escaped double quote from closing a double-quoted opener region", () => {
+			// Inside `"..."` bash pairs a backslash with the next character, so
+			// `\"` is an escaped double quote and the region stays open: the `#`
+			// after it is region content, never a comment onset, and the
+			// substitution remains live syntax reaching its own segment. An
+			// onset scan that tests the escape exemption against the wrong quote
+			// kind treats `\"` as the closer, reads the following `#` as a
+			// word-start comment, and drops the payload as comment material.
+			const { commands, parseError } = parseCommand('cat <<E "a\\" # $(zap x)"\nbody\nE')
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(['cat <<E\nbody\nE a" # $(zap x)', "zap x"])
+		})
+
+		it("keeps a single-quoted backslash literal so its closer ends the region", () => {
+			// Inside `'...'` bash reads a backslash as literal, so `\'` closes the
+			// region: the following word-start `#` opens the comment bash sees and
+			// the substitution after it is discarded text, never an extracted
+			// payload. An onset scan that applies the escape pair inside single
+			// quotes carries the region past the closer and turns that comment
+			// material into a live segment.
+			const { commands, parseError } = parseCommand("cat <<E 'a\\' # $(zap x)'\nbody\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nbody\nE a\\"])
+		})
+
+		it("fails closed on an apostrophe after a mid-word # in the opener remainder", () => {
+			// A `#` glued to a word is word content, not a comment start, so the
+			// `'` after it is live syntax that spans the newline like the
+			// un-commented shape.
+			const input = "cat <<E x#'a\nb'; zap x\nhi\nE"
+			const { commands, parseError } = parseCommand(input)
+			expect(commands).toEqual([input])
+			expect(parseError?.quoteType).toBe("heredoc")
+			// A blank escaped by `\ ` also keeps the following `#` mid-word:
+			// bash carries the opened `'` across the newline, so the opener
+			// stays over-rejected rather than swallowing the quote.
+			const escapedInput = "cat <<E \\ #'a\nbody'\nE"
+			const escaped = parseCommand(escapedInput)
+			expect(escaped.commands).toEqual([escapedInput])
+			expect(escaped.parseError?.quoteType).toBe("heredoc")
+			// The escape pair consumes exactly the backslash and the escaped
+			// character: the word after it is read normally, so `\'` contributes
+			// a literal quote word and the following word-start `#` is a comment.
+			// (The body apostrophe matters: an over-read that left the escaped
+			// `'` unpaired would read it as a residual quote closing here.)
+			const escapeQuote = parseCommand("cat <<E \\' # dont\nb'ody\nE")
+			expect(escapeQuote.parseError).toBeNull()
+			expect(escapeQuote.commands).toEqual(["cat <<E\nb'ody\nE '"])
+			// A quote byte directly after the pair is visited, not skipped: it
+			// opens a region that swallows the `#`, so the comment never starts
+			// and the quote text reaches the host. (An under-read that skipped
+			// this `'` would open the comment and see its apostrophe as a
+			// residual quote closing on the body.)
+			const quoteAfterPair = parseCommand("cat <<E \\x' # don't\nb'ody\nE")
+			expect(quoteAfterPair.parseError).toBeNull()
+			expect(quoteAfterPair.commands).toEqual(["cat <<E\nb'ody\nE x # dont"])
+			// The escape pair consumes exactly two bytes, so the `\'` word and
+			// the following word-start comment stay separated: the comment's
+			// `$(zap x)` is discarded text, never an extracted payload segment.
+			const commentPayload = parseCommand("cat <<E \\' # it's here's $(zap x)\nbody\nE")
+			expect(commentPayload.parseError).toBeNull()
+			expect(commentPayload.commands).toEqual(["cat <<E\nbody\nE '"])
 		})
 
 		it("ends the delimiter word at an unquoted operator so the tail splits", () => {

@@ -183,6 +183,16 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("echo $(cat <<E f#g | rm x\nhi\nE\n)", ["cat", "echo"], ["rm"])).toBe("auto_deny")
 	})
 
+	it("does not auto-approve a command hidden behind a |& pipe operator", () => {
+		// bash pipes stdout and stderr of `echo a` into `zap x`: `|&` is a pipe
+		// like `|`, so the right-hand command must match the lists on its own
+		// instead of riding the left-hand command's allowlist match.
+		const result = getCommandDecisionDetailed("echo a |& zap x", ["echo"], [])
+
+		expect(result.decision).toBe("ask_user")
+		expect(result.offendingCommand).toBe("zap x")
+	})
+
 	it("does not auto-approve a denied command glued to the heredoc delimiter", () => {
 		// bash ends the delimiter word at `|`, so the body never terminates and
 		// `rm x` runs live. The parser cannot account for the construct and

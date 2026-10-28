@@ -798,6 +798,48 @@ function scanShellSyntax(text: string): ScanOutcome {
 		// the body only. Walk the remainder unconditionally. An error there
 		// fails the whole heredoc closed, like a body error does.
 		const remainderEnd = endOfLine(endIndex)
+		// bash discards a word-start `#` comment before tokenizing, so nothing
+		// after that `#` on the opener line is live syntax. The backslash and
+		// quote guards and the payload walk below read the remainder prefix
+		// through this index; reading the discarded comment bytes would refuse
+		// openers bash runs. The word-start and escape tests mirror the
+		// comment branch of the live-text scan; the quoting rules match
+		// `quoteStateAt` below. The mask region and the line-termination check
+		// keep the physical `remainderEnd`.
+		const commentOnset = (): number => {
+			let j = endIndex
+			let quote: "'" | '"' | null = null
+			// Index just past the most recent `\c` escape pair, or -1. The
+			// escaped character is word content to the shell, so a `#` directly
+			// after the pair continues the word and cannot start a comment.
+			// Stryker disable next-line NumberLiteral: the operator's replacements for this -1 sentinel are 0 and 1, and every `j` compared against it starts at or past the index after a `<<` (>= 2), so no replacement can block a different `#`.
+			let escapedEnd = -1
+			while (j < remainderEnd) {
+				const char = text[j]
+				if (char === "\\" && quote !== "'") {
+					escapedEnd = j + 2
+					j += 2
+					continue
+				}
+				if (quote === null) {
+					if (char === "#" && j !== escapedEnd) {
+						// The word-start rule mirrors the live-text scan's
+						// comment branch: after a blank or a metacharacter, or
+						// at the very start of the remainder.
+						if (j === endIndex || /\s/.test(text[j - 1]) || /[;&()|<>]/.test(text[j - 1])) {
+							return j
+						}
+					} else if (char === "'" || char === '"') {
+						quote = char
+					}
+				} else if (char === quote) {
+					quote = null
+				}
+				j++
+			}
+			return remainderEnd
+		}
+		const liveRemainderEnd = commentOnset()
 		// The quote state of the remainder `[from, to)`, with the same semantics
 		// the remainder walk applies: outside single quotes a backslash pairs
 		// with the next character, and only a matching quote character closes an
@@ -824,17 +866,20 @@ function scanShellSyntax(text: string): ScanOutcome {
 		}
 		if (wordPresent) {
 			// bash joins a backslash-newline pair before tokenizing, even inside
-			// double quotes. An odd unquoted backslash run at the end of the
+			// double quotes. An odd unquoted backslash run at the end of the live
 			// remainder therefore joins the rest of the opener line's syntax onto
 			// the first body line, while the remainder cut here stops blindly at
 			// that newline. The remainder cannot account for the joined bytes, so
 			// the heredoc fails closed. Inside single quotes a backslash is
 			// literal and no joining happens, so the guard stays silent there.
 			let backslashRun = 0
-			while (remainderEnd - 1 - backslashRun >= endIndex && text[remainderEnd - 1 - backslashRun] === "\\") {
+			while (
+				liveRemainderEnd - 1 - backslashRun >= endIndex &&
+				text[liveRemainderEnd - 1 - backslashRun] === "\\"
+			) {
 				backslashRun++
 			}
-			if (backslashRun % 2 === 1 && quoteStateAt(endIndex, remainderEnd - backslashRun) !== "'") {
+			if (backslashRun % 2 === 1 && quoteStateAt(endIndex, liveRemainderEnd - backslashRun) !== "'") {
 				return { error: errorAt("heredoc", start) }
 			}
 			// bash carries a quote opened on the opener line across the newline.
@@ -845,12 +890,12 @@ function scanShellSyntax(text: string): ScanOutcome {
 			// escaped closer as a close only over-rejects. A quote that never
 			// closes again is bash's own syntax error: bash reads one unterminated
 			// word and executes nothing, so those openers stay acceptable.
-			const residualQuote = quoteStateAt(endIndex, remainderEnd)
+			const residualQuote = quoteStateAt(endIndex, liveRemainderEnd)
 			if (residualQuote !== null && text.indexOf(residualQuote, remainderEnd) !== -1) {
 				return { error: errorAt("heredoc", start) }
 			}
 		}
-		const remainderError = walkBodyPayloads(endIndex, remainderEnd, payloads, 0)
+		const remainderError = walkBodyPayloads(endIndex, liveRemainderEnd, payloads, 0)
 		if (remainderError) {
 			return { error: remainderError }
 		}
@@ -2087,7 +2132,7 @@ function parseLine(line: string, outcome: ScanOutcome, depth: number): string[] 
 
 	for (const token of tokens) {
 		if (typeof token === "object" && "op" in token) {
-			if (["&&", "||", ";", "|", "&"].includes(token.op)) {
+			if (["&&", "||", ";", "|", "&", "|&"].includes(token.op)) {
 				flush()
 			} else {
 				// Other operators (>, <) are part of the command word.
