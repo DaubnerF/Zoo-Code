@@ -979,6 +979,35 @@ describe("parseCommand", () => {
 			expect(commentPayload.commands).toEqual(["cat <<E\nbody\nE '"])
 		})
 
+		it("starts a # comment on the opener line regardless of the byte after the #", () => {
+			// bash opens a comment at any unquoted word-start `#`: only the
+			// byte before the `#` decides word start, so `#don't` opens a
+			// comment just like a spaced `#`. The comment is discarded before
+			// any quote is interpreted, so its apostrophe never opens a
+			// region. A remainder quote that closes on a later line fails the
+			// opener closed, which is why the body carries the matching
+			// apostrophe: reading the byte after the `#` instead of before it
+			// misses this onset, keeps the comment bytes live, and refuses an
+			// opener bash runs.
+			const { commands, parseError } = parseCommand("cat <<E #don't\nb'ody\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nb'ody\nE"])
+		})
+
+		it("starts the opener-remainder comment at a # right after a semicolon", () => {
+			// A metacharacter terminates the previous word, so the `#` after
+			// `;` sits at a word start and opens a comment bash discards
+			// before any quote is interpreted: its apostrophe never opens a
+			// region. The bare-`(` onset shows the same rule from the other
+			// side of the metacharacter set. Reading the byte after the `#`
+			// instead of before it misses this onset, keeps the comment bytes
+			// live, and refuses an opener bash runs on the comment's
+			// apostrophe closing at the body's `b'`.
+			const { commands, parseError } = parseCommand("cat <<E ;#don't\nb'ody\nE")
+			expect(parseError).toBeNull()
+			expect(commands).toEqual(["cat <<E\nb'ody\nE"])
+		})
+
 		it("ends the delimiter word at an unquoted operator so the tail splits", () => {
 			// bash tokenizes `cat <<EOF|grep y` as the word `EOF` plus a live
 			// pipe, exactly like the spaced idiom. The terminator comparison
