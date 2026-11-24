@@ -307,13 +307,12 @@ const NUL = "\x00"
  * True when `pattern` carries a placeholder for a construct whose masked text
  * can hide a command the executing shell may run: a command substitution
  * (`S`), a quote region (`Q`), a parameter expansion (`P`), a heredoc (`H`),
- * or an arithmetic expression (`A`). A glob word that swallows one of these
- * loses the only channel that extracts and checks the construct's payload.
- * Variables (`V`), redirections (`R`), and escaped glob characters (`g`)
- * restore verbatim and carry no payload, so a glob word sharing its word with
- * one of those keeps its main-line host-glob behavior. The pattern is built
- * from `NUL` rather than a literal so the sentinel stays the scan's single
- * source of truth.
+ * or an arithmetic expression (`A`) — a glob word that swallows one loses the
+ * only channel that extracts and checks its payload. Variables (`V`),
+ * redirections (`R`), and escaped glob characters (`g`) restore verbatim and
+ * carry no payload, so a glob word sharing its word with one of those keeps
+ * its host-glob behavior. The pattern is built from `NUL` so the sentinel
+ * stays the scan's single source of truth.
  */
 function carriesExecutablePlaceholder(pattern: string): boolean {
 	return new RegExp(`${NUL}[SQPHA]\\d+${NUL}`).test(pattern)
@@ -624,14 +623,13 @@ function scanShellSyntax(text: string): ScanOutcome {
 	// comment rule decides a `#` after it against the logical boundary instead.
 	// Stryker disable next-line NumberLiteral,UnaryOperator: the replacements for this -1 sentinel (0, 1, and +1) can never equal the scan index at a frame-comment position — frame content starts at least two past the frame's opener — so no reachable input distinguishes them from `-1`.
 	let frameEscapeEnd = -1
-	// Index just past the most recent `\c` escape pair that the scan emitted
-	// at host level, or -1. To the shell, the escaped character is an ordinary
-	// word character. The word continues past the pair. A `#` directly at this
-	// index is word content, even when the escaped character is whitespace or
-	// a metacharacter in the raw text. A backslash-newline pair is excluded:
-	// the shell removes that pair before tokenizing, so it leaves no word
-	// content behind, and the comment rule decides a following `#` against the
-	// logical boundary instead.
+	// Index just past the most recent `\c` escape pair the scan emitted at host
+	// level, or -1. The escaped character is an ordinary word character to the
+	// shell, so the word continues past the pair and a `#` directly at this index
+	// is word content — even when the escaped character is whitespace or a
+	// metacharacter in the raw text. A backslash-newline pair is excluded: the
+	// shell removes it before tokenizing, leaving no word content, so the comment
+	// rule decides a following `#` against the logical boundary.
 	let escapedWordCharEnd = -1
 
 	const mark = (name: string): string => `${NUL}${name}${NUL}`
@@ -667,14 +665,13 @@ function scanShellSyntax(text: string): ScanOutcome {
 		return j
 	}
 
-	// True when the scan's line ending at `end` is a lone carriage return: a
-	// CR not followed by an LF. The comment branches stop a comment at the
-	// first newline or carriage return, but the executing shell ends comments
-	// only at newlines. When the terminator is a lone CR, the comment bytes
-	// the shell still reads extend past this index, and quote openers among
-	// them would open a live region in this scan while the shell keeps them
-	// comment text. A CR followed by an LF is a CRLF pair — one line ending
-	// for both models — and stays parseable.
+	// True when the scan's line ending at `end` is a lone carriage return: a CR
+	// not followed by an LF. The comment branches stop at the first newline or
+	// carriage return, but the executing shell ends comments only at newlines, so
+	// when the terminator is a lone CR the comment bytes the shell still reads
+	// extend past this index — quote openers among them would open a live region
+	// here while the shell keeps them comment text. A CR followed by LF is one
+	// line ending for both models and stays parseable.
 	const terminatesAtLoneCR = (end: number): boolean => text[end] === "\r" && text[end + 1] !== "\n"
 
 	/** Open the quoted region starting at `i`, or return null if none. */
@@ -746,15 +743,14 @@ function scanShellSyntax(text: string): ScanOutcome {
 
 	/**
 	 * Consume an entire heredoc at `i`: the opener line, the body, and the
-	 * terminator. Heredoc redirects chained on the opener line each get a
-	 * body: bash reads those bodies sequentially from the input stream, so
-	 * each chained body starts on the line after the previous construct's
-	 * terminator and runs to its own. The redirect operator and delimiter word
-	 * through the last terminator mask to one host word; the opener-line
-	 * remainder after the delimiter word stays live host text. Return the
-	 * index just past the last terminator text. Return an error when the outer
-	 * heredoc or any chained body is unterminated, or for an unbalanced
-	 * delimiter inside an expansion-active body.
+	 * terminator. Chained redirects each get a body, read sequentially from the
+	 * input stream so each starts on the line after the previous construct's
+	 * terminator and runs to its own; the redirect operator and delimiter word
+	 * through the last terminator mask to one host word, and the opener-line
+	 * remainder after the delimiter word stays live host text. Returns the index
+	 * just past the last terminator, or an error when the outer heredoc or any
+	 * chained body is unterminated, or for an unbalanced delimiter inside an
+	 * expansion-active body.
 	 */
 	const skipHeredoc = (i: number, frames: RegionFrame[]): { end: number } | { error: UnterminatedQuote } => {
 		const start = i
@@ -768,13 +764,16 @@ function scanShellSyntax(text: string): ScanOutcome {
 		}
 		const { delimiter, endIndex, quoted, wordPresent, malformed } = parseHeredocDelimiter(text, i)
 		if (malformed) {
-			// The walk cannot determine the terminator: the word reached end
-			// of input with a quote region still open, so bash reads a
-			// multi-line word that can never match a body line, or it contains
-			// an unquoted ANSI-C/locale quoting occurrence whose quote removal
-			// the walk does not reproduce, so bash closes the heredoc at a
-			// line this walk never derives. Either way the body and everything
-			// after it are unaccountable, so fail closed.
+			// The walk cannot determine the terminator: the word reached end of input
+			// with a quote region still open, so bash reads a multi-line word that can
+			// never match a body line,
+			//
+			// or it contains an unquoted ANSI-C/locale quoting occurrence whose quote
+			// removal the walk does not reproduce, so bash closes the heredoc at a line
+			// this walk never derives.
+			//
+			// Either way the body and everything after it are unaccountable, so fail
+			// closed.
 			return { error: errorAt("heredoc", start) }
 		}
 		if (!wordPresent && endIndex < text.length && text[endIndex] !== "\n" && text[endIndex] !== "\r") {
@@ -1390,14 +1389,16 @@ function scanShellSyntax(text: string): ScanOutcome {
 			if (backslashRun % 2 === 1 && quoteStateAt(endIndex, liveRemainderEnd - backslashRun) !== "'") {
 				return { error: errorAt("heredoc", start) }
 			}
-			// bash carries a quote opened on the opener line across the newline.
-			// When that quote closes on a later line, the bytes after its closer
-			// are live syntax on a line this cut already masks as body, hidden
-			// from the decomposition, so the heredoc fails closed. The cut test
-			// is the next same-kind quote byte after the remainder; reading an
-			// escaped closer as a close only over-rejects. A quote that never
-			// closes again is bash's own syntax error: bash reads one unterminated
-			// word and executes nothing, so those openers stay acceptable.
+			// bash carries a quote opened on the opener line across the newline. When that
+			// quote closes on a later line, the bytes after its closer are live syntax on
+			// a line this cut already masks as body, hidden from the decomposition, so the
+			// heredoc fails closed.
+			//
+			// The cut test is the next same-kind quote byte after the remainder; reading
+			// an escaped closer as a close only over-rejects.
+			//
+			// A quote that never closes again is bash's own syntax error: bash reads one
+			// unterminated word and executes nothing, so those openers stay acceptable.
 			const residualQuote = quoteStateAt(endIndex, liveRemainderEnd)
 			if (residualQuote !== null && text.indexOf(residualQuote, remainderEnd) !== -1) {
 				return { error: errorAt("heredoc", start) }
@@ -1489,16 +1490,14 @@ function scanShellSyntax(text: string): ScanOutcome {
 			// would emit each one twice.
 			return emitMask(finalEnd)
 		}
-		// No delimiter token appeared, and the break was not metacharacter-caused
-		// -- the metacharacter guard above already fails those shapes closed: a
-		// bare `<<`, or `<<` followed only by blanks, before end of line. bash
-		// rejects such input with a syntax error and never executes it. The
-		// opener therefore masks through end of input as one opaque word, over a
-		// construct that can never run. The mask is sound only while both read
-		// layers see the same bytes. The region test at the mask-emission guard
-		// above fails the mask closed when a CR enters the span. This
-		// over-rejects the CR-touched shapes whose layers happen to agree. That
-		// is the accepted cost of keeping one region rule.
+		// No delimiter token appeared, and the break was not metacharacter-caused —
+		// the guard above fails those closed: a bare `<<`, or `<<` followed only by
+		// blanks, before end of line. bash rejects such input and never executes it,
+		// so the opener masks through end of input as one opaque word over a construct
+		// that can never run. The mask is sound only while both read layers see the
+		// same bytes: the region test at mask emission fails it closed when a CR
+		// enters the span, which over-rejects the CR-touched shapes whose layers
+		// agree — the accepted cost of one region rule.
 		return emitMask(text.length)
 	}
 
@@ -1706,14 +1705,11 @@ function scanShellSyntax(text: string): ScanOutcome {
 					continue
 				}
 				if (char === "$" && !dqOpen && text[i + 1] === "'") {
-					// An ANSI-C word is opaque to its first unescaped `'`, like
-					// `openQuote`'s `ansi-c` kind: its `\'` escapes, so pairing
-					// raw quote bytes would end the word early and re-read the
-					// bytes bash keeps inside it, or (reversed) swallow the live
-					// bytes after it. An unterminated region is bash's own
-					// syntax error: the shell reads one word to end of input
-					// and expands nothing there, so the rest of the region
-					// carries no payload.
+					// An ANSI-C word is opaque to its first unescaped `'`, like `openQuote`'s
+					// `ansi-c` kind: its `\'` escapes, so pairing raw quote bytes would end the
+					// word early and re-read bytes bash keeps inside it, or, reversed, swallow the
+					// live bytes after it. An unterminated region is bash's own syntax error — the
+					// shell reads one word to end of input and expands nothing there.
 					let k = i + 2
 					while (k < end) {
 						if (text[k] === "\\") {
@@ -1990,15 +1986,13 @@ function scanShellSyntax(text: string): ScanOutcome {
 			// inert here, exactly as in the `$((` loop below.
 			let depth = 1 // the opening bracket
 			let j = i + 2
-			// Set once the scan passes an unclosed frame-kind region (`$(`,
-			// `${`, backtick). The shell reads every later byte inside that
-			// region, so no later byte can open one: plain counting finishes
-			// the scan instead of re-walking the tail at each byte. An
-			// expression closed through such a masked tail still holds that
-			// opener in its interior, so the interior walk fails it closed.
-			// An unclosed quote is invisible to that walk, which reads a
-			// top-level quote as literal text, so it ends the expression
-			// unclosed at the opener instead — bash refuses that input too.
+			// Set once the scan passes an unclosed frame-kind region (`$(`, `${`,
+			// backtick): the shell reads every later byte inside it, so no later byte can
+			// open one and plain counting finishes the scan instead of re-walking the tail
+			// at each byte. An expression closed through such a masked tail still holds
+			// that opener, so the interior walk fails it closed; an unclosed quote is
+			// invisible to that walk, which reads a top-level quote as literal text, so it
+			// ends the expression unclosed at the opener — bash refuses that input too.
 			let maskedTail = false
 			while (j < text.length) {
 				const jumped = maskedTail ? null : skipInertRegion(j, true)
@@ -2785,18 +2779,19 @@ function parseHeredocDelimiter(
 	let quoted = false
 	// The quote region currently open inside the word, if any.
 	let quote: "'" | '"' | null = null
-	// bash removes backslash-newline line continuations before tokenizing, so
-	// a `$'` or `$"` occurrence can form from bytes on separate physical
-	// lines: `a$` plus a continuation plus `'b'` is the word `a$'b'`. bash
-	// applies ANSI-C/locale quote removal to every unquoted such occurrence —
-	// mid-word, at the start, and across any run of continuations joining the
-	// bytes — before matching the delimiter word against a terminator line, so
-	// such a word closes the heredoc at text this walk never derives
-	// (`$'EOF'` terminates at `EOF`, not `$EOF`; the joined `a$\<LF>'b'` at
-	// `ab`). The terminator is undeterminable: fail closed. An escaped `\$` is
-	// a literal dollar, a `$` inside a quote region is ordinary word content,
-	// and any byte that survives the removal (a space) keeps the pair apart
-	// for bash too; the walk reproduces all three exactly.
+	// bash removes backslash-newline line continuations before tokenizing, so a
+	// `$'` or `$"` occurrence can form from bytes on separate physical lines:
+	// `a$` plus a continuation plus `'b'` is the word `a$'b'`. bash applies
+	// ANSI-C/locale quote removal to every unquoted such occurrence — mid-word, at
+	// the start, and across any run of continuations joining the bytes — before
+	// matching the delimiter word against a terminator line, so such a word closes
+	// the heredoc at text this walk never derives (`$'EOF'` terminates at `EOF`,
+	// not `$EOF`; the joined `a$\<LF>'b'` at `ab`). The terminator is
+	// undeterminable: fail closed.
+	//
+	// An escaped `\$` is a literal dollar, a `$` inside a quote region is ordinary
+	// word content, and any byte that survives the removal (a space) keeps the
+	// pair apart for bash too; the walk reproduces all three exactly.
 	let ansiCPrefix = false
 
 	while (i < command.length) {
@@ -2892,7 +2887,6 @@ function parseHeredocDelimiter(
 	}
 }
 
-/** Look up the raw text that a placeholder name stands for, or undefined. */
 function lookupPlaceholder(name: string, outcome: ScanOutcome): string | undefined {
 	const index = Number(name.slice(1))
 	switch (name[0]) {

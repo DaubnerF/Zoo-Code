@@ -182,17 +182,19 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("does not let a backslash-newline comment hide a denied payload from the lists", () => {
-		// The shell removes a backslash-newline pair before tokenizing, so the
-		// `#` after it starts the comment bash starts. When the comment line
-		// ends the frame's last command, the frame still closes at its `)` and
-		// the payload on the following line is its own segment: a deny rule on
-		// it decides the command, instead of the payload riding a mask the
-		// lists never see. When the comment swallows the frame closer and the
-		// heredoc opener, the payload re-scan starts at host level, where the
-		// same comment rule fires again and the executed line surfaces as its
-		// own word — the deny rule sees it there too. The even-run shape keeps
-		// the payload inside the open frame and still surfaces it to the
-		// denylist.
+		// The shell removes a backslash-newline pair before tokenizing, so the `#`
+		// after it starts the comment bash starts.
+		//
+		// When the comment line ends the frame's last command, the frame still closes
+		// at its `)` and the payload on the following line is its own segment: a deny
+		// rule on it decides the command, instead of the payload riding a mask the
+		// lists never see. When the comment swallows the frame closer and the heredoc
+		// opener, the payload re-scan starts at host level, where the same comment
+		// rule fires again and the executed line surfaces as its own word — the deny
+		// rule sees it there too.
+		//
+		// The even-run shape keeps the payload inside the open frame and still
+		// surfaces it to the denylist.
 		const denied = getCommandDecisionDetailed("echo $(a \\\n#b\nrm -rf /)", ["echo", "a"], ["rm"])
 		expect(denied.decision).toBe("auto_deny")
 		expect(denied.offendingCommand).toBe("rm -rf /")
@@ -203,14 +205,12 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("does not let a host-level backslash-newline comment hide a denied payload from the lists", () => {
-		// Same hiding class one level up: at host level, each suppressed
-		// comment line made its `"` a live quote opener, and two such lines
-		// kept parity even, so executed lines rode quote-shaped segments the
-		// lists never matched. With the comments firing, the shape that still
-		// carries a live quote at end of input is refused outright — bash
-		// itself aborts on the same unmatched `"`. The quote-free shape keeps
-		// the executed line as its own word, so the deny rule sees it and the
-		// decision is auto_deny, naming the executed command.
+		// Same hiding class one level up: two suppressed comment lines each made their
+		// `"` a live opener, kept parity even, and let executed lines ride quote-shaped
+		// segments the lists never matched. With the comments firing, a quote live at
+		// end of input is refused outright — bash aborts on the same unmatched `"`.
+		// The quote-free shape keeps the executed line its own word, so the deny rule
+		// names it.
 		const twoComment = 'echo a \\\n# "p\nprintf RAN1\n" q\nb \\\n# "r\nprintf RAN2\n" s'
 		expect(getCommandDecisionDetailed(twoComment, ["echo", "a", "q", "b", "s"], ["printf"]).decision).toBe(
 			"malformed_command",
@@ -340,13 +340,13 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("keeps the discarded tail of a bare-paren comment out of the segments", () => {
-		// bash balances the `(echo x)` group and starts a comment at the glued
-		// `#`, so `$(zap y)` never runs and never reaches the lists: the
-		// offending segment is the group alone, and a `zap` deny never sees
-		// the commented payload. Reading the bare `)` as a word continuation
-		// would extract `zap y` here and flip the deny to `auto_deny`: the
-		// deny call is the discriminator, the allow-only `ask_user` half on
-		// its own cannot tell the two readings apart.
+		// bash balances the `(echo x)` group and starts a comment at the glued `#`, so
+		// `$(zap y)` never runs and never reaches the lists: the offending segment is
+		// the group alone, and a `zap` deny never sees the commented payload.
+		//
+		// Reading the bare `)` as a word continuation would extract `zap y` here and
+		// flip the deny to `auto_deny`: the deny call is the discriminator, the
+		// allow-only `ask_user` half on its own cannot tell the two readings apart.
 		const command = "cat <<E ;(echo x)#$(zap y)\nbody\nE"
 		const result = getCommandDecisionDetailed(command, ["cat", "echo"], [])
 		expect(result.decision).toBe("ask_user")
@@ -405,13 +405,12 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("fails closed on a CRLF heredoc whose backslash-CRLF pair only the msys read layer joins", () => {
-		// The msys/Cygwin read layer is the reference shell on the Windows
-		// target. It strips the CR from every line it reads. The line therefore
-		// ends with the lone backslash and continues. `EO\` plus `F` joins into
-		// the terminator, and the commands after it are live. POSIX bash reads
-		// `\<CR>` as an escaped CR and joins nothing, so the two models close
-		// on different lines. A join that consumes a CRLF makes the boundary
-		// model-dependent, and the parser rejects the input as malformed.
+		// The msys/Cygwin read layer, the reference shell on Windows, strips the CR
+		// from every line, so the line ends with the lone backslash and `EO\` plus `F`
+		// joins into the terminator — and the commands after it are live. POSIX bash
+		// reads `\<CR>` as an escaped CR and joins nothing, closing on a different
+		// line. A CRLF-consuming join makes the boundary model-dependent, so the
+		// parser rejects the input.
 		expect(getCommandDecision("cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n", ["cat"])).toBe("malformed_command")
 	})
 
@@ -577,15 +576,14 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("does not let a glob inside a substitution payload ride the host allowlist", () => {
-		// shell-quote reduces `rm*` to an inert `glob` token, so the re-scanned
-		// payload reads as the bare word `glob`. With that word allowlisted the
-		// whole command used to auto-approve while bash could glob-expand the
-		// pattern onto denylisted binaries. The payload now fails closed, so
-		// neither rule set carries it.
+		// shell-quote reduces `rm*` to the bare `glob` token, so the re-scanned
+		// payload reads as `glob`. Allowlisting that word would carry the hidden `rm`
+		// to an approval while bash glob-expands onto denylisted binaries. The payload
+		// fails closed instead, so no rule set carries it.
 		expect(getCommandDecision("echo $(rm* /tmp/victim)", ["echo", "glob"], [])).toBe("malformed_command")
-		// Deny side: the denylist no longer sees a bare `glob` word it cannot
-		// match; the input is rejected outright instead of asking on an
-		// under-approximated segment list.
+		// Deny side: the input is rejected outright rather than asking on an
+		// under-approximated segment list, so a bare `glob` word never reaches the
+		// denylist.
 		expect(getCommandDecision("echo $(rm* /tmp/victim)", ["echo"], ["rm"])).toBe("malformed_command")
 		// Accept path: a payload without a glob token still decomposes and
 		// rides the host allowlist unchanged.
@@ -595,11 +593,10 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("fails closed when an escaped backtick inside a backtick region hides an executable payload", () => {
-		// bash removes the backslash before an inner backtick and runs the
-		// payload it opens: `echo `echo \`rm x`` executes `rm x`, while the
-		// scan's extraction hands back a word whose leading backtick hides it,
-		// and the allowlisted `echo` carried the command to an approval. The
-		// parser now refuses the input, so the allowlist never carries it.
+		// bash removes the backslash before an inner backtick and runs the payload it
+		// opens: `echo `echo \`rm x`` executes `rm x`, while the scan hands back a
+		// word whose leading backtick hides it. The parser refuses the input, so an
+		// allowlisted `echo` cannot carry the command.
 		expect(getCommandDecision("echo `echo \\`rm x\\``", ["echo", "ls", "touch", "x"], ["rm"])).toBe(
 			"malformed_command",
 		)
@@ -614,23 +611,20 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("fails closed when a comment's lone-CR terminator hides an executable tail", () => {
-		// bash reads the whole first line — the quote opener included — as
-		// comment text and executes the following line, while the scan ends
-		// the comment at the carriage return and lets the quoted region mask
-		// the tail behind an allowlisted word. The parser now refuses the
-		// input, so the allowlist never carries it.
+		// bash reads the whole first line — the quote opener included — as comment
+		// text and executes the following line, while ending the comment at the
+		// carriage return would let the quoted region mask the tail behind an
+		// allowlisted word. The parser refuses the input instead.
 		expect(getCommandDecision("echo;# '\recho '\nrm -rf /\n# '\n", ["echo", "ls", "touch", "x"], ["rm"])).toBe(
 			"malformed_command",
 		)
 	})
 
 	it("does not let a host glob word swallowing a substitution ride the allowlist", () => {
-		// `$(rm -rf /tmp/victim)*` shares its word with a command
-		// substitution, so shell-quote collapses the whole word to the bare
-		// `glob` and the hidden `rm` is never extracted or checked. The
-		// collapsed word used to ride an `echo` allow rule to an approval
-		// even with `rm` denied. The word now fails closed, so no rule set
-		// can carry it — not even one that allowlists the collapsed `glob`.
+		// A `$(rm -rf /tmp/victim)*` word collapses to the bare `glob`, so the hidden
+		// `rm` is never extracted or checked. Riding an `echo` allow rule to an
+		// approval would execute it even with `rm` denied; the word fails closed
+		// instead, so no rule set — not even one allowlisting `glob` — carries it.
 		expect(getCommandDecision("echo $(rm -rf /tmp/victim)*", ["echo", "glob"], ["rm"])).toBe("malformed_command")
 		// Deny side without the collapsed word allowlisted: same rejection,
 		// not an ask built on a segment list missing the hidden command.
@@ -640,7 +634,6 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 		expect(getCommandDecision("echo $(printf x /tmp/victim)", ["echo", "printf x /tmp/victim"], [])).toBe(
 			"auto_approve",
 		)
-		// A plain host glob is unchanged main-line behavior.
 		expect(getCommandDecision("ls *.log", ["ls"], [])).toBe("auto_approve")
 	})
 
@@ -684,14 +677,12 @@ describe("getCommandDecision — integration with dangerous substitution checks"
 	})
 
 	it("decides opener-remainder quote, procsub-chain, and redirect shapes by their decomposition", () => {
-		// Decision-layer mirror of the remainder-walk pins: a quote region
-		// only closes on its own character, so the cross-quoted remainders
-		// drop the `#c` tail inside the still-open region and leave a
-		// heredoc whose every command is allowlisted; the closer-boundary
-		// shapes keep `#c` as word content and stay approved; a `>(…)`
-		// chain makes its payloads match the lists on their own, so an
-		// unlisted payload costs a prompt; and a plain `>`/`<` redirect
-		// stays host text that never masks a command from the lists.
+		// Decision-layer mirror of the remainder-walk pins: a quote region closes only
+		// on its own character, so the cross-quoted remainders drop the `#c` tail
+		// inside the still-open region and leave a fully allowlisted heredoc;
+		// closer-boundary shapes keep `#c` as word content; a `>(…)` chain matches
+		// payload by payload, so an unlisted one costs a prompt; a plain `>`/`<` stays
+		// host text that masks nothing.
 		expect(getCommandDecision("cat <<E \"a'b'#c\nbody\nE\n", ["cat"], ["rm"])).toBe("auto_approve")
 		expect(getCommandDecision('cat <<E \'a"b"#c\nbody\nE\n', ["cat"], ["rm"])).toBe("auto_approve")
 		expect(getCommandDecision('cat <<E "a\'b"#c\nbody\nE\n', ["cat"], ["rm"])).toBe("auto_approve")

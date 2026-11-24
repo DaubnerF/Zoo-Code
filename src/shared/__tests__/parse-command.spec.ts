@@ -801,13 +801,14 @@ describe("parseCommand", () => {
 
 		it("fails closed when a region inside an arithmetic expression never closes", () => {
 			// An opener inside `$((…))`/`$[…]` that never closes is bash's own
-			// unclosed-delimiter error: the shell reads every later byte inside
-			// it and runs nothing, so the expression fails closed whatever the
-			// masked tail looks like to a depth count. The closer scan masks
-			// the tail from that reading on instead of re-walking it per byte;
-			// these rows pin the fail-closed set and the accept rows pin that
-			// a scan which masks too much (dropping a real closer's effect on
-			// the interior walk) cannot pass.
+			// unclosed-delimiter error: the shell reads every later byte inside it and runs
+			// nothing, so the expression fails closed whatever the masked tail looks like
+			// to a depth count.
+			//
+			// The closer scan masks the tail from that reading on instead of re-walking it
+			// per byte; these rows pin the fail-closed set and the accept rows pin that a
+			// scan which masks too much (dropping a real closer's effect on the interior
+			// walk) cannot pass.
 			expect(structuralError("echo $(( $(evil)")?.quoteType).toBe("arithmetic")
 			expect(structuralError("echo $(( `x")?.quoteType).toBe("arithmetic")
 			expect(structuralError("echo $[1 ${")?.quoteType).toBe("arithmetic")
@@ -836,14 +837,14 @@ describe("parseCommand", () => {
 		})
 
 		it("keeps the arithmetic closer scan linear past an unclosed region", () => {
-			// One unclosed region inside `$((` makes every later byte a
-			// non-opener for the shell: the closer scan masks that tail and
-			// plain-counts instead of re-walking it per byte. The fail-closed
-			// set is pinned by the block above; this pin bounds the cost — the
-			// per-byte re-walk shape measures ~410 ms at this size vs ~1 ms
-			// linear, so the ceiling cannot fire on the shipped scan and does
-			// fire the moment the unclosed-region sentinel stops ending the
-			// region walk.
+			// One unclosed region inside `$((` makes every later byte a non-opener for the
+			// shell: the closer scan masks that tail and plain-counts instead of re-walking
+			// it per byte.
+			//
+			// The fail-closed set is pinned by the block above; this pin bounds the cost —
+			// the per-byte re-walk shape measures ~410 ms at this size vs ~1 ms linear, so
+			// the ceiling cannot fire on the shipped scan and does fire the moment the
+			// unclosed-region sentinel stops ending the region walk.
 			const input = "echo $(( " + "${".repeat(8000)
 			expect(parseCommand(input).parseError?.quoteType).toBe("arithmetic")
 			let best = Number.POSITIVE_INFINITY
@@ -1176,14 +1177,12 @@ describe("parseCommand", () => {
 		})
 
 		it("fails closed when the chained body runs past the end of input (sequential stdin cursor)", () => {
-			// bash reads chained bodies sequentially: B's body starts after
-			// A's terminator line, so the `# $(evil) B` line is B's unterminated
-			// body and bash expands the substitution there anyway (its warning
-			// only reports the missing terminator). A parser that anchored B's
-			// body at the line after the shared opener line found the stray `B`
-			// inside A's body instead and returned the `#` line to the main
-			// scan, where it reads as a top-level comment — the executed bytes
-			// hid. bash's executed set for this input carries `evil`.
+			// bash reads chained bodies sequentially: B's body starts after A's terminator
+			// line, so the `# $(evil) B` line is B's unterminated body and bash expands the
+			// substitution there (its warning reports only the missing terminator).
+			// Anchoring B's body at the line after the shared opener instead finds the
+			// stray `B` inside A's body and returns the `#` line to the main scan as a
+			// top-level comment — the executed bytes hide.
 			const { commands, parseError } = parseCommand("cat <<A <<B\nB\nA\n# $(evil) B\n")
 			expect(parseError?.quoteType).toBe("heredoc")
 			expect(commands).toEqual(["cat <<A <<B\nB\nA\n# $(evil) B\n"])
@@ -1386,16 +1385,11 @@ describe("parseCommand", () => {
 		})
 
 		it("keeps every executed command visible when a continuation comment swallows the frame closer and a quote", () => {
-			// The shell removes a backslash-newline pair before tokenizing, so
-			// the `#` that follows one sits at a real word boundary and starts
-			// the comment bash starts: it runs to end of line, swallowing the
-			// `)` and the opening `'`. The quote never opens. The frame stays
-			// open past the swallowed closer, closes at the next `)` — the one
-			// inside `>&2` — and the payload re-scan surfaces each executed
-			// command as its own segment. The `#` after that closer is a host
-			// comment again, so the trailing `'` never opens either. bash runs
-			// `echo` and `printf MARKER` inside the substitution here; both
-			// surface to the command lists, so no executed byte rides a mask.
+			// The frame opens past the swallowed closer and closes at the next `)` — the
+			// one inside `>&2` — so the payload re-scan surfaces each executed command as
+			// its own segment; the `#` after that closer is a host comment again, so the
+			// trailing `'` never opens. bash runs `echo` and `printf MARKER` inside the
+			// substitution, and both surface.
 			const input = "echo $(echo \\\n#x ) '\nprintf MARKER >&2) #'"
 			const { commands, parseError } = parseCommand(input)
 			expect(parseError?.quoteType ?? null).toBeNull()
@@ -1403,19 +1397,14 @@ describe("parseCommand", () => {
 		})
 
 		it("extracts payloads when a continuation comment swallows the heredoc opener", () => {
-			// Same removal rule: the comment at the `#` swallows `) <<E` to end
-			// of line, so no heredoc opens, the body lines stay inside the
-			// substitution, and the shell comments bash comments. The scan
-			// reaches the `)` on its own line, closes the frame, and the
-			// payload re-scan runs the host rules: there the comment fires
-			// again, `zap x` surfaces as its own segment, and the `E` after
-			// the frame closer is an ordinary trailing word. bash runs
-			// `zap x` inside the substitution here, so every executed byte
-			// the shell expands stays visible to the command lists instead
-			// of riding a mask. Where the comment line ends the frame's last
-			// command instead, the frame closes at `)` and the payload after
-			// the comment line is extracted on its own segment; the comment
-			// bytes themselves are shell-discarded, never a segment.
+			// The comment at the `#` swallows `) <<E` to end of line, so no heredoc opens,
+			// the body lines stay inside the substitution, and the scan reaches the `)` on
+			// its own line: the payload re-scan runs the host rules there, the comment
+			// fires again, `zap x` surfaces as its own segment, and the `E` after the frame
+			// closer is an ordinary trailing word. Where the comment line ends the frame's
+			// last command instead, the frame closes at `)` and the following payload is
+			// extracted on its own segment; comment bytes are shell-discarded, never a
+			// segment.
 			const rows = [
 				{
 					input: "echo $(a \\\n#b) <<E\nzap x\n)\nE",
@@ -1541,15 +1530,13 @@ describe("parseCommand", () => {
 		})
 
 		it("walks continuations at the frame-comment boundary inside heredoc bodies", () => {
-			// The body walk carries the same tracker and the same boundary walk
-			// as the main scan, so a continuation comment inside a body frame
-			// reads the same. The swallowed-closer shape keeps every executed
-			// command visible: the body mask holds the raw text, and the
-			// unquoted-delimiter payload re-scan starts at host level, where
-			// the same comment rule fires on the `#` after the removed
-			// continuation pair — the quote on that line dies with the
-			// comment, and each executed command surfaces as its own segment.
-			// The glued shape stays word text with its frame closing normally.
+			// The body walk carries the same tracker and boundary walk as the main scan, so
+			// a continuation comment inside a body frame reads the same. The
+			// swallowed-closer shape keeps every executed command visible: the body mask
+			// holds the raw text, and the unquoted-delimiter payload re-scan starts at host
+			// level, where the same comment rule fires on the `#` after the removed pair —
+			// the quote on that line dies with the comment and each command surfaces. The
+			// glued shape stays word text with its frame closing normally.
 			const rows = [
 				{
 					input: "cat <<E\necho $(echo \\\n#x ) '\nprintf MARKER >&2) #'\nE",
@@ -1574,24 +1561,24 @@ describe("parseCommand", () => {
 		})
 
 		it("fires a host-level comment reached through a line continuation", () => {
-			// The shell removes a backslash-newline pair before tokenizing, so
-			// a `#` opening the continuation line is word-initial: the comment
-			// fires and every quote on that line dies with it. Recording the
-			// pair as an escape-pair word continuation suppressed both comments
-			// in the two-comment shape below: the `"` on each comment line
-			// opened a live mask, the pair kept quote parity even so the input
-			// parsed, and the executed lines rode the quote-shaped segments
-			// hidden from the command lists. With the comment firing, the one
-			// quote still live at end of input stays unterminated and the
-			// parser refuses the shape — the same reading bash reaches, which
-			// aborts on the same unmatched `"` after the executable printf
-			// lines have already run. The residual quote pairing need not be
-			// byte-exact to bash: the
-			// pinned security property is that an executed line is either a
-			// visible word or the input is refused. The quote-free rows show
-			// the visible-word side: the comment takes the `# p` / backtick
-			// bytes (a comment is not shell syntax, so no payload extracts) and
-			// the executed line surfaces as an ordinary word.
+			// The shell removes a backslash-newline pair before tokenizing, so a `#`
+			// opening the continuation line is word-initial: the comment fires and every
+			// quote on that line dies with it.
+			//
+			// Recording the pair as an escape-pair word continuation suppressed both
+			// comments in the two-comment shape below: the `"` on each comment line opened
+			// a live mask, the pair kept quote parity even so the input parsed, and the
+			// executed lines rode the quote-shaped segments hidden from the command lists.
+			//
+			// With the comment firing, the one quote still live at end of input stays
+			// unterminated and the parser refuses the shape — the same reading bash
+			// reaches, which aborts on the same unmatched `"` after the executable printf
+			// lines have already run. The residual quote pairing need not be byte-exact to
+			// bash: the pinned security property is that an executed line is either a
+			// visible word or the input is refused. The quote-free rows show the
+			// visible-word side: the comment takes the `# p` / backtick bytes (a comment is
+			// not shell syntax, so no payload extracts) and the executed line surfaces as
+			// an ordinary word.
 			const rows = [
 				{
 					input: 'echo a \\\n# "p\nprintf RAN1\n" q\nb \\\n# "r\nprintf RAN2\n" s',
@@ -1622,16 +1609,13 @@ describe("parseCommand", () => {
 		})
 
 		it("keeps host-level continuation word text on the accept path", () => {
-			// The recording guard excludes only the backslash-newline pair, so
-			// the accept paths bash runs must keep parsing as word text. A
-			// glued pair leaves the word bytes directly before the `#`: mid-
-			// word, no comment, and the following line stays its own word. At
-			// start of input the removal puts the `#` at the logical start: a
-			// comment, and nothing after it executes. Stacked pairs both
-			// remove, again gluing the word bytes to the `#`. An ordinary
-			// escape pair still records its end: a `#` after an escaped blank
-			// is word interior, and commenting it would refuse a word bash
-			// runs.
+			// The recording guard excludes only the backslash-newline pair, so the accept
+			// paths bash runs keep parsing as word text: a glued pair leaves the word bytes
+			// directly before the `#` — mid-word, no comment — and at start of input the
+			// removal puts the `#` at the logical start, where nothing after it executes;
+			// stacked pairs glue the word bytes to the `#` the same way. An ordinary escape
+			// pair still records its end: a `#` after an escaped blank is word interior,
+			// and commenting it would refuse a word bash runs.
 			const rows = [
 				{
 					input: "printf %s a\\\n#b",
@@ -1667,15 +1651,12 @@ describe("parseCommand", () => {
 		})
 
 		it("does not treat exotic JS-\\s bytes as shell word separators", () => {
-			// bash word-splits on the default $IFS blanks (space, tab, newline)
-			// only. JS `\s` is wider — VT, FF, NBSP, U+3000, U+2001, U+2028 —
-			// and a `#` after one of those extras is mid-word to bash, so the
-			// comment bytes (here a whole `$(evil)`) execute. Reading the
-			// extras as boundaries commented the payload away and approved the
-			// command. The frame rows pin the substitution-frame rule and its
-			// payload re-scan; the top rows pin the same rule's top-level twin.
-			// The accept rows keep space and tab commenting: exact $IFS, never a
-			// widened refusal.
+			// bash word-splits on the default $IFS blanks only — space, tab, newline. JS
+			// `\s` is wider (VT, FF, NBSP, U+3000, U+2001, U+2028), and a `#` after one of
+			// those extras is mid-word to bash, so the comment bytes (here a whole
+			// `$(evil)`) execute. The frame rows pin the substitution rule and its payload
+			// re-scan, the top rows its top-level twin, and the accept rows keep space and
+			// tab commenting: exact $IFS, never a widened refusal.
 			const exotic = ["\x0b", "\x0c", "\u00a0", "\u3000", "\u2001", "\u2028"]
 			// The top-level host word reaches the tokenizer as
 			// `a<exotic><# placeholder>`: the tokenizer ends the word at the
@@ -1791,28 +1772,25 @@ describe("parseCommand", () => {
 		})
 
 		it("keeps a word-start # inside an open ANSI-C region from cutting the live remainder", () => {
-			// bash starts a comment at a word-start `#` only outside quotes:
-			// here the `#` sits inside the open `$'…'` region, so it is region
-			// content and the region closes at the final quote — bash expands
-			// the substitution after the word. An onset scan that pairs raw
-			// quote bytes closes the region at the escaped `\'`, reads that
-			// `#` as a comment start, and drops the executed payload into the
-			// host text.
+			// bash starts a comment at a word-start `#` only outside quotes: here the `#`
+			// is inside the open `$'…'` region, so it is region content and the region
+			// closes at the final quote, where bash expands the substitution after the
+			// word. An onset scan pairing raw quote bytes closes at the escaped `\'`, reads
+			// that `#` as a comment start, and drops the executed payload into host text.
 			const { commands, parseError } = parseCommand("cat <<E $'a \\' # b' $(echo M30 >&2)\nbody\nE\n")
 			expect(parseError).toBeNull()
 			expect(commands).toEqual(["cat <<E\nbody\nE a ' # b $ ( echo M30 >& 2 )", "echo M30 >&2"])
 		})
 
 		it("fails closed when an ANSI-C word precedes a line-continuation backslash on a quoted-delimiter opener", () => {
-			// bash joins a trailing-backslash continuation before
-			// tokenizing, so the substitution is live on the opener line
-			// while the remainder cut cannot account for the joined bytes
-			// — the construct must fail closed. The guard reads the quote
-			// state just before the backslash run: ANSI-C-aware pairing
-			// closes `$'\''` at its third quote and reports no open quote,
-			// while raw-byte pairing closes at the escaped quote and
-			// reopens at the trailing one, silencing the guard exactly
-			// where bash runs the joined payload.
+			// bash joins a trailing-backslash continuation before tokenizing, so the
+			// substitution is live on the opener line while the remainder cut cannot
+			// account for the joined bytes — the construct must fail closed.
+			//
+			// The guard reads the quote state just before the backslash run: ANSI-C-aware
+			// pairing closes `$'\''` at its third quote and reports no open quote, while
+			// raw-byte pairing closes at the escaped quote and reopens at the trailing one,
+			// silencing the guard exactly where bash runs the joined payload.
 			const join = "cat <<'E' $'\\'' \\\n$(echo M20 >&2)\nE\n"
 			const joined = parseCommand(join)
 			expect(joined.parseError?.quoteType).toBe("heredoc")
@@ -1891,14 +1869,12 @@ describe("parseCommand", () => {
 		})
 
 		it("starts a # comment on the opener line regardless of the byte after the #", () => {
-			// bash opens a comment at any unquoted word-start `#`: only the
-			// byte before the `#` decides word start, so `#don't` opens a
-			// comment just like a spaced `#`. The comment is discarded before
-			// any quote is interpreted, so its apostrophe never opens a
-			// region. A remainder quote that closes on a later line fails the
-			// opener closed, which is why the body carries the matching
-			// apostrophe: reading the byte after the `#` instead of before it
-			// misses this onset, keeps the comment bytes live, and refuses an
+			// bash opens a comment at any unquoted word-start `#`: only the byte before it
+			// decides, so `#don't` opens a comment like a spaced `#`, and the comment is
+			// discarded before any quote is interpreted, so its apostrophe never opens a
+			// region — a remainder quote closing on a later line fails the opener closed,
+			// which is why the body carries the matching apostrophe. Reading the byte after
+			// the `#` misses this onset, keeps the comment bytes live, and refuses an
 			// opener bash runs.
 			const { commands, parseError } = parseCommand("cat <<E #don't\nb'ody\nE")
 			expect(parseError).toBeNull()
@@ -2227,15 +2203,13 @@ describe("parseCommand", () => {
 		})
 
 		it.each(delimiterBreakRows)("$name", ({ input, commands, error }) => {
-			// Each metacharacter in the delimiter break sets ends the word at
-			// both positions. At word start the empty word plus the operator
-			// token is the shape bash rejects, so the opener fails closed.
-			// Glued after the word the operator is live syntax: the body
-			// closes at the terminator and the tail becomes a host segment (or
-			// redirect word text for `<`/`>`, which the tokenizer keeps with the
-			// word). Erasing an operator from either set absorbs it into the
-			// delimiter word: the start row loses its rejection and the glued
-			// row's terminator never matches, so one row per operator goes red.
+			// Each metacharacter in the delimiter break sets ends the word at both
+			// positions. At word start the empty word plus operator token is the shape bash
+			// rejects, so the opener fails closed; glued after the word the operator is
+			// live syntax — the body closes at its terminator and the tail becomes a host
+			// segment, or redirect word text for `<`/`>`, which the tokenizer keeps with
+			// the word. Erasing an operator from either set absorbs it into the delimiter
+			// word, and one row per operator goes red.
 			const result = parseCommand(input)
 			expect(result.commands).toEqual(commands)
 			expect(result.parseError?.quoteType ?? null).toBe(error)
@@ -2334,14 +2308,12 @@ describe("parseCommand", () => {
 		})
 
 		it("forms substitution openers across CRLF continuation runs", () => {
-			// On the reference shell a carriage return between the continuation
-			// backslash and the newline does not stop the join, so a `$` or `<`
-			// and the opener byte behind a backslash-CR-LF run are adjacent to
-			// that shell: each substitution below really executes, so the parser
-			// must open its frame and extract the payload instead of leaving it
-			// masked in the expansion's verbatim host text. The CR-joined `{` is
-			// the exception the next test covers: the reference shell reads that
-			// join only to reject the whole line, so it fails closed.
+			// On the reference shell a carriage return between the continuation backslash
+			// and the newline does not stop the join, so a `$` or `<` and the opener byte
+			// behind a backslash-CR-LF run are adjacent to that shell: each substitution
+			// below really executes, and the parser must open its frame and extract the
+			// payload instead of leaving it masked in the expansion's verbatim host text.
+			// The CR-joined `{` is the exception the next test covers.
 			const inExpansion = parseCommand("echo ${x:-$\\\r\n(printf RAN > ran.marker)}\n")
 			expect(inExpansion.parseError).toBeNull()
 			expect(inExpansion.commands).toEqual([
@@ -2649,10 +2621,9 @@ describe("parseCommand", () => {
 		})
 
 		it("keeps CRLF line endings and CRLF-terminated comments on the parse path", () => {
-			// A carriage return that is the CR of a CRLF pair is a line ending
-			// for both read models (the splitter treats it as one), so nothing
-			// about these shapes changes: CRLF lines still split into
-			// segments, and a comment terminated by CRLF still masks its line.
+			// A CR that is the CR of a CRLF pair is a line ending for both read models,
+			// so CRLF lines still split into segments and a comment terminated by CRLF
+			// still masks its line.
 			const lines = parseCommand("echo a\r\nrm -rf /")
 			expect(lines.parseError).toBeNull()
 			expect(lines.commands).toEqual(["echo a", "rm -rf /"])
@@ -2695,14 +2666,13 @@ describe("parseCommand", () => {
 		})
 
 		it("refuses every region-special escape inside a backtick region", () => {
-			// The second parse removes the backslash before `$`, a backtick, `"`,
-			// or `\`, so each of the four turns the extracted payload text into a
-			// different command than the one the region's text appears to hold.
-			// An escaped `$(` inside the region becomes a live substitution bash
-			// runs while the extraction keeps it inert word text.
-			// Each byte of the escaped class is refused at the escape itself: a
-			// guard testing a narrower byte set would still refuse, one byte
-			// later at the next escape, so the index is what pins the class.
+			// The second parse removes the backslash before `$`, a backtick, `"`, or `\`,
+			// so each of the four turns the extracted payload into a different command than
+			// the region's text appears to hold: an escaped `$(` becomes a live
+			// substitution bash runs while extraction keeps it inert word text. Each byte
+			// of the class is refused at the escape itself — a narrower guard still
+			// refuses, one byte later at the next escape, so the index is what pins the
+			// class.
 			const escapedDollar = "echo `echo \\$(rm x)`"
 			expect(parseCommand(escapedDollar).parseError).toEqual(
 				expect.objectContaining({ quoteType: "ambiguous-escape", openIndex: 11 }),
@@ -2848,17 +2818,14 @@ describe("parseCommand", () => {
 		})
 
 		it("routes payloads through frames opened inside joined substitution bodies", () => {
-			// The joins below open a frame nested inside another open frame, so
-			// each payload travels the region walk's closer and comment rules on
-			// its way out: a joined `>(` inside a substitution inside an
-			// expansion, an escaped byte that keeps a `#` word content inside a
-			// joined frame, a real comment that swallows the frame's own closer
-			// only after the line ends, and a joined `{` whose expansion must
-			// stay accounted inside its enclosing one. Every payload bash
-			// substitutes here must reach the segment list exactly once.
-			// A payload nested in a joined expansion reaches the list through
-			// the re-scan of its enclosing payload, so the enclosing command is
-			// emitted before it — the same order the top-level twins show.
+			// These joins open a frame nested inside another open frame, so each payload
+			// travels the region walk's closer and comment rules on its way out: a joined
+			// `>(` inside a substitution inside an expansion, an escaped byte keeping a `#`
+			// as word content inside a joined frame, a comment swallowing the frame's own
+			// closer only after the line ends, and a joined `{` staying accounted inside
+			// its enclosing expansion. Every payload bash substitutes here reaches the
+			// segment list exactly once: a nested payload arrives through the re-scan of
+			// its enclosing one, so the enclosing command is emitted first.
 			const outNested = parseCommand("echo ${x:-$(cat >\\\n(printf b > b.marker))}\n")
 			expect(outNested.parseError).toBeNull()
 			expect(outNested.commands).toEqual([
@@ -3265,15 +3232,13 @@ describe("parseCommand", () => {
 			expect(parseError?.quoteType).toBe("heredoc")
 		})
 
-		// The next rows pin how the comment-onset scan reads a `#` glued to a
-		// closer, and the delimiter's continuation rule. A `#` glued directly
-		// after the closer that ends a substitution frame continues the word:
-		// bash ends the region at its closer but not the word, so a comment
-		// there never starts and the text behind the `#` stays live syntax. A
-		// `)` that closes no frame is an operator token, and the next `#` is
-		// at a word start. Separately, bash removes a backslash-newline pair
-		// as a line continuation before tokenizing, so such a pair inside the
-		// delimiter word never quotes the body.
+		// These rows pin how the comment-onset scan reads a `#` glued to a closer, and
+		// the delimiter's continuation rule. A `#` directly after the closer that ends
+		// a substitution frame continues the word — bash ends the region there but not
+		// the word — so no comment starts and the text behind the `#` stays live
+		// syntax; a `)` closing no frame is an operator token, and the next `#` is at a
+		// word start. A backslash-newline pair removed before tokenizing never quotes
+		// the body.
 		it("extracts a substitution behind a # glued to a $( … ) closer", () => {
 			// bash prints `ab#c` for `echo a$(echo b)#c`: the glued `#` is
 			// mid-word, so `$(zap y)` executes. Dropping the frame bookkeeping
@@ -4034,7 +3999,6 @@ describe("parseCommand", () => {
 			const frame = parseCommand("echo $( x=$(( $(printf '%d' 2) + 1 )); echo $x )")
 			expect(frame.parseError).toBeNull()
 			expect(frame.commands).toEqual(["echo", "x=$(( $(printf '%d' 2) + 1 ))", "printf '%d' 2", "echo $x"])
-			// Body call site.
 			const body = parseCommand("cat <<EOF\necho $(( $(printf '%d' 2) + 1 ))\nEOF")
 			expect(body.parseError).toBeNull()
 			expect(body.commands).toEqual(["cat <<EOF\necho $(( $(printf '%d' 2) + 1 ))\nEOF", "printf '%d' 2"])
@@ -4421,14 +4385,13 @@ describe("parseCommand", () => {
 	})
 
 	describe("heredoc delimiters with undeterminable terminators fail closed", () => {
-		// A quote character inside the delimiter word opens a quote region. bash
-		// carries that region across newlines until its closing quote. A word
-		// that still has a region open at end of input is a delimiter that no
-		// body line can ever match. The opener line's tail keeps executing as
-		// ordinary syntax. This is exactly where a mask to end of input would
-		// hand bash's separate commands to the allowlists unaccounted for. A
-		// delimiter is equally unresolvable when bash applies a quote removal
-		// the walk does not reproduce (ANSI-C/locale rows below).
+		// A quote character inside the delimiter word opens a region bash carries
+		// across newlines until its closing quote, so a word with a region still open
+		// at end of input is a delimiter no body line can match — and the opener
+		// line's tail keeps executing as ordinary syntax, which is where a mask to end
+		// of input would hand bash's separate commands to the allowlists unaccounted
+		// for. A delimiter is equally unresolvable when bash applies a quote removal
+		// the walk does not reproduce.
 
 		it("fails closed on the CR-delimited unclosed-quote delimiter (the approval-bypass shape)", () => {
 			// bash closes the delimiter's quote on the second line. It then runs
@@ -4558,16 +4521,13 @@ describe("parseCommand", () => {
 		})
 
 		it("fails closed when a line continuation joins a delimiter's dollar to a quote byte", () => {
-			// bash removes backslash-newline line continuations before
-			// tokenizing, so the `$` and the quote byte of a `$'`/`$"`
-			// occurrence can sit on separate physical lines. bash joins the
-			// bytes and removes the quotes before matching the delimiter word
-			// against a terminator line, so each word below closes the heredoc
-			// at the joined quote-removed text — a line the terminator search
-			// never derives from the physical lines — and runs the tail after
-			// it as its own command. The `<<-` tab form is scanned after the
-			// strip, and a word whose dollar follows a closed quote region
-			// reaches the scan unquoted.
+			// bash removes backslash-newline continuations before tokenizing, so the `$`
+			// and the quote byte of a `$'`/`$"` occurrence can sit on separate physical
+			// lines: bash joins the bytes and removes the quotes before matching the
+			// delimiter word, so each word closes the heredoc at joined quote-removed text
+			// the terminator search never derives from the physical lines, and runs the
+			// tail as its own command. The `<<-` tab form is scanned after the strip, and
+			// a dollar following a closed quote region reaches the scan unquoted.
 			const shape = (input: string) => {
 				const { commands, parseError } = parseCommand(input)
 				expect(parseError?.quoteType).toBe("heredoc")
@@ -4622,14 +4582,13 @@ describe("parseCommand", () => {
 		})
 
 		it("keeps escaped-dollar and in-quote-dollar delimiter words parsing", () => {
-			// Precision controls: bash treats an escaped `\$` as a literal
-			// dollar and a `$` inside a quote region as ordinary word content,
-			// and the walk derives both words exactly, so the terminator stays
-			// determinable and these words keep parsing. An escaped backslash
-			// after an unquoted dollar keeps its own pair, so the following
-			// quote belongs to a later word, not to the dollar: the word stays
-			// `a$\X`, no ANSI-C occurrence exists, and only a continuation pair
-			// -- never a lone `\\` -- may join bytes in the occurrence test.
+			// Precision controls: bash treats an escaped `\$` as a literal dollar and a
+			// `$` inside a quote region as ordinary word content, and the walk derives
+			// both words exactly, so the terminator stays determinable and these words
+			// keep parsing. An escaped backslash after an unquoted dollar keeps its own
+			// pair, so the following quote belongs to a later word: the word stays
+			// `a$\X`, no ANSI-C occurrence exists, and only a continuation pair — never a
+			// lone `\\` — may join bytes.
 			const escaped = parseCommand("cat <<\\$'X'\nbody\n$X")
 			expect(escaped.parseError).toBeNull()
 			expect(escaped.commands).toEqual(["cat <<\\$'X'\nbody\n$X"])
@@ -4676,11 +4635,10 @@ describe("parseCommand", () => {
 		})
 
 		it("keeps a chained ANSI-C delimiter refused and a quoted chain's tail visible", () => {
-			// bash strips the ANSI-C quotes from a chained delimiter too, so the
-			// `$'A'` chain must stay refused; the guard now refuses it at the
-			// delimiter itself. The quoted twin is ordinary chained syntax: it
-			// keeps parsing, and the tail after the last terminator reaches its
-			// own segment for the deny surface.
+			// bash strips the ANSI-C quotes from a chained delimiter too, so the `$'A'`
+			// chain must stay refused, and the guard refuses it at the delimiter itself.
+			// The quoted twin is ordinary chained syntax: it keeps parsing, and the tail
+			// after the last terminator reaches its own segment for the deny surface.
 			const chain = parseCommand("cat <<$'A' <<B\na1\nA\nb1\nB\nprintf RAN > ran.marker")
 			expect(chain.parseError?.quoteType).toBe("heredoc")
 			expect(chain.commands).toEqual(["cat <<$'A' <<B\na1\nA\nb1\nB\nprintf RAN > ran.marker"])
@@ -5052,15 +5010,12 @@ describe("parseCommand", () => {
 		})
 
 		it("fails closed on a heredoc whose continuation joins over a CRLF line ending", () => {
-			// The msys/Cygwin read layer is the reference shell on the Windows
-			// target. It strips the CR from every line it reads. The logical
-			// line therefore ends with the lone backslash and continues into
-			// the `F` line. That joins the candidate into the `EOF` terminator.
-			// POSIX bash reads `\<CR>` as an escaped CR, with no join, so the
-			// two models close on different lines. A continuation that consumes
-			// a CRLF makes the mask boundary model-dependent. The heredoc
-			// therefore fails closed for review instead of guessing which model
-			// decides it.
+			// The msys/Cygwin read layer, the reference shell on the Windows target,
+			// strips the CR from every line, so the logical line ends with the lone
+			// backslash and continues into the `F` line, joining the candidate into the
+			// `EOF` terminator. POSIX bash reads `\<CR>` as an escaped CR with no join, so
+			// the two models close on different lines; a continuation that consumes a
+			// CRLF makes the mask boundary model-dependent, so the heredoc fails closed.
 			const input = "cat <<EOF\r\nEO\\\r\nF\r\ntouch x\r\nEOF\r\n"
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
@@ -5068,12 +5023,13 @@ describe("parseCommand", () => {
 		})
 
 		it("fails closed on a heredoc body line carrying a lone CR", () => {
-			// The read-layer CR strip leaves `EO\F`: no continuation, and the
-			// body runs to the real terminator. POSIX bash reads the backslash
-			// as escaping the CR. Here the models happen to agree. The CR still
-			// leaves the two layers reading different bytes, so the close cannot
-			// be verified in a model-independent way. Such a heredoc fails
-			// closed. That is the accepted cost of never picking a model.
+			// The read-layer CR strip leaves `EO\F`: no continuation, and the body runs to
+			// the real terminator. POSIX bash reads the backslash as escaping the CR.
+			//
+			// Here the models happen to agree. The CR still leaves the two layers reading
+			// different bytes, so the close cannot be verified in a model-independent way.
+			// Such a heredoc fails closed. That is the accepted cost of never picking a
+			// model.
 			const input = "cat <<EOF\nEO\\\rF\ntouch x\nEOF\n"
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
@@ -5116,15 +5072,12 @@ describe("parseCommand", () => {
 		})
 
 		it("fails closed on a heredoc body line whose stripped content only contains the delimiter", () => {
-			// Stripping yields `EOFx`, which is not the terminator. The msys
-			// read line therefore keeps the body open until the real `EOF`
-			// line. POSIX bash keeps `EOF<CR>x` as ordinary body content. Both
-			// models close at the same final `EOF` line. The CR inside the
-			// opener-through-terminator region still leaves the two layers
-			// reading different bytes. The close cannot then be verified in a
-			// model-independent way, so the input fails closed for review. That
-			// over-rejection is accepted, because confirming the agreement
-			// would mean modeling both read layers.
+			// Stripping yields `EOFx`, not the terminator, so msys keeps the body open
+			// until the real `EOF` line while POSIX keeps `EOF<CR>x` as ordinary content:
+			// both close at the same line, yet the CR inside the region still leaves the
+			// layers reading different bytes, so the close cannot be verified
+			// model-independently and the input fails closed. That over-rejection is
+			// accepted: confirming agreement would mean modeling both read layers.
 			const input = "cat <<EOF\nEOF\rx\ncurl evil\nEOF\n"
 			const { commands, parseError } = parseCommand(input)
 			expect(commands).toEqual([input])
